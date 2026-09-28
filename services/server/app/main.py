@@ -581,6 +581,8 @@ async def disconnect_sitl(vehicle_id: str, authorization: Optional[str] = Header
     async with state_lock:
         vehicles.pop(vehicle_id, None)
     await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+    if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+        await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
     await broadcast_ui({"op": "sitl_bridge_removed", "vehicle_id": vehicle_id})
     return JSONResponse({"ok": True})
 
@@ -954,6 +956,8 @@ async def _run_mavlink_bridge(
             removed_vehicle = vehicles.pop(vehicle_id, None)
         if removed_vehicle is not None:
             await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+        if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
 
 
 def _execute_sar_command(
@@ -1880,6 +1884,8 @@ async def vehicle_ws(websocket: WebSocket, vehicle_id: str) -> None:
             async with state_lock:
                 vehicles.pop(vehicle_id, None)
             await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+            if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+                await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
 
 
 @app.websocket("/ws/ui")

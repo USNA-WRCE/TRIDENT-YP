@@ -76,7 +76,7 @@ _ship_state = {
     "stamp": 0.0,
 }
 _ship_relative_thread: threading.Thread | None = None
-_ship_relative_stop_event = threading.Event()
+_ship_relative_stop_event: threading.Event | None = None
 _last_rtb_step_time = 0.0
 _rtb_guided_forced = False
 
@@ -181,12 +181,16 @@ def _update_ship_state(vehicle: dict) -> None:
     vehicle_id = vehicle.get("vehicle_id")
 
     with _ship_state_lock:
+        same_ship = _ship_state.get("vehicle_id") == vehicle_id
         prev_lat = _ship_state.get("lat")
         prev_lon = _ship_state.get("lon")
         prev_stamp = float(_ship_state.get("stamp") or 0.0)
         vn_ms = float(_ship_state.get("vn_ms") or 0.0)
         ve_ms = float(_ship_state.get("ve_ms") or 0.0)
-        if prev_lat is not None and prev_lon is not None and stamp > prev_stamp:
+        if not same_ship:
+            vn_ms = 0.0
+            ve_ms = 0.0
+        elif prev_lat is not None and prev_lon is not None and stamp > prev_stamp:
             north_m, east_m = _north_east_delta_m(float(prev_lat), float(prev_lon), float(lat), float(lon))
             dt = stamp - prev_stamp
             if dt > 0:
@@ -246,18 +250,20 @@ async def ship_state_listener_loop() -> None:
 
 
 def _stop_ship_relative_mission() -> None:
-    global _ship_relative_thread
+    global _ship_relative_thread, _ship_relative_stop_event
 
     thread = _ship_relative_thread
+    stop_event = _ship_relative_stop_event
     if thread and thread.is_alive():
-        _ship_relative_stop_event.set()
+        if stop_event:
+            stop_event.set()
         thread.join(timeout=1.0)
-    _ship_relative_stop_event.clear()
     _ship_relative_thread = None
+    _ship_relative_stop_event = None
 
 
 def _launch_ship_relative_mission(master, command_data: dict) -> None:
-    global _ship_relative_thread
+    global _ship_relative_thread, _ship_relative_stop_event
 
     local_waypoints = command_data.get("local_waypoints", [])
     ship_vehicle_id = command_data.get("ship_vehicle_id")
@@ -269,9 +275,11 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
         return
 
     _stop_ship_relative_mission()
+    stop_event = threading.Event()
+    _ship_relative_stop_event = stop_event
     _ship_relative_thread = threading.Thread(
         target=_run_ship_relative_mission,
-        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), _ship_relative_stop_event),
+        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event),
         daemon=True,
     )
     _ship_relative_thread.start()
@@ -493,6 +501,9 @@ async def telemetry_loop() -> None:
                             and server_msg.get("vehicle_id") == VEHICLE_ID):
                             command_data = server_msg.get("command", {})
                             cmd_type = command_data.get("type")
+
+                            if cmd_type != "ship_relative_trajectory":
+                                _stop_ship_relative_mission()
 
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
