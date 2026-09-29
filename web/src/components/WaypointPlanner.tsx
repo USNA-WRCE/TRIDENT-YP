@@ -25,6 +25,7 @@ export function WaypointPlanner({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedVehicleId, setSelectedVehicleId] = useState("");
   const [faceInward, setFaceInward] = useState(false);
+  const [holdLastWaypoint, setHoldLastWaypoint] = useState(false);
   const [missionLoops, setMissionLoops] = useState(1);
   const [dispatchAltitudeOffset, setDispatchAltitudeOffset] = useState(15);
   const [circleRadius, setCircleRadius] = useState(30);
@@ -59,6 +60,7 @@ export function WaypointPlanner({
       faceInward,
       missionLoops,
       dispatchAltitudeOffset,
+      holdLastWaypoint,
     );
     const url = URL.createObjectURL(new Blob([content], { type: "application/json" }));
     const link = document.createElement("a");
@@ -79,6 +81,7 @@ export function WaypointPlanner({
       })));
       setSelectedId(null);
       if (plan.faceShip != null) setFaceInward(plan.faceShip);
+      if (plan.holdLastWaypoint != null) setHoldLastWaypoint(plan.holdLastWaypoint);
       if (plan.loopCount != null) setMissionLoops(plan.loopCount);
       if (plan.dispatchAltitudeOffset != null) setDispatchAltitudeOffset(plan.dispatchAltitudeOffset);
     } catch (error) {
@@ -113,9 +116,10 @@ export function WaypointPlanner({
       update_hz: 10,
       face_ship: faceInward,
       loop_count: missionLoops,
+      hold_last_waypoint: holdLastWaypoint,
     });
     alert(
-      `Dispatched ${localWaypoints.length} waypoints for ${missionLoops} loop${missionLoops === 1 ? "" : "s"} to ${selectedVehicleId}`,
+      `Dispatched ${localWaypoints.length} waypoints for ${missionLoops} loop${missionLoops === 1 ? "" : "s"} to ${selectedVehicleId}${holdLastWaypoint ? ". Holding final relative waypoint until retasked" : ""}`,
     );
     setWaypoints([]);
     setSelectedId(null);
@@ -305,6 +309,15 @@ export function WaypointPlanner({
                   onChange={(event) => setFaceInward(event.target.checked)}
                 />
                 Face inward toward YP
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <input
+                  type="checkbox"
+                  checked={holdLastWaypoint}
+                  onChange={(event) => setHoldLastWaypoint(event.target.checked)}
+                  title="Continue updating the final target relative to the moving YP until another command is sent"
+                />
+                Hold final relative waypoint
               </label>
               <label style={{ display: "flex", alignItems: "center", gap: 7 }}>
                 Mission loops

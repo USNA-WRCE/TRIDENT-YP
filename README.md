@@ -331,8 +331,11 @@ The **Local Waypoint Planner** tab is separate from Mission Planner. It creates 
 - **Base dispatch altitude** defaults to 15 m above the YP. The altitude profile shows each point's final relative altitude; dragging a point adjusts that height relative to the base. The resulting waypoint `z` sent to bridges is the base altitude plus the point adjustment. New waypoints and generated circles start with a 0 m adjustment, so they dispatch at the selected base altitude.
 - **Face inward toward YP** makes the dispatched vehicle continuously face the YP. When disabled, the vehicle faces its current direction of travel toward the active waypoint.
 - **Mission loops** repeats the full ordered route for the selected number of passes (1–100).
+- **Hold final relative waypoint** keeps streaming the last waypoint relative to the moving YP after all loops finish. The hold ends when another command is sent to that vehicle; leave it disabled to finish the route normally.
 - Export and import use the planner's versioned JSON format, retaining local waypoint coordinates, altitude adjustments, inward-facing setting, loop count, and base dispatch altitude.
 - Select a vehicle and connected YP with fresh position and heading before dispatch. Ship-relative trajectory dispatch requires the `upload_mission` permission. It is implemented by the TCP SITL bridge and the supported ArduPilot, BlueBoat, PX4, and MAVROS bridges; other bridge types may not execute this command.
+
+Holding a relative position is not a collision-avoidance guarantee. Maintain a suitable standoff, verify YP and vehicle telemetry, and retain an independent safety-pilot/RC override. If the YP state becomes stale, bridge behavior depends on the vehicle/autopilot failsafe; do not rely on this option as the sole collision-prevention measure.
 
 ## Search and rescue operations
 

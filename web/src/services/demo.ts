@@ -29,6 +29,7 @@ export interface DemoVehicle {
   shipRelativeShipId?: string;
   shipRelativeIndex: number;
   shipRelativeFaceShip: boolean;
+  shipRelativeHoldLast: boolean;
   mode: string;
   history: Vehicle["history"];
   messages: Vehicle["messages"];
@@ -61,7 +62,7 @@ export function createDemoVehicles(): DemoVehicle[] {
 }
 
 function createDemoVehicle(vehicle_id: string, vehicle_type: VehicleType, lat: number, lon: number, alt: number, heading: number, speed: number, batteryDrainPerSecond: number, battery = 0.86): DemoVehicle {
-  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, shipRelativeFaceShip: false, mode: "loiter", history: [], messages: {}, localX: 0, localY: 0 };
+  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, shipRelativeFaceShip: false, shipRelativeHoldLast: false, mode: "loiter", history: [], messages: {}, localX: 0, localY: 0 };
 }
 
 export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number, vehicles: DemoVehicle[]): DemoMessagePayload[] {
@@ -102,14 +103,15 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
       if (nextWaypoint) vehicle.target = nextWaypoint;
       else vehicle.mode = "hold";
     } else if (vehicle.mode === "ship_relative") {
-      vehicle.shipRelativeIndex += 1;
-      const nextWaypoint = vehicle.shipRelativeWaypoints[vehicle.shipRelativeIndex];
+      const nextIndex = vehicle.shipRelativeIndex + 1;
+      const nextWaypoint = vehicle.shipRelativeWaypoints[nextIndex];
       if (nextWaypoint && ship) {
+        vehicle.shipRelativeIndex = nextIndex;
         vehicle.target = localToGlobalWaypoint(ship.lat, ship.lon, ship.heading, ship.alt, nextWaypoint.x, nextWaypoint.y, nextWaypoint.z);
         vehicle.targetYawDeg = vehicle.shipRelativeFaceShip
           ? bearingDegrees(vehicle.lat, vehicle.lon, ship.lat, ship.lon)
           : bearingDegrees(vehicle.lat, vehicle.lon, vehicle.target.latitude, vehicle.target.longitude);
-      } else {
+      } else if (!vehicle.shipRelativeHoldLast) {
         vehicle.mode = "hold";
         if (vehicle.targetYawDeg != null) vehicle.heading = vehicle.targetYawDeg;
       }
@@ -164,6 +166,7 @@ export function handleDemoCommand(vehicles: DemoVehicle[], vehicleId: string, co
     vehicle.shipRelativeShipId = yp.vehicle_id;
     vehicle.shipRelativeIndex = 0;
     vehicle.shipRelativeFaceShip = command.face_ship ?? false;
+    vehicle.shipRelativeHoldLast = command.hold_last_waypoint ?? false;
     vehicle.target = localToGlobalWaypoint(ypPosition.latitude, ypPosition.longitude, yp.heading, ypPosition.altitude, firstWaypoint.x, firstWaypoint.y, firstWaypoint.z);
     vehicle.targetYawDeg = vehicle.shipRelativeFaceShip
       ? bearingDegrees(vehicle.lat, vehicle.lon, yp.lat, yp.lon)

@@ -10,6 +10,7 @@ export interface ImportedLocalWaypointPlan {
   faceShip?: boolean;
   loopCount?: number;
   dispatchAltitudeOffset?: number;
+  holdLastWaypoint?: boolean;
 }
 
 export function applyDispatchAltitudeOffset(
@@ -27,14 +28,16 @@ export function serializeLocalWaypointPlan(
   faceShip: boolean,
   loopCount: number,
   dispatchAltitudeOffset = 15,
+  holdLastWaypoint = false,
 ): string {
   return JSON.stringify({
     format: "yp-local-waypoint-plan",
-    version: 2,
+    version: 3,
     saved_at: new Date().toISOString(),
     face_ship: faceShip,
     loop_count: loopCount,
     dispatch_altitude_offset_m: dispatchAltitudeOffset,
+    hold_last_waypoint: holdLastWaypoint,
     waypoints,
   }, null, 2);
 }
@@ -47,8 +50,9 @@ export function parseLocalWaypointPlan(text: string): ImportedLocalWaypointPlan 
     face_ship?: unknown;
     loop_count?: unknown;
     dispatch_altitude_offset_m?: unknown;
+    hold_last_waypoint?: unknown;
   };
-  if (payload.format !== "yp-local-waypoint-plan" || ![1, 2].includes(Number(payload.version)) || !Array.isArray(payload.waypoints)) {
+  if (payload.format !== "yp-local-waypoint-plan" || ![1, 2, 3].includes(Number(payload.version)) || !Array.isArray(payload.waypoints)) {
     throw new Error("Unsupported local waypoint plan format.");
   }
 
@@ -81,5 +85,6 @@ export function parseLocalWaypointPlan(text: string): ImportedLocalWaypointPlan 
       ? Math.max(1, Math.min(100, Math.floor(loopValue)))
       : undefined,
     dispatchAltitudeOffset: altitudeBase,
+    holdLastWaypoint: typeof payload.hold_last_waypoint === "boolean" ? payload.hold_last_waypoint : undefined,
   };
 }

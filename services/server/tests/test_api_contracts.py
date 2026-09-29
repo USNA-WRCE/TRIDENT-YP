@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import math
 import time
 import unittest
@@ -186,6 +188,42 @@ class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
             main._step_sitl_ship_relative(master, plan)
             send_args = master.mav.set_position_target_global_int_send.call_args.args
             self.assertAlmostEqual(send_args[14], 0.0, places=5)
+
+    def test_sitl_ship_relative_hold_keeps_final_waypoint_active(self):
+        now = time.time()
+        plan = {
+            "ship_vehicle_id": "yp-boat",
+            "vehicle_id": "sitl-drone",
+            "waypoints": [{"x": 0, "y": 20, "z": 15}],
+            "index": 0,
+            "arrival_radius_m": 6.0,
+            "guided_forced": False,
+            "hold_last_waypoint": True,
+        }
+        expected_lat = 38.9 + math.degrees(20 / 6_378_137.0)
+        states = {
+            "yp-boat": {"lat": 38.9, "lon": -76.4, "alt": 2.0, "heading_deg": 0.0, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": now},
+            "sitl-drone": {"lat": expected_lat, "lon": -76.4, "alt": 17.0, "heading_deg": 0.0, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": now},
+        }
+        master = MagicMock()
+        mavlink = SimpleNamespace(
+            MAV_FRAME_GLOBAL_RELATIVE_ALT_INT=6,
+            MAV_FRAME_GLOBAL_INT=5,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1,
+            MAV_CMD_COMPONENT_ARM_DISARM=400,
+        )
+        with patch.object(main, "_mavutil", SimpleNamespace(mavlink=mavlink)), patch.dict(
+            main._sitl_nav_states, states, clear=True,
+        ), patch.dict(main.sitl_bridge_info, {"sitl-drone": {"vehicle_type": "uav"}}, clear=True):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertIs(main._step_sitl_ship_relative(master, plan), plan)
+                self.assertEqual(plan["index"], 0)
+                self.assertEqual(master.mav.set_position_target_global_int_send.call_count, 1)
+                self.assertIs(main._step_sitl_ship_relative(master, plan), plan)
+            self.assertEqual(plan["index"], 0)
+            self.assertEqual(master.mav.set_position_target_global_int_send.call_count, 2)
+            self.assertEqual(output.getvalue().count("Reached final waypoint"), 1)
 
     async def test_sar_path_is_computed_once_and_only_simulators_receive_navigation_points(self):
         for vehicle_id in ("sim-drone", "hardware-drone"):

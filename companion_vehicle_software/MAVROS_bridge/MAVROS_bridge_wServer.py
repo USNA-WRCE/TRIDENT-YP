@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import traceback
+from itertools import chain, repeat
 from pathlib import Path
 from typing import Any
 import sys
@@ -467,6 +468,9 @@ class Bridge:
                     self.streaming_task.cancel()
                     self.streaming_task = None
                 self.stream_stop_event.clear()
+                self.active_waypoint = None
+                self.active_velocity = None
+                self.ignore_yaw_flag = False
 
             if cmd_type == "waypoint":
                 await self.handle_waypoint(command)
@@ -747,6 +751,7 @@ class Bridge:
         arrival_radius = float(command.get("arrival_radius_m", 6.0))
         update_hz = float(command.get("update_hz", 10.0))
         face_ship = bool(command.get("face_ship", False))
+        hold_last_waypoint = bool(command.get("hold_last_waypoint", False))
         try:
             loop_count = max(1, min(100, int(command.get("loop_count", 1))))
         except (TypeError, ValueError):
@@ -758,7 +763,9 @@ class Bridge:
         if config.get("auto_arm_offboard", True):
             await self.call_service("/mavros/cmd/arming", "mavros_msgs/CommandBool", {"value": True})
 
-        for index, waypoint in enumerate(local_waypoints * loop_count):
+        waypoints = local_waypoints * loop_count
+        waypoint_stream = chain(waypoints, repeat(waypoints[-1])) if hold_last_waypoint else iter(waypoints)
+        for index, waypoint in enumerate(waypoint_stream):
             if self.stream_stop_event.is_set():
                 break
                 

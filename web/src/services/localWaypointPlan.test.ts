@@ -4,12 +4,13 @@ import { applyDispatchAltitudeOffset, parseLocalWaypointPlan, serializeLocalWayp
 describe("local waypoint plan files", () => {
   it("round-trips local coordinates, inward-facing option, and loop count", () => {
     const source = [{ x: 12.5, y: -4, z: 20, yaw_deg: 35 }];
-    const serialized = serializeLocalWaypointPlan(source, true, 3, 25);
+    const serialized = serializeLocalWaypointPlan(source, true, 3, 25, true);
     expect(parseLocalWaypointPlan(serialized)).toEqual({
       waypoints: source,
       faceShip: true,
       loopCount: 3,
       dispatchAltitudeOffset: 25,
+      holdLastWaypoint: true,
     });
   });
 
@@ -26,6 +27,7 @@ describe("local waypoint plan files", () => {
       faceShip: undefined,
       loopCount: 100,
       dispatchAltitudeOffset: 15,
+      holdLastWaypoint: undefined,
     });
   });
 

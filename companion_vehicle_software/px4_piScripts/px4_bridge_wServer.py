@@ -695,10 +695,10 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
     _stop_ship_relative_mission()
     stop_event = threading.Event()
     _ship_relative_stop_event = stop_event
-    _ship_relative_thread = threading.Thread(target=_run_ship_relative_mission, args=(master, command_data["ship_vehicle_id"], command_data["local_waypoints"], float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count), daemon=True)
+    _ship_relative_thread = threading.Thread(target=_run_ship_relative_mission, args=(master, command_data["ship_vehicle_id"], command_data["local_waypoints"], float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count, bool(command_data.get("hold_last_waypoint", False))), daemon=True)
     _ship_relative_thread.start()
 
-def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1) -> None:
+def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1, hold_last_waypoint: bool = False) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     offboard_confirmed = False
     prestream_started = time.monotonic()
@@ -754,7 +754,7 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                 
             alt_condition_met = True if VEHICLE_TYPE in ["usv", "ugv"] else abs(float(vehicle_state["alt"]) - target_alt) <= max(2.0, arrival_radius_m * 0.5)
             if _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon) <= arrival_radius_m and alt_condition_met:
-                if index < len(repeated_waypoints):
+                if index < len(repeated_waypoints) or not hold_last_waypoint:
                     break
             time.sleep(update_period_s)
         if stop_event.is_set(): return

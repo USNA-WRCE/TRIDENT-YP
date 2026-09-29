@@ -78,6 +78,7 @@ export interface Command {
   update_hz?: number;
   face_ship?: boolean;
   loop_count?: number;
+  hold_last_waypoint?: boolean;
   // mission_plan fields
   waypoints?: Array<{
     latitude: number;

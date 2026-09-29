@@ -774,6 +774,7 @@ async def _run_mavlink_bridge(
                                     "arrival_radius_m": float(command.get("arrival_radius_m", 6.0)),
                                     "guided_forced": False,
                                     "face_ship": bool(command.get("face_ship", False)),
+                                    "hold_last_waypoint": bool(command.get("hold_last_waypoint", False)),
                                     "vehicle_id": vehicle_id,
                                 }
                                 print(f"[SITL][SHIP-REL] Started {len(waypoints)} waypoints for {vehicle_id} relative to {ship_vehicle_id}")
@@ -1172,11 +1173,18 @@ def _step_sitl_ship_relative(master: Any, plan: dict[str, Any]) -> Optional[dict
         2.0, float(plan["arrival_radius_m"]) * 0.5,
     )
     if distance_m <= float(plan["arrival_radius_m"]) and altitude_reached:
-        print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
-        plan["index"] = index + 1
-        if plan["index"] >= len(waypoints):
+        if index + 1 >= len(waypoints):
+            if plan.get("hold_last_waypoint"):
+                if not plan.get("hold_arrival_logged"):
+                    print(f"[SITL][SHIP-REL] Reached final waypoint; holding relative target for {vehicle_id}")
+                    plan["hold_arrival_logged"] = True
+                return plan
+            print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
+            plan["index"] = index + 1
             print(f"[SITL][SHIP-REL] Mission complete for {vehicle_id}")
             return None
+        print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
+        plan["index"] = index + 1
     return plan
 
 

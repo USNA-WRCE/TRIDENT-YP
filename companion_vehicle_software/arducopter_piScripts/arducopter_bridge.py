@@ -326,13 +326,13 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
     _ship_relative_stop_event = stop_event
     _ship_relative_thread = threading.Thread(
         target=_run_ship_relative_mission,
-        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count),
+        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count, bool(command_data.get("hold_last_waypoint", False))),
         daemon=True,
     )
     _ship_relative_thread.start()
 
 
-def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1) -> None:
+def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1, hold_last_waypoint: bool = False) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     print(f"[SHIP-REL] Starting mission with {len(local_waypoints)} waypoints relative to {ship_vehicle_id}")
     # SET_POSITION_TARGET_GLOBAL_INT is silently ignored unless already armed in GUIDED.
@@ -411,7 +411,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
 
             if distance_m <= arrival_radius_m and alt_condition_met:
                 print(f"[SHIP-REL] Reached waypoint {index}/{len(local_waypoints)}")
-                break
+                if index < len(repeated_waypoints) or not hold_last_waypoint:
+                    break
 
             time.sleep(update_period_s)
 
@@ -419,7 +420,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
             print("[SHIP-REL] Mission interrupted.")
             return
 
-    print("[SHIP-REL] Mission complete.")
+    if not hold_last_waypoint:
+        print("[SHIP-REL] Mission complete.")
 
 
 def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_guided=True):
