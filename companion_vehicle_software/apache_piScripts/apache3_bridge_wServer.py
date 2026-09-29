@@ -1,6 +1,7 @@
 import asyncio
 import json
-import math
+from math      import floor
+from numpy     import degrees, radians, sin, cos, arctan2, sqrt
 import os
 import socket
 import threading
@@ -12,6 +13,7 @@ from typing import Any
 from aiohttp import web
 from pymavlink import mavutil
 import websockets
+import math
 
 import sar_missions
 
@@ -100,7 +102,7 @@ SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M = float(os.getenv("SHIP_RELATIVE_ARRIVAL_
 EARTH_RADIUS_M = 6_378_137.0
 
 _vehicle_state_lock = threading.Lock()
-_vehicle_state = {"lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "stamp": 0.0}
+_vehicle_state = {"lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms":0.0, "stamp": 0.0}
 _ship_state_lock = threading.Lock()
 _ship_state = {"vehicle_id": None, "lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": 0.0}
 
@@ -322,8 +324,8 @@ async def handle_mode_api(request):
         body = await request.json()
         target_mode_id = int(body.get("mode_id", CUSTOM_MODE_AUTO))
 
-        _stop_active_controller()  # Terminate active RC override controller when manual mode change is issued
-
+        await _stop_active_controller()  # Terminate active RC override controller when manual mode change is issued
+        
         with mav_master_lock:
             if not mav_master or not system_status["cube_connected"]:
                 return web.json_response({"ok": False, "error": "Apache controller disconnected"}, status=503)
@@ -392,14 +394,21 @@ def _send_raw_rc_override(master, steering_pwm: int = 1500, throttle_pwm: int = 
         )
     )
 
-def _stop_active_controller():
-    """Stops any running heading/speed control loop thread."""
+def _stop_active_controller_sync():
+    """Synchronous helper to signal and join the controller thread."""
     global _controller_thread
     if _controller_thread and _controller_thread.is_alive():
         _controller_stop_event.set()
         _controller_thread.join(timeout=1.0)
     _controller_stop_event.clear()
     _controller_thread = None
+
+async def _stop_active_controller():
+    """Non-blocking async call that offloads thread joining off the main event loop."""
+    if _controller_thread and _controller_thread.is_alive():
+        await asyncio.to_thread(_stop_active_controller_sync)
+    else:
+        _controller_stop_event.clear()
 
 def _start_heading_speed_control(target_heading_deg: float, target_speed_mps: float):
     """Spawns or updates the heading/speed controller thread."""
@@ -422,7 +431,12 @@ def _heading_speed_control_loop():
     and streams MAVLink RC_CHANNELS_OVERRIDE messages to the Apache 3.
     """
     print("[CONTROLLER] Starting Heading/Speed controller loop...")
+    global _last_rc_cmd_time
+    _last_rc_cmd_time = time.time()
     dt = 1.0 / 15.0  # 15 Hz loop rate
+    thr_1 = 0.0
+    thr_2 = 0.0
+    e_1 = 0.0
 
     while not _controller_stop_event.is_set():
         with _controller_target_lock:
@@ -434,29 +448,90 @@ def _heading_speed_control_loop():
             connected = system_status.get("cube_connected", False)
 
         if master and connected:
+
+            # Stop controller if flight mode changed away from MANUAL
+            if system_status.get("flight_mode") not in ("MANUAL", "MODE_0"):
+                print("[CONTROLLER] Flight mode changed externally; disengaging controller.")
+                break
+            
+            # Pull vehicle position and velocity info.
             with _vehicle_state_lock:
                 current_hdg = _vehicle_state.get("heading_deg", 0.0) or 0.0
                 current_lat = _vehicle_state.get("lat")
                 current_lon = _vehicle_state.get("lon")
+                current_vn = _vehicle_state.get("vn_ms", 0.0)
+                current_ve = _vehicle_state.get("ve_ms", 0.0)
 
             _last_rc_cmd_time = time.time()  # <--- REFRESH WATCHDOG TIMER so behavior times out if messages aren't received at 2 Hz
 
-            # =================================================================
-            # === ADD YOUR CUSTOM HEADING / SPEED CONTROLLER CODE HERE ===
-            # =================================================================
-            # Input variables available:
-            # - target_hdg: Desired heading angle in degrees (0 - 360)
-            # - target_spd: Desired forward speed in m/s
-            # - current_hdg: Current vessel heading angle in degrees
-            # - dt: Control loop delta time (1/15 s)
-            #
-            # Output requirements:
-            # Calculate steering_pwm (1100 to 1900) and throttle_pwm (1100 to 1900)
-            # Example Placeholder:
-            steering_pwm = 1500  # Replace with calculated steering PWM
-            throttle_pwm = 1500  # Replace with calculated throttle PWM
-            # =================================================================
+            
+            # Measured speed. Only positive. 
+            u = math.sqrt(current_vn**2 + current_ve**2)
+            
+            # Measured heading.
+            hdg = current_hdg*math.pi/180.0 # (rad)
 
+            # ---------------------------------------------------------------
+            # Calculate heading error.
+            # ---------------------------------------------------------------    
+            
+            # Wrap heading error in degrees (-180 to +180)
+            e_h_deg = (target_hdg - current_hdg + 180.0) % 360.0 - 180.0
+            e_h = math.radians(e_h_deg)
+
+            # Steering command.
+            steer = 0.5*e_h   # proportional controller
+            
+            # Age variables.
+            steer_1 = steer 
+            
+            # ---------------------------------------------------------------
+            # Calculate speed error.
+            # ---------------------------------------------------------------    
+            e  = target_spd - u
+
+            thr = 1/(1+1.6*dt)*(-(-2-1.6*dt)*thr_1 - thr_2 + (0.26319*dt + 0.26319*1.33*dt**2)*e -0.26319*dt*e_1)
+            
+            # Age variables.
+            e_1   = e
+            thr_2 = thr_1
+            thr_1 = thr
+
+
+            # Act.
+            steering_pwm = int(1500 + 500*steer)
+            if steering_pwm < 1100:
+                steering_pwm = 1100
+            if steering_pwm > 1900:
+                steering_pwm = 1900
+            throttle_pwm = int(1500 + 500*thr)
+            if throttle_pwm < 1100:
+                throttle_pwm = 1100
+            if throttle_pwm > 1900:
+                throttle_pwm = 1900
+
+            """ # Print info to screen.
+                print(f"Run time : {int(hrs):02}:{int(mns):02}:{int(scs):02}")
+                print("----------------------------------------------------------")
+                print(f"Desired (lat,lon)        : ({lat_d:10.7f},{lon_d:10.7f})")
+                print(f"Actual  (lat,lon)        : ({lat:10.7f},{lon:10.7f})")
+                print(f"Range to WP          (m) : {rng_2_wp:6.1f}                         ")
+                print(f"Vehicle speed      (m/s) : {u:6.1f}                     ")
+                print()
+                print(f"Vehicle heading      (d) : {degrees(hdg):6.1f}                     ")
+                print(f"Bearing to WP        (d) : {degrees(brg_2_wp):6.1f}                ")
+                print(f"Steer cmd            (%) : {steer*100:6.1f}                         ")
+                print(f"Throttle cmd         (%) : {thr*100:6.1f}                         ")
+                print("----------------------------------------------------------")
+
+                # Update time epoch.
+                t_prt += 1 """
+
+            
+            # Example Placeholder:
+            #steering_pwm = 1500  # Replace with calculated steering PWM
+            #throttle_pwm = 1500  # Replace with calculated throttle PWM
+            # =================================================================
             try:
                 _send_raw_rc_override(master, steering_pwm=steering_pwm, throttle_pwm=throttle_pwm)
             except Exception as err:
@@ -529,14 +604,14 @@ def upload_mission_batch(master, waypoints: list[tuple[float, float]], append_te
     return False
 
 def _run_single_waypoint(master, lat: float, lon: float):
-    _stop_active_controller()
+    _stop_active_controller_sync()
     with _sar_mission_lock:
         if upload_mission_batch(master, [(lat, lon)], append_terminal_loiter=True):
             time.sleep(0.2)
             set_chcnav_mode(master, CUSTOM_MODE_AUTO)
 
 def _run_search_grid(master, waypoints: list[tuple[float, float]]):
-    _stop_active_controller()
+    _stop_active_controller_sync()
     with _sar_mission_lock:
         if upload_mission_batch(master, waypoints, append_terminal_loiter=True):
             time.sleep(0.2)
@@ -620,7 +695,7 @@ async def _rc_override_watchdog_loop():
         # Trigger safety stop if commands were active but stream halted
         if _last_rc_cmd_time > 0 and (now - _last_rc_cmd_time) > _RC_COMMAND_TIMEOUT_S:
             print("[WATCHDOG] Control stream timed out!")
-            
+
             # 1. Kill the running heading/speed control thread so it doesn't fight the watchdog
             _stop_active_controller()
 
@@ -711,7 +786,7 @@ async def telemetry_loop(current_config: dict) -> None:
 
                             # --- BEHAVIOR 1: Direct Raw RC Override JSON Command ---
                             if cmd_type == "rc_override":
-                                _stop_active_controller()
+                                await _stop_active_controller()
                                 _last_rc_cmd_time = time.time()  # Reset watchdog timer
                                 steering_pwm = int(command_data.get("steering", 1500))
                                 throttle_pwm = int(command_data.get("throttle", 1500))
@@ -724,6 +799,7 @@ async def telemetry_loop(current_config: dict) -> None:
                                 _start_heading_speed_control(target_hdg, target_spd)
 
                             elif cmd_type == "waypoint":
+                                await _stop_active_controller()
                                 target = command_data.get("target", {})
                                 if "latitude" in target and "longitude" in target:
                                     threading.Thread(
@@ -743,16 +819,16 @@ async def telemetry_loop(current_config: dict) -> None:
                                     ).start()
 
                             elif cmd_type == "rtb":
-                                _stop_active_controller()
+                                await _stop_active_controller()
                                 set_chcnav_mode(master, CUSTOM_MODE_RTL)
 
                             elif cmd_type == "cancel_sar":
-                                _stop_active_controller()
+                                await _stop_active_controller()
                                 _sar_stop_event.set()
                                 set_chcnav_mode(master, CUSTOM_MODE_LOITER)
 
                             elif cmd_type == "set_mode":
-                                _stop_active_controller()
+                                await _stop_active_controller()
                                 mode_str = str(command_data.get("mode", "")).upper()
                                 str_map = {"MANUAL": CUSTOM_MODE_MANUAL, "AUTO": CUSTOM_MODE_AUTO, "RTL": CUSTOM_MODE_RTL, "LOITER": CUSTOM_MODE_LOITER, "HOLD": CUSTOM_MODE_HOLD}
                                 if mode_str in str_map:
@@ -811,6 +887,8 @@ async def telemetry_loop(current_config: dict) -> None:
                         _vehicle_state["lat"] = lat
                         _vehicle_state["lon"] = lon
                         _vehicle_state["heading_deg"] = heading
+                        _vehicle_state["vn_ms"] = getattr(msg, "vx", 0) / 100.0
+                        _vehicle_state["ve_ms"] = getattr(msg, "vy", 0) / 100.0
                         _vehicle_state["stamp"] = now
                     telemetry_sample = (lat, lon, heading)
 
