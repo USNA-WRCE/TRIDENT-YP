@@ -63,17 +63,44 @@ describe("hardware-free telemetry and commands", () => {
     expect(demoVehicleSnapshot(vehicle)).toMatchObject({ marker_color: "#123456" });
   });
 
-  it("rotates to the dispatched ship-relative yaw once the waypoint is reached", () => {
+  it("faces the direction of travel when inward-facing mode is disabled", () => {
     const vehicles = createDemoVehicles();
     const [yp, vehicle] = vehicles;
-    vehicle.lat = yp.lat;
+    vehicle.lat = yp.lat - 0.0001;
     vehicle.lon = yp.lon;
+    const headingBeforeDispatch = vehicle.heading;
     handleDemoCommand(vehicles, vehicle.vehicle_id, {
       type: "ship_relative_trajectory", ship_vehicle_id: yp.vehicle_id,
-      local_waypoints: [{ x: 0, y: 0, z: vehicle.alt, yaw_deg: 90 }],
+      local_waypoints: [{ x: 0, y: 0, z: vehicle.alt, yaw_deg: 270 }],
     });
     stepDemoVehicle(vehicle, 0.2, 1, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.targetYawDeg).toBeCloseTo(0, 1);
+    expect(Math.abs(vehicle.heading)).toBeLessThan(Math.abs(headingBeforeDispatch));
+  });
+
+  it("faces inward and repeats the full ship-relative waypoint list", () => {
+    const vehicles = createDemoVehicles();
+    const [yp, vehicle] = vehicles;
+    vehicle.lat = yp.lat + 0.00001;
+    vehicle.lon = yp.lon;
+    vehicle.alt = yp.alt;
+    const localWaypoint = { x: 0, y: 0, z: 0, yaw_deg: 0 };
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "ship_relative_trajectory",
+      ship_vehicle_id: yp.vehicle_id,
+      local_waypoints: [localWaypoint],
+      face_ship: true,
+      loop_count: 2,
+    });
+
+    expect(vehicle.shipRelativeWaypoints).toHaveLength(2);
+    stepDemoVehicle(vehicle, 0.2, 1, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.heading).toBeCloseTo(180);
+    expect(vehicle.targetYawDeg).toBeCloseTo(180);
+    stepDemoVehicle(vehicle, 0.2, 2, vehicles);
     expect(vehicle.mode).toBe("hold");
-    expect(vehicle.heading).toBeCloseTo((yp.heading + 90) % 360);
+    expect(vehicle.heading).toBeCloseTo(180);
   });
 });

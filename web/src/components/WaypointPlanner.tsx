@@ -1,11 +1,13 @@
 import {
   useRef,
   useState,
+  type ChangeEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Trash2 } from "lucide-react";
+import { Download, Trash2, Upload } from "lucide-react";
 import { WaypointScene } from "./3d/WaypointScene";
 import type { Command, RelativeWaypoint, Vehicle } from "../types";
+import { parseLocalWaypointPlan, serializeLocalWaypointPlan } from "../services/localWaypointPlan";
 
 type LocalWaypoint = { id: string; x: number; y: number; z: number; yaw: number };
 
@@ -21,6 +23,9 @@ export function WaypointPlanner({
   const [waypoints, setWaypoints] = useState<LocalWaypoint[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedVehicleId, setSelectedVehicleId] = useState("");
+  const [faceInward, setFaceInward] = useState(false);
+  const [missionLoops, setMissionLoops] = useState(1);
+  const importFileRef = useRef<HTMLInputElement>(null);
   const updateWaypoint = (id: string, updates: Partial<LocalWaypoint>) =>
     setWaypoints((items) =>
       items.map((item) => (item.id === id ? { ...item, ...updates } : item)),
@@ -28,6 +33,42 @@ export function WaypointPlanner({
   const deleteWaypoint = (id: string) => {
     setWaypoints((items) => items.filter((item) => item.id !== id));
     if (selectedId === id) setSelectedId(null);
+  };
+  const exportPlan = () => {
+    if (!waypoints.length) {
+      alert("Add at least one waypoint before exporting a plan.");
+      return;
+    }
+    const content = serializeLocalWaypointPlan(
+      waypoints.map(({ x, y, z, yaw }) => ({ x, y, z, yaw_deg: yaw })),
+      faceInward,
+      missionLoops,
+    );
+    const url = URL.createObjectURL(new Blob([content], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `local-waypoint-plan-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+  const importPlan = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const plan = parseLocalWaypointPlan(await file.text());
+      setWaypoints(plan.waypoints.map(({ x, y, z, yaw_deg }, index) => ({
+        id: `${Date.now()}-${index}`, x, y, z, yaw: yaw_deg,
+      })));
+      setSelectedId(null);
+      if (plan.faceShip != null) setFaceInward(plan.faceShip);
+      if (plan.loopCount != null) setMissionLoops(plan.loopCount);
+    } catch (error) {
+      alert(error instanceof Error ? error.message : "Failed to import local waypoint plan.");
+    } finally {
+      event.target.value = "";
+    }
   };
   const dispatch = () => {
     if (!yp?.position || yp.heading == null) {
@@ -54,9 +95,11 @@ export function WaypointPlanner({
       local_waypoints: localWaypoints,
       arrival_radius_m: 6,
       update_hz: 10,
+      face_ship: faceInward,
+      loop_count: missionLoops,
     });
     alert(
-      `Dispatched ${localWaypoints.length} ship-relative waypoints to ${selectedVehicleId}`,
+      `Dispatched ${localWaypoints.length} waypoints for ${missionLoops} loop${missionLoops === 1 ? "" : "s"} to ${selectedVehicleId}`,
     );
     setWaypoints([]);
     setSelectedId(null);
@@ -189,6 +232,39 @@ export function WaypointPlanner({
               onUpdateAltitude={(id, z) => updateWaypoint(id, { z })}
             />
           </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <input
+                  type="checkbox"
+                  checked={faceInward}
+                  onChange={(event) => setFaceInward(event.target.checked)}
+                />
+                Face inward toward YP
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                Mission loops
+                <input
+                  aria-label="Mission loops"
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={missionLoops}
+                  onChange={(event) => setMissionLoops(Math.max(1, Math.min(100, Math.floor(Number(event.target.value) || 1))))}
+                  style={{ width: 72, background: "#1e293b", color: "white", border: "1px solid #475569", padding: 8, borderRadius: 4 }}
+                />
+              </label>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button type="button" title="Export local waypoint plan" aria-label="Export local waypoint plan" onClick={exportPlan} disabled={!waypoints.length} style={{ padding: 8, background: "#334155", color: "white", border: "1px solid #475569", borderRadius: 4, opacity: waypoints.length ? 1 : 0.5 }}>
+                <Download size={16} />
+              </button>
+              <button type="button" title="Import local waypoint plan" aria-label="Import local waypoint plan" onClick={() => importFileRef.current?.click()} style={{ padding: 8, background: "#334155", color: "white", border: "1px solid #475569", borderRadius: 4 }}>
+                <Upload size={16} />
+              </button>
+            </div>
+          </div>
           <div style={{ display: "flex", gap: 10 }}>
             <select
               value={selectedVehicleId}
@@ -238,6 +314,7 @@ export function WaypointPlanner({
               Dispatch
             </button>
           </div>
+          <input ref={importFileRef} type="file" accept="application/json,.json" onChange={importPlan} style={{ display: "none" }} />
         </div>
       </div>
     </div>
@@ -282,31 +359,6 @@ function InteractiveWaypoint2D({
         x: (x / rect.width - 0.5) * width,
         y: -(y / rect.height - 0.5) * height,
       });
-    };
-    const up = () => {
-      target.removeEventListener("pointermove", move);
-      target.removeEventListener("pointerup", up);
-    };
-    target.addEventListener("pointermove", move);
-    target.addEventListener("pointerup", up);
-  };
-  // Yaw is measured clockwise from "up" (ship-forward), matching the backend's compass-style bearing convention.
-  const rotate = (id: string, event: ReactPointerEvent<HTMLDivElement>) => {
-    event.stopPropagation();
-    onSelect(id);
-    const target = event.currentTarget;
-    target.setPointerCapture(event.pointerId);
-    const move = (item: PointerEvent) => {
-      if (!ref.current) return;
-      const waypoint = waypoints.find((candidate) => candidate.id === id);
-      if (!waypoint) return;
-      const rect = ref.current.getBoundingClientRect();
-      const centerX = (waypoint.x / width + 0.5) * rect.width;
-      const centerY = (-waypoint.y / height + 0.5) * rect.height;
-      const dx = item.clientX - rect.left - centerX;
-      const dy = item.clientY - rect.top - centerY;
-      const yaw = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
-      onUpdate(id, { yaw });
     };
     const up = () => {
       target.removeEventListener("pointermove", move);
@@ -361,36 +413,6 @@ function InteractiveWaypoint2D({
             height: 0,
           }}
         >
-          <div
-            style={{
-              position: "absolute",
-              left: 0,
-              top: -22,
-              width: 2,
-              height: 22,
-              backgroundColor: waypoint.id === selectedId ? "#38bdf8" : "#f59e0b",
-              transformOrigin: "bottom center",
-              transform: `translateX(-50%) rotate(${waypoint.yaw}deg)`,
-              pointerEvents: "none",
-            }}
-          />
-          <div
-            onPointerDown={(event) => rotate(waypoint.id, event)}
-            title="Drag to set yaw relative to ship heading"
-            style={{
-              position: "absolute",
-              left: Math.sin((waypoint.yaw * Math.PI) / 180) * 22,
-              top: -Math.cos((waypoint.yaw * Math.PI) / 180) * 22,
-              width: 12,
-              height: 12,
-              backgroundColor: waypoint.id === selectedId ? "#38bdf8" : "#f59e0b",
-              border: "1px solid #78350f",
-              borderRadius: "50%",
-              transform: "translate(-50%, -50%)",
-              cursor: "grab",
-              zIndex: waypoint.id === selectedId ? 11 : 2,
-            }}
-          />
           <div
             onPointerDown={(event) => drag(waypoint.id, event)}
             style={{

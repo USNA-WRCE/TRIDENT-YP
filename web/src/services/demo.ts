@@ -28,6 +28,7 @@ export interface DemoVehicle {
   shipRelativeWaypoints: Array<{ x: number; y: number; z: number; yaw_deg?: number }>;
   shipRelativeShipId?: string;
   shipRelativeIndex: number;
+  shipRelativeFaceShip: boolean;
   mode: string;
   history: Vehicle["history"];
   messages: Vehicle["messages"];
@@ -60,7 +61,7 @@ export function createDemoVehicles(): DemoVehicle[] {
 }
 
 function createDemoVehicle(vehicle_id: string, vehicle_type: VehicleType, lat: number, lon: number, alt: number, heading: number, speed: number, batteryDrainPerSecond: number, battery = 0.86): DemoVehicle {
-  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, mode: "loiter", history: [], messages: {}, localX: 0, localY: 0 };
+  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, shipRelativeFaceShip: false, mode: "loiter", history: [], messages: {}, localX: 0, localY: 0 };
 }
 
 export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number, vehicles: DemoVehicle[]): DemoMessagePayload[] {
@@ -82,7 +83,9 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
   if (vehicle.mode === "ship_relative" && ship && vehicle.shipRelativeWaypoints.length) {
     const waypoint = vehicle.shipRelativeWaypoints[vehicle.shipRelativeIndex];
     vehicle.target = localToGlobalWaypoint(ship.lat, ship.lon, ship.heading, ship.alt, waypoint.x, waypoint.y, waypoint.z);
-    vehicle.targetYawDeg = waypoint.yaw_deg != null ? (ship.heading + waypoint.yaw_deg + 360) % 360 : undefined;
+    vehicle.targetYawDeg = vehicle.shipRelativeFaceShip
+      ? bearingDegrees(vehicle.lat, vehicle.lon, ship.lat, ship.lon)
+      : bearingDegrees(vehicle.lat, vehicle.lon, vehicle.target.latitude, vehicle.target.longitude);
   }
   if (vehicle.mode === "rtb" && yp) vehicle.target = sternTargetForYp(yp, vehicle);
   else if (!vehicle.manualWaypoint && yp) {
@@ -103,7 +106,9 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
       const nextWaypoint = vehicle.shipRelativeWaypoints[vehicle.shipRelativeIndex];
       if (nextWaypoint && ship) {
         vehicle.target = localToGlobalWaypoint(ship.lat, ship.lon, ship.heading, ship.alt, nextWaypoint.x, nextWaypoint.y, nextWaypoint.z);
-        vehicle.targetYawDeg = nextWaypoint.yaw_deg != null ? (ship.heading + nextWaypoint.yaw_deg + 360) % 360 : undefined;
+        vehicle.targetYawDeg = vehicle.shipRelativeFaceShip
+          ? bearingDegrees(vehicle.lat, vehicle.lon, ship.lat, ship.lon)
+          : bearingDegrees(vehicle.lat, vehicle.lon, vehicle.target.latitude, vehicle.target.longitude);
       } else {
         vehicle.mode = "hold";
         if (vehicle.targetYawDeg != null) vehicle.heading = vehicle.targetYawDeg;
@@ -115,15 +120,20 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
   } else {
     const bearing = bearingDegrees(vehicle.lat, vehicle.lon, vehicle.target.latitude, vehicle.target.longitude);
     vehicle.heading = smoothDegrees(vehicle.heading, bearing, Math.min(1, dt * 1.6));
+    const travelBearing = vehicle.mode === "ship_relative" && vehicle.shipRelativeFaceShip ? bearing : vehicle.heading;
     const travel = Math.min(distance, vehicle.speed * dt);
-    const next = destinationPoint(vehicle.lat, vehicle.lon, vehicle.heading, travel);
+    const next = destinationPoint(vehicle.lat, vehicle.lon, travelBearing, travel);
     vehicle.lat = next.latitude;
     vehicle.lon = next.longitude;
     vehicle.alt += Math.max(-1, Math.min(1, vehicle.target.altitude - vehicle.alt)) * Math.min(1, dt);
     if (vehicle.vehicle_type === "usv") vehicle.alt = 0;
     if (vehicle.vehicle_type === "uuv") vehicle.alt = Math.min(-1, vehicle.alt);
-    vehicle.localX += Math.sin((vehicle.heading * Math.PI) / 180) * travel;
-    vehicle.localY += Math.cos((vehicle.heading * Math.PI) / 180) * travel;
+    vehicle.localX += Math.sin((travelBearing * Math.PI) / 180) * travel;
+    vehicle.localY += Math.cos((travelBearing * Math.PI) / 180) * travel;
+  }
+  if (vehicle.mode === "ship_relative" && vehicle.shipRelativeFaceShip && ship) {
+    vehicle.heading = bearingDegrees(vehicle.lat, vehicle.lon, ship.lat, ship.lon);
+    vehicle.targetYawDeg = vehicle.heading;
   }
   vehicle.battery = Math.max(0.05, vehicle.battery - dt * vehicle.batteryDrainPerSecond);
   vehicle.history = [...(vehicle.history ?? []), { stamp, latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt }].slice(-500);
@@ -149,11 +159,15 @@ export function handleDemoCommand(vehicles: DemoVehicle[], vehicleId: string, co
   if (command.type === "ship_relative_trajectory" && yp && ypPosition && command.local_waypoints?.length) {
     const firstWaypoint = command.local_waypoints[0];
     vehicle.mode = "ship_relative"; vehicle.manualWaypoint = true; vehicle.missionWaypoints = [];
-    vehicle.shipRelativeWaypoints = command.local_waypoints;
+    const loopCount = Math.max(1, Math.min(100, Math.floor(command.loop_count ?? 1)));
+    vehicle.shipRelativeWaypoints = Array.from({ length: loopCount }, () => command.local_waypoints!).flat();
     vehicle.shipRelativeShipId = yp.vehicle_id;
     vehicle.shipRelativeIndex = 0;
+    vehicle.shipRelativeFaceShip = command.face_ship ?? false;
     vehicle.target = localToGlobalWaypoint(ypPosition.latitude, ypPosition.longitude, yp.heading, ypPosition.altitude, firstWaypoint.x, firstWaypoint.y, firstWaypoint.z);
-    vehicle.targetYawDeg = firstWaypoint.yaw_deg != null ? (yp.heading + firstWaypoint.yaw_deg + 360) % 360 : undefined;
+    vehicle.targetYawDeg = vehicle.shipRelativeFaceShip
+      ? bearingDegrees(vehicle.lat, vehicle.lon, yp.lat, yp.lon)
+      : bearingDegrees(vehicle.lat, vehicle.lon, vehicle.target.latitude, vehicle.target.longitude);
   }
   if (command.type === "takeoff") { vehicle.mode = "waypoint"; vehicle.manualWaypoint = true; vehicle.missionWaypoints = []; vehicle.shipRelativeWaypoints = []; vehicle.shipRelativeShipId = undefined; vehicle.targetYawDeg = undefined; vehicle.target = { latitude: vehicle.lat, longitude: vehicle.lon, altitude: command.altitude_m ?? 15 }; }
 }

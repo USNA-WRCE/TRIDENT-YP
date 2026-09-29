@@ -84,6 +84,10 @@ class GeometryTests(unittest.TestCase):
         self.assertAlmostEqual(geometry.relative_yaw_to_global(300.0, 90.0), 30.0)
         self.assertAlmostEqual(geometry.relative_yaw_to_global(10.0, -30.0), 340.0)
 
+    def test_bearing_degrees_points_toward_live_ship_position(self):
+        self.assertAlmostEqual(geometry.bearing_degrees(38.901, -76.4, 38.9, -76.4), 180.0)
+        self.assertAlmostEqual(geometry.bearing_degrees(38.9, -76.4, 38.901, -76.4), 0.0)
+
     def test_grid_alternates_tracks_without_changing_altitude(self):
         grid = missions.calculate_search_grid_waypoints(38.9, -76.4, 100, 25, 30)
         self.assertEqual(len(grid), 8)

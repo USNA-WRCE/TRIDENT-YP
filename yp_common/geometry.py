@@ -35,6 +35,19 @@ def relative_yaw_to_global(ship_heading_deg: float, yaw_deg: float) -> float:
     return (ship_heading_deg + yaw_deg) % 360.0
 
 
+def bearing_degrees(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return the clockwise compass bearing from the first point to the second."""
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    lon_delta_rad = math.radians(lon2 - lon1)
+    east_component = math.sin(lon_delta_rad) * math.cos(lat2_rad)
+    north_component = (
+        math.cos(lat1_rad) * math.sin(lat2_rad)
+        - math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(lon_delta_rad)
+    )
+    return math.degrees(math.atan2(east_component, north_component)) % 360.0
+
+
 def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     lat1_rad = math.radians(lat1)
     lat2_rad = math.radians(lat2)

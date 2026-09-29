@@ -76,6 +76,8 @@ export interface Command {
   local_waypoints?: RelativeWaypoint[];
   arrival_radius_m?: number;
   update_hz?: number;
+  face_ship?: boolean;
+  loop_count?: number;
   // mission_plan fields
   waypoints?: Array<{
     latitude: number;

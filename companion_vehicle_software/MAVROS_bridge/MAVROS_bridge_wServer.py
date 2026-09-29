@@ -21,7 +21,12 @@ if str(REPO_ROOT) not in sys.path:
 
 
 from yp_common import behaviors_agnostic
-from yp_common.geometry import distance_m as _distance_m
+from yp_common.geometry import (
+    bearing_degrees as _bearing_degrees,
+    distance_m as _distance_m,
+    relative_waypoint_to_global as _relative_waypoint_to_global,
+    relative_yaw_to_global as _relative_yaw_to_global,
+)
 
 CONFIG_PATH = Path("config.json")
 
@@ -741,6 +746,11 @@ class Bridge:
         local_waypoints = command.get("local_waypoints", [])
         arrival_radius = float(command.get("arrival_radius_m", 6.0))
         update_hz = float(command.get("update_hz", 10.0))
+        face_ship = bool(command.get("face_ship", False))
+        try:
+            loop_count = max(1, min(100, int(command.get("loop_count", 1))))
+        except (TypeError, ValueError):
+            loop_count = 1
         
         if not ship_id or not local_waypoints:
             return
@@ -748,11 +758,11 @@ class Bridge:
         if config.get("auto_arm_offboard", True):
             await self.call_service("/mavros/cmd/arming", "mavros_msgs/CommandBool", {"value": True})
 
-        for index, waypoint in enumerate(local_waypoints):
+        for index, waypoint in enumerate(local_waypoints * loop_count):
             if self.stream_stop_event.is_set():
                 break
                 
-            self.auto_heading = False 
+            self.auto_heading = not face_ship
             if config.get("auto_arm_offboard", True):
                 asyncio.create_task(self.enter_offboard_after_setpoints())
 
@@ -763,19 +773,23 @@ class Bridge:
                     continue
                     
                 ship_heading = ship["heading_deg"]
-                target_lat, target_lon, target_alt = behaviors_agnostic._relative_waypoint_to_global(
+                target_lat, target_lon, target_alt = _relative_waypoint_to_global(
                     ship["lat"], ship["lon"], ship_heading, ship["alt"], waypoint
                 )
                 
                 if config.get("vehicle_type", "uav") in ["usv", "ugv"]:
                     target_alt = 0.0
                     
-                yaw_deg = waypoint.get("yaw_deg")
-                if yaw_deg is not None:
-                    self.last_heading = behaviors_agnostic._relative_yaw_to_global(ship_heading, float(yaw_deg))
+                if face_ship and self.current_pos["lat"] is not None and self.current_pos["lon"] is not None:
+                    self.last_heading = _bearing_degrees(
+                        float(self.current_pos["lat"]), float(self.current_pos["lon"]),
+                        float(ship["lat"]), float(ship["lon"]),
+                    )
                     self.ignore_yaw_flag = False
-                else:
+                elif face_ship:
                     self.ignore_yaw_flag = True
+                else:
+                    self.ignore_yaw_flag = False
                     
                 self.active_waypoint = {"latitude": target_lat, "longitude": target_lon, "altitude": target_alt}
                 

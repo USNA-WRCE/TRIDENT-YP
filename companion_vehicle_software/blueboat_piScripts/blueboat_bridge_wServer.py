@@ -15,6 +15,7 @@ import websockets
 
 import sar_missions
 from yp_common.geometry import (
+    bearing_degrees as _bearing_degrees,
     destination_point as _destination_point,
     relative_waypoint_to_global as _relative_waypoint_to_global,
     relative_yaw_to_global as _relative_yaw_to_global,
@@ -521,18 +522,20 @@ def _stop_ship_relative_mission() -> None:
 def _launch_ship_relative_mission(master, command_data: dict) -> None:
     global _ship_relative_thread, _ship_relative_stop_event
     if not command_data.get("ship_vehicle_id") or not command_data.get("local_waypoints"): return
+    loop_count = max(1, min(100, int(command_data.get("loop_count", 1))))
     _stop_ship_relative_mission()
     stop_event = threading.Event()
     _ship_relative_stop_event = stop_event
-    _ship_relative_thread = threading.Thread(target=_run_ship_relative_mission, args=(master, command_data["ship_vehicle_id"], command_data["local_waypoints"], float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event), daemon=True)
+    _ship_relative_thread = threading.Thread(target=_run_ship_relative_mission, args=(master, command_data["ship_vehicle_id"], command_data["local_waypoints"], float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count), daemon=True)
     _ship_relative_thread.start()
 
-def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event) -> None:
+def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     # SET_POSITION_TARGET_GLOBAL_INT is silently ignored unless already armed in GUIDED.
     sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
     sar_missions.arm_vehicle(master)
-    for index, waypoint in enumerate(local_waypoints, start=1):
+    repeated_waypoints = local_waypoints * max(1, min(100, int(loop_count)))
+    for index, waypoint in enumerate(repeated_waypoints, start=1):
         while not stop_event.is_set():
             ship_state, vehicle_state = _snapshot_ship_state(ship_vehicle_id), _snapshot_vehicle_state()
             if not _ship_state_is_fresh(ship_state) or ship_state is None or vehicle_state.get("lat") is None:
@@ -542,13 +545,22 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
             target_lat, target_lon, target_alt = _relative_waypoint_to_global(float(ship_state["lat"]), float(ship_state["lon"]), ship_heading, float(ship_state.get("alt") or 0.0), waypoint)
             if VEHICLE_TYPE in ["usv", "ugv"]: target_alt = 0.0
             yaw_deg = waypoint.get("yaw_deg")
-            type_mask = int(0b100111000000) if yaw_deg is not None else int(0b110111000000)
-            target_yaw_rad = math.radians(_relative_yaw_to_global(ship_heading, float(yaw_deg))) if yaw_deg is not None else 0.0
+            if face_ship:
+                type_mask = int(0b100111000000)
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]),
+                    float(ship_state["lat"]), float(ship_state["lon"]),
+                ))
+            else:
+                type_mask = int(0b100111000000)
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon,
+                ))
             master.mav.set_position_target_global_int_send(0, master.target_system, master.target_component, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, type_mask, int(target_lat * 1e7), int(target_lon * 1e7), target_alt, float(ship_state.get("vn_ms") or 0.0), float(ship_state.get("ve_ms") or 0.0), 0.0, 0, 0, 0, target_yaw_rad, 0.0)
             alt_condition_met = True if VEHICLE_TYPE in ["usv", "ugv"] else abs(float(vehicle_state["alt"]) - target_alt) <= max(2.0, arrival_radius_m * 0.5)
             if _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon) <= arrival_radius_m and alt_condition_met:
                 # Only break if there are more waypoints in the sequence
-                if index < len(local_waypoints):
+                if index < len(repeated_waypoints):
                     break
             time.sleep(update_period_s)
         if stop_event.is_set(): return

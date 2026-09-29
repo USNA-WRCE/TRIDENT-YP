@@ -1,6 +1,9 @@
 import asyncio
+import math
+import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, WebSocketDisconnect
 
@@ -110,6 +113,80 @@ class APIContractTests(DatabaseTestCase):
 
 
 class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
+    def test_sitl_ship_relative_dispatch_sends_and_completes_waypoint(self):
+        now = time.time()
+        ship_lat, ship_lon = 38.9, -76.4
+        plan = {
+            "ship_vehicle_id": "yp-boat",
+            "vehicle_id": "sitl-drone",
+            "waypoints": [
+                {"x": 0, "y": 20, "z": 15, "yaw_deg": 0},
+                {"x": 0, "y": 20, "z": 15, "yaw_deg": 0},
+            ],
+            "index": 0,
+            "arrival_radius_m": 6.0,
+            "guided_forced": False,
+            "face_ship": True,
+        }
+        states = {
+            "yp-boat": {"lat": ship_lat, "lon": ship_lon, "alt": 2.0, "heading_deg": 0.0, "vn_ms": 1.5, "ve_ms": -0.5, "stamp": now},
+            "sitl-drone": {"lat": 38.9005, "lon": ship_lon, "alt": 2.0, "heading_deg": 0.0, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": now},
+        }
+        master = MagicMock()
+        master.mode_mapping.return_value = {"GUIDED": 4}
+        mavlink = SimpleNamespace(
+            MAV_FRAME_GLOBAL_RELATIVE_ALT_INT=6,
+            MAV_FRAME_GLOBAL_INT=5,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1,
+            MAV_CMD_COMPONENT_ARM_DISARM=400,
+        )
+
+        with patch.object(main, "_mavutil", SimpleNamespace(mavlink=mavlink)), patch.dict(
+            main._sitl_nav_states, states, clear=True,
+        ), patch.dict(main.sitl_bridge_info, {"sitl-drone": {"vehicle_type": "uav"}}, clear=True):
+            self.assertIs(main._step_sitl_ship_relative(master, plan), plan)
+            send_args = master.mav.set_position_target_global_int_send.call_args.args
+            expected_lat = ship_lat + math.degrees(20 / 6_378_137.0)
+            self.assertAlmostEqual(send_args[5] / 1e7, expected_lat, places=5)
+            self.assertAlmostEqual(send_args[7], 17.0)
+            self.assertAlmostEqual(send_args[14], math.pi)
+            self.assertEqual(send_args[8:10], (1.5, -0.5))
+
+            main._sitl_nav_states["sitl-drone"].update({"lat": expected_lat, "lon": ship_lon, "alt": 17.0, "stamp": time.time()})
+            self.assertIs(main._step_sitl_ship_relative(master, plan), plan)
+            self.assertEqual(plan["index"], 1)
+            self.assertIsNone(main._step_sitl_ship_relative(master, plan))
+            self.assertEqual(plan["index"], 2)
+
+    def test_sitl_ship_relative_default_yaw_faces_waypoint_travel_bearing(self):
+        now = time.time()
+        plan = {
+            "ship_vehicle_id": "yp-boat",
+            "vehicle_id": "sitl-drone",
+            "waypoints": [{"x": 0, "y": 20, "z": 15, "yaw_deg": 270}],
+            "index": 0,
+            "arrival_radius_m": 6.0,
+            "guided_forced": False,
+            "face_ship": False,
+        }
+        states = {
+            "yp-boat": {"lat": 38.9, "lon": -76.4, "alt": 2.0, "heading_deg": 0.0, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": now},
+            "sitl-drone": {"lat": 38.899, "lon": -76.4, "alt": 17.0, "heading_deg": 180.0, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": now},
+        }
+        master = MagicMock()
+        mavlink = SimpleNamespace(
+            MAV_FRAME_GLOBAL_RELATIVE_ALT_INT=6,
+            MAV_FRAME_GLOBAL_INT=5,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED=1,
+            MAV_CMD_COMPONENT_ARM_DISARM=400,
+        )
+        with patch.object(main, "_mavutil", SimpleNamespace(mavlink=mavlink)), patch.dict(
+            main._sitl_nav_states, states, clear=True,
+        ), patch.dict(main.sitl_bridge_info, {"sitl-drone": {"vehicle_type": "uav"}}, clear=True):
+            main._step_sitl_ship_relative(master, plan)
+            send_args = master.mav.set_position_target_global_int_send.call_args.args
+            self.assertAlmostEqual(send_args[14], 0.0, places=5)
+
     async def test_sar_path_is_computed_once_and_only_simulators_receive_navigation_points(self):
         for vehicle_id in ("sim-drone", "hardware-drone"):
             with self.subTest(vehicle_id=vehicle_id):

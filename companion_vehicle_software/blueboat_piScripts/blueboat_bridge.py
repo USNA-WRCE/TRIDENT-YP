@@ -11,6 +11,7 @@ import websockets
 
 import sar_missions
 from yp_common.geometry import (
+    bearing_degrees as _bearing_degrees,
     destination_point as _destination_point,
     relative_waypoint_to_global as _relative_waypoint_to_global,
     relative_yaw_to_global as _relative_yaw_to_global,
@@ -273,26 +274,28 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
     if not local_waypoints:
         print("[ERROR] ship_relative_trajectory requires at least one waypoint.")
         return
+    loop_count = max(1, min(100, int(command_data.get("loop_count", 1))))
 
     _stop_ship_relative_mission()
     stop_event = threading.Event()
     _ship_relative_stop_event = stop_event
     _ship_relative_thread = threading.Thread(
         target=_run_ship_relative_mission,
-        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event),
+        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count),
         daemon=True,
     )
     _ship_relative_thread.start()
 
 
-def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event) -> None:
+def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     print(f"[SHIP-REL] Starting mission with {len(local_waypoints)} waypoints relative to {ship_vehicle_id}")
     # SET_POSITION_TARGET_GLOBAL_INT is silently ignored unless already armed in GUIDED.
     sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
     sar_missions.arm_vehicle(master)
 
-    for index, waypoint in enumerate(local_waypoints, start=1):
+    repeated_waypoints = local_waypoints * max(1, min(100, int(loop_count)))
+    for index, waypoint in enumerate(repeated_waypoints, start=1):
         while not stop_event.is_set():
             ship_state = _snapshot_ship_state(ship_vehicle_id)
             vehicle_state = _snapshot_vehicle_state()
@@ -322,12 +325,16 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                 target_alt = 0.0
 
             yaw_deg = waypoint.get("yaw_deg")
-            if yaw_deg is not None:
+            if face_ship:
                 type_mask = int(0b100111000000)
-                target_yaw_rad = math.radians(_relative_yaw_to_global(ship_heading, float(yaw_deg)))
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]), ship_lat, ship_lon,
+                ))
             else:
-                type_mask = int(0b110111000000)
-                target_yaw_rad = 0.0
+                type_mask = int(0b100111000000)
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon,
+                ))
 
             master.mav.set_position_target_global_int_send(
                 0,

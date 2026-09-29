@@ -50,6 +50,7 @@ from app.tiles import router as tile_router, TILE_MAX_CACHE_AGE_SECONDS
 
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
+from yp_common.geometry import bearing_degrees as _bearing_degrees
 
 
 INFLUX_URL = os.getenv("INFLUX_URL", "http://influxdb:8086")
@@ -159,6 +160,8 @@ _sitl_guided_forced: dict[str, bool] = {} # vehicle_id -> True once GUIDED has b
 _sitl_landed_state: dict[str, int] = {} # vehicle_id -> last EXTENDED_SYS_STATE.landed_state seen (real ground-contact detection)
 _sitl_land_touchdown_since: dict[str, float] = {} # vehicle_id -> monotonic time landed_state first read ON_GROUND for the current attempt
 _sitl_land_touchdown_sent: dict[str, bool] = {} # vehicle_id -> True once auto-disarm has fired for the current attempt
+_sitl_nav_lock = threading.Lock()
+_sitl_nav_states: dict[str, dict[str, float]] = {}
 
 # MAVLink MAV_TYPE -> (vehicle_type, human-readable frame name)
 _MAV_TYPE_MAP: dict[int, tuple[str, str]] = {
@@ -744,12 +747,43 @@ async def _run_mavlink_bridge(
             min_pos_interval = 1.0 / send_hz
             last_pos_time = 0.0
             last_gps_fix_time = 0.0
+            active_ship_relative: Optional[dict[str, Any]] = None
 
             while not _stop.is_set():
                 # Forward any outbound commands queued by the asyncio side
                 while True:
                     try:
-                        touched_down = _handle_sitl_command(m, _outbound.get_nowait())
+                        command_payload = _outbound.get_nowait()
+                        command_type = command_payload.get("command", {}).get("type")
+                        if command_type == "_cancel_ship_relative":
+                            active_ship_relative = None
+                            continue
+                        if command_type == "ship_relative_trajectory":
+                            command = command_payload.get("command", {})
+                            ship_vehicle_id = command.get("ship_vehicle_id")
+                            waypoints = command.get("local_waypoints")
+                            try:
+                                loop_count = max(1, min(100, int(command.get("loop_count", 1))))
+                            except (TypeError, ValueError):
+                                loop_count = 1
+                            if ship_vehicle_id and isinstance(waypoints, list) and waypoints:
+                                active_ship_relative = {
+                                    "ship_vehicle_id": str(ship_vehicle_id),
+                                    "waypoints": waypoints * loop_count,
+                                    "index": 0,
+                                    "arrival_radius_m": float(command.get("arrival_radius_m", 6.0)),
+                                    "guided_forced": False,
+                                    "face_ship": bool(command.get("face_ship", False)),
+                                    "vehicle_id": vehicle_id,
+                                }
+                                print(f"[SITL][SHIP-REL] Started {len(waypoints)} waypoints for {vehicle_id} relative to {ship_vehicle_id}")
+                            else:
+                                active_ship_relative = None
+                                print(f"[SITL][SHIP-REL] Invalid ship-relative command for {vehicle_id}")
+                            continue
+
+                        active_ship_relative = None
+                        touched_down = _handle_sitl_command(m, command_payload)
                         if touched_down:
                             try:
                                 _inbound.put_nowait(("LAND_TOUCHDOWN", None, time.time()))
@@ -763,6 +797,9 @@ async def _run_mavlink_bridge(
                 if _sar_active.is_set():
                     time.sleep(0.05)
                     continue
+
+                if active_ship_relative is not None:
+                    active_ship_relative = _step_sitl_ship_relative(m, active_ship_relative)
 
                 # Blocking read — wakes up as soon as a message arrives
                 msg = m.recv_match(
@@ -816,6 +853,11 @@ async def _run_mavlink_bridge(
                     payload = cmd_queue.get_nowait()
                     queued_commands_processed += 1
                     cmd_type = payload.get("command", {}).get("type")
+                    if cmd_type != "ship_relative_trajectory":
+                        try:
+                            _outbound.put_nowait({"command": {"type": "_cancel_ship_relative"}})
+                        except _stdlib_queue.Full:
+                            print(f"[SITL][SHIP-REL] Could not queue cancellation for {vehicle_id}")
                     if cmd_type == "cancel_sar":
                         _sar_stop_event.set()
                         print(f"[SITL][SAR] Cancel requested for {vehicle_id}")
@@ -1024,6 +1066,118 @@ def _execute_sar_command(
             telemetry_callback=telemetry_callback,
         )
         print(f"[SITL][SAR] MOB search mission (streaming) {'COMPLETE' if ok else 'FAILED'}")
+
+
+def _step_sitl_ship_relative(master: Any, plan: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Send one moving-ship-relative setpoint and advance reached waypoints."""
+    ship_vehicle_id = plan["ship_vehicle_id"]
+    vehicle_id = plan["vehicle_id"]
+    with _sitl_nav_lock:
+        ship = dict(_sitl_nav_states.get(ship_vehicle_id, {}))
+        vehicle = dict(_sitl_nav_states.get(vehicle_id, {}))
+
+    now = time.time()
+    if not ship or now - float(ship.get("stamp", 0.0)) > 2.0:
+        return plan
+    if not vehicle or now - float(vehicle.get("stamp", 0.0)) > 2.0:
+        return plan
+
+    index = int(plan["index"])
+    waypoints = plan["waypoints"]
+    if index >= len(waypoints):
+        return None
+    waypoint = waypoints[index]
+    try:
+        local_x = float(waypoint.get("x", 0.0))
+        local_y = float(waypoint.get("y", 0.0))
+        local_z = float(waypoint.get("z", 0.0))
+        ship_heading = float(ship.get("heading_deg", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        print(f"[SITL][SHIP-REL] Invalid waypoint {index + 1} for {vehicle_id}")
+        return None
+
+    distance_from_ship = math.hypot(local_x, local_y)
+    relative_bearing = math.degrees(math.atan2(local_x, local_y))
+    bearing = math.radians((ship_heading + relative_bearing) % 360.0)
+    angular_distance = distance_from_ship / 6_378_137.0
+    ship_latitude = math.radians(float(ship["lat"]))
+    ship_longitude = math.radians(float(ship["lon"]))
+    target_latitude = math.asin(
+        math.sin(ship_latitude) * math.cos(angular_distance)
+        + math.cos(ship_latitude) * math.sin(angular_distance) * math.cos(bearing)
+    )
+    target_longitude = ship_longitude + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(ship_latitude),
+        math.cos(angular_distance) - math.sin(ship_latitude) * math.sin(target_latitude),
+    )
+    target_lat = math.degrees(target_latitude)
+    target_lon = math.degrees(target_longitude)
+    target_alt = float(ship.get("alt", 0.0)) + local_z
+
+    vehicle_type = sitl_bridge_info.get(vehicle_id, {}).get("vehicle_type", "uav")
+    frame = _mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+    if vehicle_type in ("usv", "ugv"):
+        target_alt = 0.0
+        frame = _mavutil.mavlink.MAV_FRAME_GLOBAL_INT
+
+    if not plan["guided_forced"]:
+        mode_mapping = master.mode_mapping()
+        if mode_mapping and "GUIDED" in mode_mapping:
+            master.mav.set_mode_send(
+                master.target_system,
+                _mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_mapping["GUIDED"],
+            )
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 1, 0, 0, 0, 0, 0, 0,
+        )
+        plan["guided_forced"] = True
+
+    if plan.get("face_ship"):
+        type_mask = 0b100111000000
+        target_yaw = math.radians(_bearing_degrees(
+            float(vehicle["lat"]), float(vehicle["lon"]),
+            float(ship["lat"]), float(ship["lon"]),
+        ))
+    else:
+        type_mask = 0b100111000000
+        target_yaw = math.radians(_bearing_degrees(
+            float(vehicle["lat"]), float(vehicle["lon"]), target_lat, target_lon,
+        ))
+
+    master.mav.set_position_target_global_int_send(
+        0,
+        master.target_system,
+        master.target_component,
+        frame,
+        type_mask,
+        int(target_lat * 1e7),
+        int(target_lon * 1e7),
+        target_alt,
+        float(ship.get("vn_ms", 0.0)),
+        float(ship.get("ve_ms", 0.0)),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        target_yaw,
+        0.0,
+    )
+
+    distance_m = _haversine_m(float(vehicle["lat"]), float(vehicle["lon"]), target_lat, target_lon)
+    altitude_reached = vehicle_type in ("usv", "ugv") or abs(float(vehicle.get("alt", 0.0)) - target_alt) <= max(
+        2.0, float(plan["arrival_radius_m"]) * 0.5,
+    )
+    if distance_m <= float(plan["arrival_radius_m"]) and altitude_reached:
+        print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
+        plan["index"] = index + 1
+        if plan["index"] >= len(waypoints):
+            print(f"[SITL][SHIP-REL] Mission complete for {vehicle_id}")
+            return None
+    return plan
 
 
 def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> bool:
@@ -2224,6 +2378,29 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
         heading = extract_heading(msg)
         if heading is not None:
             vehicle["heading"] = heading
+
+        if nav:
+            with _sitl_nav_lock:
+                previous_nav = _sitl_nav_states.get(vehicle_id, {})
+                north_velocity = float(previous_nav.get("vn_ms", 0.0))
+                east_velocity = float(previous_nav.get("ve_ms", 0.0))
+                previous_stamp = float(previous_nav.get("stamp", 0.0))
+                if previous_nav and now > previous_stamp:
+                    latitude_delta = math.radians(float(nav["latitude"]) - float(previous_nav["lat"]))
+                    longitude_delta = math.radians(float(nav["longitude"]) - float(previous_nav["lon"]))
+                    mean_latitude = math.radians((float(nav["latitude"]) + float(previous_nav["lat"])) / 2.0)
+                    elapsed = now - previous_stamp
+                    north_velocity = latitude_delta * 6_378_137.0 / elapsed
+                    east_velocity = longitude_delta * 6_378_137.0 * math.cos(mean_latitude) / elapsed
+                _sitl_nav_states[vehicle_id] = {
+                    "lat": float(nav["latitude"]),
+                    "lon": float(nav["longitude"]),
+                    "alt": float(nav.get("altitude", 0.0)),
+                    "heading_deg": float(vehicle.get("heading") or 0.0) % 360.0,
+                    "vn_ms": north_velocity,
+                    "ve_ms": east_velocity,
+                    "stamp": now,
+                }
 
         battery = extract_battery(topic, msg_type, msg)
         if battery:
