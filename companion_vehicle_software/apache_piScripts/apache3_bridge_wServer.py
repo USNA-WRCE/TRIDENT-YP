@@ -98,6 +98,15 @@ _vehicle_state = {"lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "st
 _ship_state_lock = threading.Lock()
 _ship_state = {"vehicle_id": None, "lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": 0.0}
 
+# --- HEADING & SPEED CONTROLLER STATE THREADING ---
+_controller_thread: threading.Thread | None = None
+_controller_stop_event = threading.Event()
+_controller_target_lock = threading.Lock()
+_controller_targets = {
+    "heading_deg": 0.0,
+    "speed_mps": 0.0,
+}
+
 # --- CONFIG MANAGEMENT & WEB SERVER ---
 
 def load_config() -> dict:
@@ -307,6 +316,8 @@ async def handle_mode_api(request):
         body = await request.json()
         target_mode_id = int(body.get("mode_id", CUSTOM_MODE_AUTO))
 
+        _stop_active_controller()  # Terminate active RC override controller when manual mode change is issued
+
         with mav_master_lock:
             if not mav_master or not system_status["cube_connected"]:
                 return web.json_response({"ok": False, "error": "Apache controller disconnected"}, status=503)
@@ -356,6 +367,103 @@ def set_chcnav_mode(master, mode_id: int):
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
         mode_id
     )
+
+def _send_raw_rc_override(master, steering_pwm: int = 1500, throttle_pwm: int = 1500):
+    """
+    Directly transmits MAVLink RC_CHANNELS_OVERRIDE message (msgid = 70).
+    Channel 1 = Steering (1100 = Full Left, 1500 = Center, 1900 = Full Right)
+    Channel 2 = Throttle (1100 = Full Reverse, 1500 = Neutral, 1900 = Full Forward)
+    """
+    target_sys = master.target_system or 1
+    target_comp = master.target_component or 1
+    master.mav.send(
+        mavutil.mavlink.MAVLink_rc_channels_override_message(
+            target_sys,
+            target_comp,
+            steering_pwm,  # Chan 1: Steering
+            throttle_pwm,  # Chan 2: Throttle
+            1500, 1500, 1500, 1500, 1500, 1500  # Chan 3-8: Neutral
+        )
+    )
+
+def _stop_active_controller():
+    """Stops any running heading/speed control loop thread."""
+    global _controller_thread
+    if _controller_thread and _controller_thread.is_alive():
+        _controller_stop_event.set()
+        _controller_thread.join(timeout=1.0)
+    _controller_stop_event.clear()
+    _controller_thread = None
+
+def _start_heading_speed_control(target_heading_deg: float, target_speed_mps: float):
+    """Spawns or updates the heading/speed controller thread."""
+    global _controller_thread
+    with _controller_target_lock:
+        _controller_targets["heading_deg"] = float(target_heading_deg)
+        _controller_targets["speed_mps"] = float(target_speed_mps)
+
+    if _controller_thread is None or not _controller_thread.is_alive():
+        _controller_stop_event.clear()
+        _controller_thread = threading.Thread(
+            target=_heading_speed_control_loop,
+            daemon=True
+        )
+        _controller_thread.start()
+
+def _heading_speed_control_loop():
+    """
+    15Hz Control Loop Thread: Calculates heading & speed error, computes PWMs, 
+    and streams MAVLink RC_CHANNELS_OVERRIDE messages to the Apache 3.
+    """
+    print("[CONTROLLER] Starting Heading/Speed controller loop...")
+    dt = 1.0 / 15.0  # 15 Hz loop rate
+
+    while not _controller_stop_event.is_set():
+        with _controller_target_lock:
+            target_hdg = _controller_targets["heading_deg"]
+            target_spd = _controller_targets["speed_mps"]
+
+        with mav_master_lock:
+            master = mav_master
+            connected = system_status.get("cube_connected", False)
+
+        if master and connected:
+            with _vehicle_state_lock:
+                current_hdg = _vehicle_state.get("heading_deg", 0.0) or 0.0
+                current_lat = _vehicle_state.get("lat")
+                current_lon = _vehicle_state.get("lon")
+
+            # =================================================================
+            # === ADD YOUR CUSTOM HEADING / SPEED CONTROLLER CODE HERE ===
+            # =================================================================
+            # Input variables available:
+            # - target_hdg: Desired heading angle in degrees (0 - 360)
+            # - target_spd: Desired forward speed in m/s
+            # - current_hdg: Current vessel heading angle in degrees
+            # - dt: Control loop delta time (1/15 s)
+            #
+            # Output requirements:
+            # Calculate steering_pwm (1100 to 1900) and throttle_pwm (1100 to 1900)
+            # Example Placeholder:
+            steering_pwm = 1500  # Replace with calculated steering PWM
+            throttle_pwm = 1500  # Replace with calculated throttle PWM
+            # =================================================================
+
+            try:
+                _send_raw_rc_override(master, steering_pwm=steering_pwm, throttle_pwm=throttle_pwm)
+            except Exception as err:
+                print(f"[CONTROLLER] RC Override Send Error: {err}")
+
+        time.sleep(dt)
+
+    # When controller exits, send neutral PWMs for safety
+    with mav_master_lock:
+        if mav_master and system_status.get("cube_connected", False):
+            try:
+                _send_raw_rc_override(mav_master, 1500, 1500)
+            except Exception:
+                pass
+    print("[CONTROLLER] Heading/Speed controller loop stopped.")
 
 def upload_mission_batch(master, waypoints: list[tuple[float, float]], append_terminal_loiter: bool = True) -> bool:
     """
@@ -413,12 +521,14 @@ def upload_mission_batch(master, waypoints: list[tuple[float, float]], append_te
     return False
 
 def _run_single_waypoint(master, lat: float, lon: float):
+    _stop_active_controller()
     with _sar_mission_lock:
         if upload_mission_batch(master, [(lat, lon)], append_terminal_loiter=True):
             time.sleep(0.2)
             set_chcnav_mode(master, CUSTOM_MODE_AUTO)
 
 def _run_search_grid(master, waypoints: list[tuple[float, float]]):
+    _stop_active_controller()
     with _sar_mission_lock:
         if upload_mission_batch(master, waypoints, append_terminal_loiter=True):
             time.sleep(0.2)
@@ -501,7 +611,7 @@ async def telemetry_loop(current_config: dict) -> None:
     system_status["cube_status"] = "Connecting..."
     system_status["cube_connected"] = False
 
-    ws = None  # declared here so the finally block can always close it
+    ws = None
     try:
         master = mavutil.mavlink_connection(mavlink_url)
         with mav_master_lock:
@@ -527,7 +637,6 @@ async def telemetry_loop(current_config: dict) -> None:
         master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, int(1e6 / 2), 0, 0, 0, 0, 0)
         master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, int(1e6 / 2), 0, 0, 0, 0, 0)
 
-        # Non-blocking WebSocket state variables
         ws_last_connect_attempt = 0.0
         last_send_time = time.time()
         last_video_send_time = 0.0
@@ -539,7 +648,6 @@ async def telemetry_loop(current_config: dict) -> None:
             if ws is None and (now - ws_last_connect_attempt > 5.0):
                 ws_last_connect_attempt = now
                 try:
-                    # Try to connect with a short 2-second timeout so it doesn't block MAVLink reading
                     ws = await asyncio.wait_for(
                         websockets.connect(f"{server_ws_url.rstrip('/')}/{vehicle_id}", ping_interval=10, ping_timeout=10),
                         timeout=2.0
@@ -547,7 +655,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     system_status["ws_connected"] = True
                     system_status["ws_status"] = "Connected"
                     print("[WS] Successfully connected to GCS server.")
-                except Exception as e:
+                except Exception:
                     system_status["ws_connected"] = False
                     system_status["ws_status"] = "Server Offline (Retrying)"
                     ws = None
@@ -562,7 +670,20 @@ async def telemetry_loop(current_config: dict) -> None:
                             command_data = server_msg.get("command", {})
                             cmd_type = command_data.get("type")
 
-                            if cmd_type == "waypoint":
+                            # --- BEHAVIOR 1: Direct Raw RC Override JSON Command ---
+                            if cmd_type == "rc_override":
+                                _stop_active_controller()
+                                steering_pwm = int(command_data.get("steering", 1500))
+                                throttle_pwm = int(command_data.get("throttle", 1500))
+                                _send_raw_rc_override(master, steering_pwm=steering_pwm, throttle_pwm=throttle_pwm)
+
+                            # --- BEHAVIOR 2: Heading & Speed Commands ---
+                            elif cmd_type in ("heading_speed", "rtb_follow"):
+                                target_hdg = float(command_data.get("heading", command_data.get("heading_deg", 0.0)))
+                                target_spd = float(command_data.get("speed_mps", command_data.get("speed", 1.5)))
+                                _start_heading_speed_control(target_hdg, target_spd)
+
+                            elif cmd_type == "waypoint":
                                 target = command_data.get("target", {})
                                 if "latitude" in target and "longitude" in target:
                                     threading.Thread(
@@ -582,13 +703,16 @@ async def telemetry_loop(current_config: dict) -> None:
                                     ).start()
 
                             elif cmd_type == "rtb":
+                                _stop_active_controller()
                                 set_chcnav_mode(master, CUSTOM_MODE_RTL)
 
                             elif cmd_type == "cancel_sar":
+                                _stop_active_controller()
                                 _sar_stop_event.set()
                                 set_chcnav_mode(master, CUSTOM_MODE_LOITER)
 
                             elif cmd_type == "set_mode":
+                                _stop_active_controller()
                                 mode_str = str(command_data.get("mode", "")).upper()
                                 str_map = {"MANUAL": CUSTOM_MODE_MANUAL, "AUTO": CUSTOM_MODE_AUTO, "RTL": CUSTOM_MODE_RTL, "LOITER": CUSTOM_MODE_LOITER, "HOLD": CUSTOM_MODE_HOLD}
                                 if mode_str in str_map:
@@ -643,6 +767,11 @@ async def telemetry_loop(current_config: dict) -> None:
                     lat, lon = msg.lat / 1e7, msg.lon / 1e7
                     heading_raw = getattr(msg, "hdg", None)
                     heading = (heading_raw / 100.0) if heading_raw is not None and heading_raw != 65535 else None
+                    with _vehicle_state_lock:
+                        _vehicle_state["lat"] = lat
+                        _vehicle_state["lon"] = lon
+                        _vehicle_state["heading_deg"] = heading
+                        _vehicle_state["stamp"] = now
                     telemetry_sample = (lat, lon, heading)
 
             # --- 4. Send WebSocket Telemetry ---
@@ -672,7 +801,7 @@ async def telemetry_loop(current_config: dict) -> None:
         system_status["ws_status"] = "Disconnected"
         traceback.print_exc()
     finally:
-        # Guarantee the socket is released on break, exception, or task cancellation.
+        _stop_active_controller()
         if ws is not None:
             try:
                 await ws.close()
