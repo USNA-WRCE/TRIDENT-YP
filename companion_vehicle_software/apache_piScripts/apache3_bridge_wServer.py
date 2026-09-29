@@ -17,6 +17,8 @@ import sar_missions
 
 CONFIG_PATH = Path("config.json")
 
+
+
 def _resolve_webrtc_ip() -> str:
     configured_ip = os.getenv("WEBRTC_IP")
     if configured_ip:
@@ -65,6 +67,10 @@ system_status = {
     "satellites": 0,
     "last_hb_time": 0,
 }
+
+# --- RC OVERRIDE WATCHDOG VARIABLES ---
+_last_rc_cmd_time = 0.0
+_RC_COMMAND_TIMEOUT_S = 0.5  # Neutralize thrusters if no command arrives in 500ms
 
 # --- USV & CHCNAV CONSTANTS ---
 VEHICLE_TYPE = "usv"
@@ -433,6 +439,8 @@ def _heading_speed_control_loop():
                 current_lat = _vehicle_state.get("lat")
                 current_lon = _vehicle_state.get("lon")
 
+            _last_rc_cmd_time = time.time()  # <--- REFRESH WATCHDOG TIMER so behavior times out if messages aren't received at 2 Hz
+
             # =================================================================
             # === ADD YOUR CUSTOM HEADING / SPEED CONTROLLER CODE HERE ===
             # =================================================================
@@ -597,6 +605,37 @@ def _ui_ws_url(base_url: str) -> str:
         return f"{base.split(marker, 1)[0]}/ws/ship_state"
     return base
 
+
+async def _rc_override_watchdog_loop():
+    """
+    Background Watchdog: Continually checks if incoming RC / Heading-Speed commands have timed out.
+    If no new command arrives within _RC_COMMAND_TIMEOUT_S, stops active controllers and sends neutral PWMs.
+    """
+    global _last_rc_cmd_time, mav_master
+
+    while True:
+        await asyncio.sleep(0.1)  # 10 Hz check rate
+
+        now = time.time()
+        # Trigger safety stop if commands were active but stream halted
+        if _last_rc_cmd_time > 0 and (now - _last_rc_cmd_time) > _RC_COMMAND_TIMEOUT_S:
+            print("[WATCHDOG] Control stream timed out!")
+            
+            # 1. Kill the running heading/speed control thread so it doesn't fight the watchdog
+            _stop_active_controller()
+
+            # 2. Send neutral override commands (1500us) to stop thrusters and center rudder
+            with mav_master_lock:
+                if mav_master and system_status.get("cube_connected", False):
+                    try:
+                        _send_raw_rc_override(mav_master, steering_pwm=1500, throttle_pwm=1500)
+                    except Exception as e:
+                        print(f"[WATCHDOG] Error sending neutral safety command: {e}")
+
+            # 3. Reset watchdog timer to prevent repeated print/cmd spam
+            _last_rc_cmd_time = 0.0
+            print("[WATCHDOG] Control stream timed out! Active controller stopped & neutral commands dispatched.")
+
 # --- MAIN TELEMETRY & COMMAND LOOP ---
 
 async def telemetry_loop(current_config: dict) -> None:
@@ -673,6 +712,7 @@ async def telemetry_loop(current_config: dict) -> None:
                             # --- BEHAVIOR 1: Direct Raw RC Override JSON Command ---
                             if cmd_type == "rc_override":
                                 _stop_active_controller()
+                                _last_rc_cmd_time = time.time()  # Reset watchdog timer
                                 steering_pwm = int(command_data.get("steering", 1500))
                                 throttle_pwm = int(command_data.get("throttle", 1500))
                                 _send_raw_rc_override(master, steering_pwm=steering_pwm, throttle_pwm=throttle_pwm)
@@ -813,6 +853,7 @@ async def main():
     config = load_config()
 
     await start_web_server()
+    asyncio.create_task(_rc_override_watchdog_loop())  # Start RC safety watchdog
 
     while True:
         reconnect_event.clear()
