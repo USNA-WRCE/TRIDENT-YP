@@ -7,10 +7,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# ROCm-enabled torch/torchvision for AMD GPU inference (RDNA3/gfx110x); installed
-# before requirements.txt so ultralytics reuses this build instead of pulling the
-# default CPU-only wheel from PyPI. Falls back to CPU automatically if no GPU.
-RUN pip install --no-cache-dir --retries 10 --timeout 120 torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+# GPU backend selection for torch/torchvision, chosen at build time so the same
+# Dockerfile serves AMD (ROCm), NVIDIA (CUDA), and CPU-only hosts:
+#   - AMD/ROCm (default, matches the current test machine): leave as-is.
+#   - NVIDIA: override with `--build-arg TORCH_INDEX_URL=` (empty) or a pinned
+#     CUDA index (e.g. https://download.pytorch.org/whl/cu124); standard PyPI
+#     torch/torchvision wheels on Linux already bundle CUDA support.
+#   - CPU-only: `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu`.
+# Falls back to CPU automatically at runtime if no GPU is exposed to the container.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/rocm6.2
+RUN if [ -n "$TORCH_INDEX_URL" ]; then \
+      pip install --no-cache-dir --retries 10 --timeout 120 torch torchvision --index-url "$TORCH_INDEX_URL"; \
+    else \
+      pip install --no-cache-dir --retries 10 --timeout 120 torch torchvision; \
+    fi
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
