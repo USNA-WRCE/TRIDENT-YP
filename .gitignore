@@ -160,6 +160,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+companion_vehicle_software/**/*env/
+companion_vehicle_software/**/config.json
 
 # Spyder project settings
 .spyderproject
@@ -231,3 +233,5 @@ web/playwright-report/
 data/tiles/
 data/tile-cache/
 data/influx/
+data/yolo_models/
+data/logs/

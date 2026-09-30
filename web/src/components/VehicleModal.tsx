@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Brush, CircleDashed, Maximize2, RotateCcw, Route, Video, X } from "lucide-react";
+import { Anchor, Brush, CircleDashed, Maximize2, PlaneTakeoff, Power, PowerOff, RotateCcw, Route, Video, X } from "lucide-react";
 
 import type { Vehicle, VehicleType } from "../types";
 import { calculateRelativePosition } from "../utils/geo";
@@ -10,13 +10,18 @@ type VehicleModalProps = {
   shipVehicle?: Vehicle;
   sarMissionActive?: boolean;
   canCommand?: boolean;
+  landOnBoatReady?: boolean;
   onClose: () => void;
+  onLandOnBoat: () => void;
   onRtb: () => void;
   onEndSar: () => void;
   onWaypoint: () => void;
   onStreamVideo: () => void;
   onColorSave: (color: string) => void;
   onSetMode: (mode: string) => void;
+  onArm: () => void;
+  onDisarm: () => void;
+  onTakeoff: (altitudeM: number) => void;
 };
 
 const VEHICLE_MODES: Record<VehicleType, string[]> = {
@@ -27,6 +32,9 @@ const VEHICLE_MODES: Record<VehicleType, string[]> = {
   uuv: ["MANUAL", "GUIDED", "AUTO", "RTL", "LOITER"],
   yp: [],
 };
+
+// Only vehicles that fly need a takeoff control.
+const TAKEOFF_CAPABLE_TYPES: VehicleType[] = ["uav", "uavf"];
 
 const VEHICLE_COLOR_PALETTE = [
   "#dc2626", "#ef4444", "#f97316", "#f59e0b", "#eab308", "#84cc16",
@@ -39,8 +47,22 @@ function vehicleMarkerColor(vehicle: Vehicle): string {
   return vehicleWithColor.marker_color ?? "#0ea5e9";
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
-  return <div className={styles.metric}><span>{label}</span><strong>{value}</strong></div>;
+function Metric({ label, value, tone }: { label: string; value: string; tone?: "good" | "warn" | "bad" }) {
+  const toneColor = tone === "good" ? "#16a34a" : tone === "warn" ? "#b45309" : tone === "bad" ? "#dc2626" : undefined;
+  return <div className={styles.metric}><span>{label}</span><strong style={toneColor ? { color: toneColor } : undefined}>{value}</strong></div>;
+}
+
+/** Buckets a MAV_GPS_FIX_TYPE value into a quality tier for GPS fix coloring. */
+function gpsFixQuality(fixType: number): "good" | "warn" | "bad" {
+  if (fixType >= 6) return "good"; // RTK Fixed / Static / PPP
+  if (fixType >= 4) return "warn"; // DGPS / RTK Float
+  return "bad"; // No GPS / No Fix / 2D / 3D only
+}
+
+/** A GPS fix reading older than this is likely leftover from before a link drop or config change. */
+const GPS_FIX_STALE_AFTER_S = 10;
+function isGpsFixStale(stamp: number | undefined): boolean {
+  return stamp == null || Date.now() / 1000 - stamp > GPS_FIX_STALE_AFTER_S;
 }
 
 export function VehicleModal({
@@ -48,17 +70,24 @@ export function VehicleModal({
   shipVehicle,
   sarMissionActive = false,
   canCommand = true,
+  landOnBoatReady = false,
   onClose,
+  onLandOnBoat,
   onRtb,
   onEndSar,
   onWaypoint,
   onStreamVideo,
   onColorSave,
   onSetMode,
+  onArm,
+  onDisarm,
+  onTakeoff,
 }: VehicleModalProps) {
   const position = vehicle.position;
   const [showColorPalette, setShowColorPalette] = useState(false);
   const [showModeSelector, setShowModeSelector] = useState(false);
+  const [showTakeoffPanel, setShowTakeoffPanel] = useState(false);
+  const [takeoffAltitudeM, setTakeoffAltitudeM] = useState(15);
   const [draftColor, setDraftColor] = useState(vehicleMarkerColor(vehicle));
   const canStreamVideo = Boolean(vehicle.video?.enabled && ((Array.isArray(vehicle.video?.streams) && vehicle.video.streams.length > 0) || Boolean(vehicle.video?.playback_url)));
   const modalRef = useRef<HTMLDivElement | null>(null);
@@ -75,7 +104,7 @@ export function VehicleModal({
     return { width, x: Math.min(Math.max(padding, candidate.x), maxX), y: Math.min(Math.max(padding, candidate.y), maxY) };
   };
 
-  useEffect(() => { setFrame((current) => clampFrameToViewport(current)); }, [vehicle.vehicle_id, showColorPalette, showModeSelector]);
+  useEffect(() => { setFrame((current) => clampFrameToViewport(current)); }, [vehicle.vehicle_id, showColorPalette, showModeSelector, showTakeoffPanel]);
   useEffect(() => {
     const onResize = () => setFrame((current) => clampFrameToViewport(current));
     window.addEventListener("resize", onResize);
@@ -105,17 +134,68 @@ export function VehicleModal({
       </div>
       <div className={styles.metrics}>
         <Metric label="Latitude" value={position?.latitude.toFixed(6) ?? "--"} /><Metric label="Longitude" value={position?.longitude.toFixed(6) ?? "--"} /><Metric label="Altitude" value={`${(position?.altitude ?? 0).toFixed(1)} m`} /><Metric label="Heading" value={`${(vehicle.heading ?? 0).toFixed(0)} deg`} /><Metric label="Battery" value={vehicle.battery?.percentage == null ? "--" : `${Math.round(vehicle.battery.percentage * 100)}%`} /><Metric label="SAR Mission" value={sarMissionActive ? "Running" : "Idle"} />
+        {vehicle.gps_fix && (() => {
+          const stale = isGpsFixStale(vehicle.gps_fix!.stamp);
+          const tone = stale ? undefined : gpsFixQuality(vehicle.gps_fix!.fix_type);
+          return (
+            <>
+              <Metric label="GPS Fix" value={stale ? `${vehicle.gps_fix!.fix_type_label} (stale)` : vehicle.gps_fix!.fix_type_label} tone={tone} />
+              <Metric
+                label="GPS Accuracy"
+                value={vehicle.gps_fix!.horizontal_accuracy_m != null ? `±${vehicle.gps_fix!.horizontal_accuracy_m.toFixed(2)} m` : "--"}
+                tone={tone}
+              />
+            </>
+          );
+        })()}
       </div>
       {relativePos && <div style={{ marginTop: "15px", paddingTop: "15px", borderTop: "1px solid #334155" }}><div style={{ fontSize: "12px", fontWeight: "bold", color: "#94a3b8", marginBottom: "8px", textTransform: "uppercase" }}>Ship Reference Frame (FLU)</div><div className={styles.metrics}><Metric label="X (Forward)" value={`${relativePos.x > 0 ? "+" : ""}${relativePos.x.toFixed(1)} m`} /><Metric label="Y (Left/Port)" value={`${relativePos.y > 0 ? "+" : ""}${relativePos.y.toFixed(1)} m`} /><Metric label="Z (Up)" value={`${relativePos.z > 0 ? "+" : ""}${relativePos.z.toFixed(1)} m`} /><Metric label="Radial Dist." value={`${relativePos.distance.toFixed(1)} m`} /></div></div>}
       <div className={styles.modalActions} style={{ marginTop: "15px" }}>
         {canCommand && <button className={styles.secondary} onClick={onEndSar} disabled={!sarMissionActive} title={sarMissionActive ? "Stop active SAR mission" : "No active SAR mission"}><CircleDashed size={18} />End SAR Mission</button>}
         {canCommand && <button className={styles.danger} onClick={onRtb}><RotateCcw size={18} />RTB</button>}
+        {canCommand && (
+          <button
+            className={styles.danger}
+            onClick={onLandOnBoat}
+            disabled={!landOnBoatReady}
+            title={landOnBoatReady ? "Land on the moving pad" : "Available once the vehicle is holding station on RTB (velocity-follow active)"}
+          >
+            <Anchor size={18} />Land on Boat
+          </button>
+        )}
         <button className={styles.secondary} onClick={() => setShowColorPalette((value) => !value)}><Brush size={18} />Color</button>
+        {canCommand && <button className={styles.stream} onClick={onArm}><Power size={18} />Arm</button>}
+        {canCommand && <button className={styles.danger} onClick={onDisarm}><PowerOff size={18} />Disarm</button>}
+        {canCommand && TAKEOFF_CAPABLE_TYPES.includes(vehicle.vehicle_type) && (
+          <button className={styles.primary} onClick={() => setShowTakeoffPanel((value) => !value)}><PlaneTakeoff size={18} />Takeoff{showTakeoffPanel && <X size={14} aria-label="Close takeoff panel" />}</button>
+        )}
         {canCommand && VEHICLE_MODES[vehicle.vehicle_type]?.length > 0 && <button className={styles.secondary} onClick={() => setShowModeSelector((value) => !value)}>Settings{showModeSelector && <X size={14} aria-label="Close mode selector" />}</button>}
         {canStreamVideo && <button className={styles.stream} onClick={onStreamVideo}><Video size={18} />Stream Video</button>}
         {canCommand && <button className={styles.primary} onClick={onWaypoint}><Route size={18} />Waypoint</button>}
       </div>
       {showColorPalette && <div className={styles.colorPanel}><div className={styles.colorSwatches}>{VEHICLE_COLOR_PALETTE.map((color) => <button key={color} className={`${styles.colorSwatch} ${draftColor === color ? styles.selected : ""}`} style={{ backgroundColor: color }} title={color} onClick={() => { setDraftColor(color); onColorSave(color); }} />)}</div></div>}
+      {showTakeoffPanel && TAKEOFF_CAPABLE_TYPES.includes(vehicle.vehicle_type) && (
+        <div className={styles.colorPanel}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <label style={{ fontSize: "12px", color: "#64748b" }}>Altitude (m)</label>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={takeoffAltitudeM}
+              onChange={(event) => setTakeoffAltitudeM(Number(event.target.value))}
+              style={{ width: "70px", padding: "4px 6px", border: "1px solid #cbd5e1", borderRadius: "6px" }}
+            />
+            <button
+              className={styles.primary}
+              style={{ minHeight: "32px", padding: "0 12px" }}
+              onClick={() => { onTakeoff(takeoffAltitudeM); setShowTakeoffPanel(false); }}
+            >
+              Confirm Takeoff
+            </button>
+          </div>
+        </div>
+      )}
       {showModeSelector && VEHICLE_MODES[vehicle.vehicle_type]?.length > 0 && <div className={styles.colorPanel}><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>{VEHICLE_MODES[vehicle.vehicle_type].map((mode) => <button key={mode} className={styles.secondary} style={{ fontSize: "13px", padding: "6px 8px" }} onClick={() => { onSetMode(mode); setShowModeSelector(false); }}>{mode}</button>)}</div></div>}
       <div style={{ position: "absolute", bottom: 0, right: 0, width: "24px", height: "24px", cursor: "nwse-resize", display: "flex", alignItems: "flex-end", justifyContent: "flex-end", padding: "4px" }} onPointerDown={(event) => startDrag("resize", event)} onPointerMove={moveDrag} onPointerUp={endDrag}><Maximize2 size={14} color="#64748b" style={{ transform: "rotate(90deg)" }} /></div>
     </div>

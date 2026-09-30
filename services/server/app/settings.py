@@ -42,6 +42,20 @@ class ApplicationSettings(Base):
     )
 
 
+class DetectorSettings(Base):
+    """Persistent tunables for the YOLO detector and PTZ auto-track controller."""
+    __tablename__ = "detector_settings"
+
+    id = Column(Integer, primary_key=True)
+    values_json = Column(Text, default="{}", nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
 APPLICATION_SETTING_DEFAULTS: dict[str, Any] = {
     "trail_seconds": 45.0,
     "show_yp_range_rings": True,
@@ -49,6 +63,13 @@ APPLICATION_SETTING_DEFAULTS: dict[str, Any] = {
     "rtb_update_hz": 2.0,
     "rtb_stern_distance_m": 35.0,
     "rtb_altitude_m": 30.0,
+    "rtb_yp_safe_distance_m": 20.0,
+    "land_on_boat_hover_clearance_m": 0.5,
+    "land_on_boat_descent_rate_ms": 0.5,
+    "land_on_boat_pad_offset_m": -0.4,
+    "land_on_boat_alignment_radius_m": 1.0,
+    "land_on_boat_auto_disarm": True,
+    "land_on_boat_touchdown_dwell_s": 1.5,
     "mob_track_seconds": 120.0,
     "mob_swath_m": 20.0,
     "mob_altitude_m": 30.0,
@@ -60,6 +81,12 @@ APPLICATION_SETTING_DEFAULTS: dict[str, Any] = {
     "rtk_host_or_port": "/dev/ttyACM0",
     "rtk_network_port": 9000,
     "rtk_baudrate": 115200,
+    "coordinated_fallback_range_m": 20.0,
+    "camera_spatial": {
+        "port": {"x_m": 0.0, "y_m": -1.0, "z_m": 2.0, "heading_deg": 270.0, "tilt_deg": 0.0, "pan_zero_deg": 0.0, "hfov_deg": 70.0, "vfov_deg": 45.0},
+        "starboard": {"x_m": 0.0, "y_m": 1.0, "z_m": 2.0, "heading_deg": 90.0, "tilt_deg": 0.0, "pan_zero_deg": 0.0, "hfov_deg": 70.0, "vfov_deg": 45.0},
+        "aft": {"x_m": -2.0, "y_m": 0.0, "z_m": 2.0, "heading_deg": 180.0, "tilt_deg": 0.0, "pan_zero_deg": 0.0, "hfov_deg": 70.0, "vfov_deg": 45.0},
+    },
 }
 
 
@@ -86,13 +113,32 @@ def normalize_application_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "message_retention_seconds": (60, 30 * 24 * 60 * 60),
         "rtb_update_hz": (0.2, 20.0),
         "rtk_network_port": (1, 65535),
+        "land_on_boat_touchdown_dwell_s": (0.5, 10.0),
     }
     for key, value in payload.items():
         if key not in APPLICATION_SETTING_DEFAULTS:
             continue
-        if key == "show_yp_range_rings":
+        if key in ("show_yp_range_rings", "land_on_boat_auto_disarm"):
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be a boolean")
+        elif key == "camera_spatial":
+            if not isinstance(value, dict):
+                raise ValueError("camera_spatial must be an object")
+            normalized_cameras = {}
+            for camera_id, camera in value.items():
+                if not isinstance(camera, dict):
+                    raise ValueError(f"camera_spatial.{camera_id} must be an object")
+                normalized_camera = {}
+                for field in ("x_m", "y_m", "z_m", "heading_deg", "tilt_deg", "pan_zero_deg", "hfov_deg", "vfov_deg"):
+                    try:
+                        number = float(camera.get(field, 0.0))
+                    except (TypeError, ValueError):
+                        raise ValueError(f"camera_spatial.{camera_id}.{field} must be a number")
+                    if not math.isfinite(number):
+                        raise ValueError(f"camera_spatial.{camera_id}.{field} must be finite")
+                    normalized_camera[field] = number % 360.0 if field.endswith("_deg") else number
+                normalized_cameras[str(camera_id)] = normalized_camera
+            value = normalized_cameras
         elif key == "yp_role_vehicle_id":
             value = str(value).strip() if value and str(value).strip() else None
         elif key == "rtk_source_type":
@@ -102,6 +148,10 @@ def normalize_application_settings(payload: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("rtk_host_or_port must be a non-empty hostname or serial path")
             value = value.strip()
+        elif key == "land_on_boat_pad_offset_m":
+            value = float(value)
+            if isinstance(value, bool) or not math.isfinite(value):
+                raise ValueError(f"{key} must be a finite number")
         else:
             value = _positive_number(key, value)
             if key in bounds:
@@ -147,6 +197,26 @@ def update_application_settings(payload: dict[str, Any]) -> tuple[bool, str]:
         except Exception as error:
             session.rollback()
             return False, f"Error updating application settings: {error}"
+
+
+def get_detector_settings() -> dict[str, Any]:
+    """Return persisted YOLO detector/PTZ-track tunables (raw, no defaults applied)."""
+    with get_db_session() as session:
+        record = session.query(DetectorSettings).first()
+        return _json_object(record.values_json) if record else {}
+
+
+def update_detector_settings(patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge and persist detector/track tunables; returns the full stored blob."""
+    with get_db_session() as session:
+        record = session.query(DetectorSettings).first()
+        if not record:
+            record = DetectorSettings(values_json="{}")
+            session.add(record)
+        stored = {**_json_object(record.values_json), **patch}
+        record.values_json = json.dumps(stored)
+        session.commit()
+        return stored
 
 
 def get_deconfliction_settings() -> dict[str, Any]:

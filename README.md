@@ -14,6 +14,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 - [Commanding and mission planning](#commanding-and-mission-planning)
 - [Search and rescue operations](#search-and-rescue-operations)
 - [Video streams](#video-streams)
+- [Axis cameras and tracking](#axis-cameras-and-tracking)
 - [Vehicle deconfliction](#vehicle-deconfliction)
 - [Advanced integrations](#advanced-integrations)
 - [Message transport](#message-transport)
@@ -31,6 +32,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 - `sim-umaa`: Loopback UMAA vehicle for testing the ground-station workflow before real DDS topics are available.
 - `yp-gps`: Simulated or serial NMEA YP GPS publisher.
 - `arducopter_ws_bridge`: Hardware WebSocket bridge for real ArduPilot/MAVLink vehicles.
+- `yolo-detector`: Optional Ultralytics YOLO service that analyzes Axis camera MJPEG feeds and sends bounding boxes to the UI. Its Compose service is commented out by default; enable it in `docker-compose.yml` before starting it.
 - `px4-sitl-uav`, `mavros`, `ros-master`, `rosbridge`, and `px4-yp-bridge`: Optional PX4/MAVROS simulation path.
 - `umaa-bridge`: RTI Connext DDS bridge shell for a real UMAA vehicle.
 - `influxdb`: Time-series storage for telemetry and command messages.
@@ -46,10 +48,12 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 | `services/sim_vehicle/` | Lightweight simulated vehicles |
 | `services/umaa_bridge/` | UMAA loopback and RTI adapter |
 | `services/arducopter_ws_bridge/` | ArduPilot WebSocket bridge |
+| `services/yolo_detector/` | Optional YOLO camera detection service |
 | `services/px4_*` and `services/mavros/` | Optional PX4/MAVROS path |
 | `services/yp_gps/` | YP GPS publisher |
 | `services/telemetry_radio_bridge.py` | Standalone serial-radio bridge |
-| `services/com_tcp_relay.py` | Windows COM-to-TCP relay |
+| `services/com_tcp_relay.py` | Cross-platform serial-to-TCP relay |
+| `services/relay_agent.py` | Local HTTP agent so the UI can start/stop the relay above |
 | `companion_vehicle_software/` | Companion-computer integrations |
 | `scripts/download_tiles.py` | Optional offline tile-source helper |
 | `data/auth/` and `data/tile-cache/` | Local persistent runtime data |
@@ -69,7 +73,9 @@ Open:
 - API root/status links: `http://localhost:8000`
 - InfluxDB: `http://localhost:8086`
 
-The default compose file starts two simulated UAVs (`sim-uav1`, `sim-uav2`), one simulated USV, one simulated UUV, the `sim-umaa` loopback vehicle, and a simulated YP GPS source near the Severn River off the US Naval Academy.
+The default Compose stack starts two simulated UAVs (`sim-uav1`, `sim-uav2`), one simulated USV, one simulated UUV, the `sim-umaa` loopback vehicle, and a simulated YP GPS source near the Severn River off the US Naval Academy. The optional `yolo-detector` service is commented out in `docker-compose.yml`; uncomment its service block to run camera detection. It requires configured, reachable Axis cameras and does not affect telemetry when no cameras are configured.
+
+When enabled, the detector can use CPU inference. On a compatible AMD GPU host, uncomment the `/dev/kfd` and `/dev/dri` device mappings in its Compose service to use the ROCm-enabled image.
 
 The normal stack does not require ROS. ROS is only required for the optional PX4/MAVROS profile.
 
@@ -100,6 +106,8 @@ The map displays icons for USV, UAV (quad and fixed wing), UUV, UGV,and YP; head
 
 Click a vehicle marker to open its draggable modal. It provides real-time position, altitude, heading, battery, SAR status, and, when a mother ship is selected, forward/left/up and radial ship-frame distances. Depending on permissions and vehicle type it also provides RTB, Waypoint, flight-mode controls, video, and a marker color picker.
 
+Vehicles with MAVLink GPS telemetry also show fix type, horizontal accuracy, and satellite count. Fix types include `3D Fix`, `DGPS`, `RTK Float`, and `RTK Fixed`; the UI marks a fix stale after 10 seconds without a fresh reading. The top-bar GPS status list shows the same quality and age information for all vehicles.
+
 ### Settings
 
 <p align="center">
@@ -109,7 +117,7 @@ Click a vehicle marker to open its draggable modal. It provides real-time positi
 The settings tabs appear in the UI as Display, Deconfliction, Man Overboard, Vessel, and RTK Correction.
 
 - **Display:** trail window, YP range rings, and database message retention.
-- **Vessel:** choose a connected vehicle as the YP mother vessel, or use the dedicated `yp-gps` service; configure RTB update rate, stern distance, and altitude.
+- **Vessel:** choose a connected vehicle as the YP mother vessel, or use the dedicated `yp-gps` service; configure RTB update rate, stern distance, altitude, and the YP safe distance used to route RTB pathing around the YP.
 - **Deconfliction:** enable the feature, configure global and per-type safety radii, avoidance orbit radius, and maximum pause duration.
 - **Man Overboard:** configure track length, swath width, search altitude, corridor width, takeoff altitude, and climb speed.
 - **RTK Correction:** select a serial, TCP, UDP, or disabled RTCM3 source and configure its device or host, network port, and serial baud rate. Raw correction frames are fragmented into MAVLink `GPS_RTCM_DATA` messages and distributed to connected vehicles.
@@ -125,6 +133,8 @@ Users with the `manage_settings` permission can open the disk icon in the top to
 On Linux or macOS, this is a gzip-compressed text file rather than a tar archive. Use `gzip -t flight-log.jsonl.gz` to validate it, then `gzip -dk flight-log.jsonl.gz` to create `flight-log.jsonl` while keeping the compressed file. Do not use `tar -xzf`, which expects a `.tar.gz` archive and can report `missing type keyword in mtree specification` for this file. On Windows, 7-Zip can extract the `.gz` file directly.
 
 Exports do not modify InfluxDB and include only data still retained there. The `message_retention_seconds` setting may remove older records before they can be exported.
+
+By default, `yp-server` also writes a shutdown export when stopped cleanly with Ctrl+C, `docker compose stop`, or `docker compose down`. It saves a gzip-compressed JSON Lines file named `yp-flight-log-<start>-<end>.jsonl.gz` under `data/logs/` (mounted into the container as `/data/logs`). This automatic copy covers the current server run and retained non-heartbeat records. It can be disabled with `LOG_EXPORT_ON_SHUTDOWN=false`; `LOG_EXPORT_DIR` changes the destination. Compose allows 30 seconds for the export to finish during shutdown. A forced kill or unavailable InfluxDB can prevent the file from being written.
 
 ### Demo and view-only modes
 
@@ -170,12 +180,12 @@ Administrators open **User Management** from the users icon. The panel creates a
 | Role | Capabilities |
 | --- | --- |
 | `view_only` | Read telemetry and vehicle status |
-| `waypoint_command` | View permissions plus waypoints, RTB, mode changes, and SAR cancellation |
+| `waypoint_command` | View permissions plus waypoints, RTB, mode changes, arm/disarm/takeoff, and SAR cancellation |
 | `mission_planning` | Waypoint permissions plus mission creation, upload, and search grids |
 | `man_overboard` | Mission planning plus MOB dispatch |
 | `admin` | All operational permissions plus settings, connections, video streams, and user management |
 
-Custom permissions: `read_telemetry`, `read_vehicle_status`, `send_waypoint`, `send_rtb`, `set_vehicle_mode`, `cancel_sar`, `create_mission`, `upload_mission`, `search_grid`, `trigger_mob`, `manage_sitl`, `manage_settings`, `manage_video_streams`, and `manage_users`.
+Custom permissions: `read_telemetry`, `read_vehicle_status`, `send_waypoint`, `send_rtb`, `set_vehicle_mode`, `cancel_sar`, `arm_disarm`, `create_mission`, `upload_mission`, `search_grid`, `trigger_mob`, `manage_sitl`, `manage_settings`, `manage_video_streams`, and `manage_users`.
 
 Accounts are stored in SQLite at `data/auth/auth.db`, mounted into `yp-server` as `/data/auth/auth.db`. They persist across rebuilds and container recreation. Deleting the database intentionally resets the store to `admin` / `admin`; the database contains password hashes and is excluded from Git.
 
@@ -224,6 +234,8 @@ GET /api/serial-ports
 
 The standalone `services/telemetry_radio_bridge.py` can also forward a serial radio directly to the YP WebSocket.
 
+To avoid opening a terminal every time you switch a port or baud rate, run `python services/relay_agent.py` once on the host (any OS). It exposes a small local control API on `http://127.0.0.1:5757` that the RFD-900 tab and the RTK Correction settings tab use to start/stop `com_tcp_relay.py` for you — the "Start relay automatically" buttons only appear once the agent is detected.
+
 ### Hardware and companion bridges
 
 - `arducopter_ws_bridge` connects a real ArduPilot/MAVLink vehicle over WebSocket and supports waypoint, RTB, SAR, and flight-mode commands.
@@ -232,6 +244,11 @@ The standalone `services/telemetry_radio_bridge.py` can also forward a serial ra
 - `companion_vehicle_software/Hunter_YPEmulator/` contains the YP emulator.
 
 SAR mission code is shared in `yp_common/`; existing bridge script names remain valid. For a Pi deployment that copies only a bridge directory, use the [companion bundle instructions](companion_vehicle_software/README.md) to include its shared code.
+
+MAVLink bridges request `GPS_RAW_INT` and `GPS2_RAW` at 2 Hz and publish the
+result on `/vehicles/<vehicle_id>/gps_fix`, including fix type, accuracy, and
+visible satellites. Companion and bridge processes use `SEND_HZ` (default `5`)
+to throttle forwarded telemetry and GPS-fix updates.
 
 The optional `arducopter` profile starts the WebSocket bridge and exposes UDP port `14600` for an external ArduPilot SITL or MAVLink vehicle. This repository does not include an ArduPilot SITL image:
 
@@ -243,8 +260,11 @@ The other standalone bridge utilities are:
 
 - `services/server/app/main.py`: FastAPI SITL bridge with waypoint, RTB, SAR, mission-upload, and flight-mode support.
 - `services/px4_mavros_bridge/px4_mavros_bridge.py`: ROS/MAVROS to YP bridge with PX4 mode mapping.
+- `companion_vehicle_software/px4_piScripts/px4_bridge_wServer.py`: Companion-computer PX4/MAVLink bridge with a local configuration/status web page and automatic `.ulg` log download on disarm. Configure its `SERVER_WS_URL`, `VEHICLE_ID`, MAVLink endpoint, and baud rate for the vehicle/network; its default values are examples, not portable deployment settings. It installs dependencies from `companion_vehicle_software/px4_piScripts/requirements.txt` and serves its local page on port `8081` by default.
 - `services/umaa_bridge/umaa_bridge.py`: RTI Connext DDS bridge for UMAA vehicles.
 - `companion_vehicle_software/blueboat_piScripts/simplified_bridge.py`: Minimal MAVLink-to-YP telemetry bridge example.
+
+The ArduPilot and BlueBoat `*_wServer.py` companion bridges automatically request the most recently closed DataFlash log when the vehicle disarms. They save `.bin` files on the companion host and list/serve them from the bridge's local web interface; this is separate from the server's InfluxDB JSONL export. Keep the companion host's `flight_logs/` directory and downloaded files managed according to the vehicle's storage policy.
 
 ## Commanding and mission planning
 
@@ -277,7 +297,11 @@ All bridge types support these command types where the vehicle can execute them:
 | `mob` | Stream a curved track-following MOB mission |
 | `cancel_sar` | Cancel an active streaming SAR mission |
 | `mission_plan` | Upload a waypoint sequence and optionally arm/start AUTO |
+| `ship_relative_trajectory` | Continuously target waypoints expressed in the selected YP's local frame |
 | `set_mode` | Change the vehicle flight mode |
+| `arm` | Arm the vehicle |
+| `disarm` | Disarm the vehicle |
+| `takeoff` | Arm (in GUIDED) and take off to `altitude_m` — UAV/UAVF only |
 
 Available mode lists are vehicle-specific. ArduPilot UAVs support `STABILIZE`, `ACRO`, `ALT_HOLD`, `AUTO`, `GUIDED`, `LOITER`, `RTL`, `CIRCLE`, `LAND`, `DRIFT`, `SPORT`, `FLIP`, `AUTOTUNE`, and `POSHOLD`; ArduPilot USV/UGV support `MANUAL`, `GUIDED`, `AUTO`, `RTL`, `LOITER`, and `CIRCLE`; PX4 UAVF supports `MANUAL`, `ALTITUDE_CONTROL`, `POSITION_CONTROL`, `AUTO`, `OFFBOARD`, and `EMERGENCY`.
 
@@ -301,7 +325,17 @@ Published mission overlays remain on the map until cleared.
 
 ![Local Waypoint Planner](screenshots/local_waypoint_planner.png)
 
-The **Local Waypoint Planner** tab is separate from Mission Planner. It creates ship-relative trajectories from the current YP position and provides spatial context for local operations. It uses the `ship_relative_trajectory` command with `RelativeWaypoint` values (`x`, `y`, `z`).
+The **Local Waypoint Planner** tab is separate from Mission Planner. It creates ship-relative trajectories from the current YP position and provides spatial context for local operations. It uses the `ship_relative_trajectory` command with `RelativeWaypoint` values (`x`, `y`, `z`): `x` is starboard-positive, `y` is bow/forward-positive, and `z` is an altitude adjustment above the selected base dispatch altitude.
+
+- Add points in the top-down planner or generate a circular track. The circle starts at the YP's bow and places evenly spaced points clockwise; configure its radius (1–75 m) and waypoint count (3–100). The lateral view has 25 m, 50 m, and 75 m range rings.
+- **Base dispatch altitude** defaults to 15 m above the YP. The altitude profile shows each point's final relative altitude; dragging a point adjusts that height relative to the base. The resulting waypoint `z` sent to bridges is the base altitude plus the point adjustment. New waypoints and generated circles start with a 0 m adjustment, so they dispatch at the selected base altitude.
+- **Face inward toward YP** makes the dispatched vehicle continuously face the YP. When disabled, the vehicle faces its current direction of travel toward the active waypoint.
+- **Mission loops** repeats the full ordered route for the selected number of passes (1–100).
+- **Hold final relative waypoint** keeps streaming the last waypoint relative to the moving YP after all loops finish. The hold ends when another command is sent to that vehicle; leave it disabled to finish the route normally.
+- Export and import use the planner's versioned JSON format, retaining local waypoint coordinates, altitude adjustments, inward-facing setting, loop count, and base dispatch altitude.
+- Select a vehicle and connected YP with fresh position and heading before dispatch. Ship-relative trajectory dispatch requires the `upload_mission` permission. It is implemented by the TCP SITL bridge and the supported ArduPilot, BlueBoat, PX4, and MAVROS bridges; other bridge types may not execute this command.
+
+Holding a relative position is not a collision-avoidance guarantee. Maintain a suitable standoff, verify YP and vehicle telemetry, and retain an independent safety-pilot/RC override. If the YP state becomes stale, bridge behavior depends on the vehicle/autopilot failsafe; do not rely on this option as the sole collision-prevention measure.
 
 ## Search and rescue operations
 
@@ -357,6 +391,116 @@ curl -X PUT http://localhost:8000/api/video/streams/blueboat-03 \
 ```
 
 MAVLink camera discovery probes `<camera-host>:8889` after bridge connection and every 60 seconds. On success it publishes `http://<camera-host>:8889/cam/whep`. The `yp-server` container must be able to reach that host and port. A failed probe does not erase an existing stream. The optional Camera Host field is sent as `camera_host`; when omitted, host-based `tcp:`, `tcpout:`, `udpout:`, and `udpbcast:` URLs can provide the host. Serial URLs, inbound/wildcard listeners, `0.0.0.0`, and `localhost` require an explicit camera host. The probe checks raw TCP reachability; the browser negotiates WHEP only when video is opened.
+
+## Axis cameras and tracking
+
+Configure reachable Axis camera IPs in the `yp-server` environment and
+recreate that service:
+
+```yaml
+AXIS_CAMERA_USERNAME: root
+AXIS_CAMERA_PASSWORD: "your-camera-password"
+AXIS_CAMERA_AFT_HOST: "192.168.0.50"
+AXIS_CAMERA_PORT_HOST: "192.168.0.51"
+AXIS_CAMERA_STARBOARD_HOST: ""
+```
+
+The camera panel probes configured hosts and shows their online status. Live
+video is proxied through the server as MJPEG, keeping Axis credentials out of
+the browser. PTZ controls use `POST /api/cameras/{id}/ptz` and require the
+`control_cameras` permission, included in the admin permission level. The
+camera service checks camera availability every 15 seconds. The camera view
+supports hold-to-move directional buttons, click-dragging the live image to
+pan/tilt, and mouse-wheel zoom. The camera window can be dragged by its header
+and resized from its lower-right corner.
+
+The **All cameras** view displays all configured feeds simultaneously. Each
+camera tile includes detection overlays, per-camera PTZ controls, and a
+`Track this camera` toggle. This is the primary tracking control surface; the
+Detection tab contains model and detector tuning rather than duplicate camera
+tracking switches.
+
+### Spatial Setup
+
+The **Spatial Setup** tab stores persistent calibration relative to the YP
+landing-pad center. The coordinate frame is:
+
+- `X+`: forward
+- `Y+`: starboard
+- `Z+`: upward
+
+Each camera has position fields in metres and orientation fields in degrees:
+
+| Field | Meaning |
+| --- | --- |
+| `x_m`, `y_m`, `z_m` | Camera position relative to the YP reference point |
+| `heading_deg` | Physical pan-zero direction relative to the YP |
+| `tilt_deg` | Physical vertical mounting angle |
+| `pan_zero_deg` | Correction for a rotated PTZ zero position |
+| `hfov_deg`, `vfov_deg` | Horizontal and vertical field of view used by tracking geometry |
+| `coordinated_fallback_range_m` | Temporary acquisition range used before a second camera sees the target |
+
+The settings are stored in the application SQLite database and survive
+container restarts. The current displayed ship-relative bearing is calculated
+from the calibrated heading, pan-zero correction, and live PTZ pan telemetry.
+
+### YOLO detection and camera tracking
+
+The optional `yolo-detector` service discovers online Axis cameras, reads their
+server-proxied MJPEG feeds, and publishes bounding boxes over the internal
+`/ws/detector` WebSocket. The Camera panel overlays fresh detections in both
+the selected-camera view and All cameras view. Per-camera detection identities
+are assigned short-lived `track_id` values based on class and bounding-box
+overlap.
+
+The detector service is commented out in the default `docker-compose.yml`.
+Uncomment its service block to enable it; configure reachable Axis cameras and
+choose CPU or the documented AMD GPU device passthrough as appropriate. The
+other ground-station services do not require the detector.
+
+Users with `control_cameras` can upload or select `.pt`/`.onnx` models, change
+the confidence threshold, and change the inference interval. The bundled
+default model is `yolov8n.pt`. On AMD GPU hosts, the detector uses ROCm
+PyTorch and logs the active device at startup, for example:
+
+```text
+YOLO inference device: cuda:0 (AMD Radeon RX 7900 XTX)
+```
+
+The same panel can enable PTZ auto-track per camera. When enabled, the server
+centers the highest-confidence detection using proportional pan/tilt control.
+Manual PTZ movement disables auto-track. A watchdog stops stale continuous PTZ
+motion if detector updates stop arriving.
+
+Coordinated tracking is optional. Enable tracking for the aft and port cameras,
+then enable **Coordinate enabled cameras** in All cameras. The first camera's
+calibrated bearing is used as an approximate acquisition cue; after both
+cameras detect the same class, the server intersects their calibrated bearing
+rays and uses the resulting YP-relative horizontal position. The current
+fusion result estimates `x_m` and `y_m`; altitude is not yet estimated.
+
+The temporary single-camera acquisition range is configured in Spatial Setup
+and defaults to `20 m`. Because one camera cannot determine target range by
+itself, this value is only an acquisition approximation; the two-camera
+intersection is the authoritative spatial estimate.
+
+Track settings are persisted with the detector settings and can be changed through:
+
+```http
+GET  /api/detector/models
+POST /api/detector/models
+POST /api/detector/model
+POST /api/detector/settings
+GET  /api/detector/track-settings
+POST /api/detector/track-settings
+GET  /api/cameras/{camera_id}/track
+POST /api/cameras/{camera_id}/track
+```
+
+Uploaded models are stored in `data/yolo_models/` and shared with the detector
+container. Set `YOLO_CAMERA_IDS` to a comma-separated list to pin cameras;
+leave it empty to discover all online cameras. `YOLO_CLASSES` optionally limits
+detections to comma-separated class labels.
 
 ## Vehicle deconfliction
 
@@ -495,7 +639,16 @@ Runtime viewing caches only tiles requested by the active viewport. It does not 
 | `yp-server` | `MESSAGE_RETENTION_SECONDS` | `600` | Message retention |
 | `yp-server` | `MESSAGE_CLEANUP_INTERVAL_SECONDS` | `600` | Message cleanup interval |
 | `yp-server` | `INFLUX_MAX_WRITE_HZ` | `5` | Influx write limit |
-| `yp-server` | `RTB_STERN_DISTANCE_M` / `RTB_UPDATE_HZ` / `RTB_ALTITUDE_M` | `35.0` / `2.0` / `30.0` | RTB target, update rate, and transit altitude |
+| `vehicle bridges` | `SEND_HZ` | `5` | Telemetry and GPS-fix forwarding rate |
+| `yolo-detector` | `YOLO_MODEL_PATH` / `YOLO_MODELS_DIR` | `yolov8n.pt` / `/data/yolo_models` | Active model and shared model directory |
+| `yolo-detector` | `YOLO_CONF_THRESHOLD` / `YOLO_INFER_INTERVAL_SECONDS` | `0.4` / `0.5` | Detection confidence threshold and inference interval in seconds |
+| `yolo-detector` | `YOLO_IMGSZ` | `416` | Inference image size; lower values improve CPU speed, higher values can improve small-object recall |
+| `yolo-detector` | `YOLO_DEVICE` | `auto` | `auto` selects the exposed ROCm/CUDA device; `cpu` forces CPU inference |
+| `yolo-detector` | `YOLO_DISCOVERY_INTERVAL_SECONDS` | `15` | Online-camera discovery interval |
+| `yolo-detector` | `YOLO_CAMERA_IDS` / `YOLO_CLASSES` | empty / empty | Optional camera and class filters; empty means auto-discover all cameras or allow all classes |
+| `yp-server` | `AXIS_CAMERA_PROBE_INTERVAL_SECONDS` | `15.0` | Axis camera availability probe interval |
+| `yp-server` | `AXIS_CAMERA_*_HEADING_DEG` | camera-specific | Environment defaults for camera mounting headings; Spatial Setup overrides these after persistence |
+| `yp-server` | `RTB_STERN_DISTANCE_M` / `RTB_UPDATE_HZ` / `RTB_ALTITUDE_M` / `RTB_YP_SAFE_DISTANCE_M` | `35.0` / `2.0` / `30.0` / `20.0` | RTB target, update rate, transit altitude, and the minimum distance kept from the YP while routing around it during RTB |
 | `yp-server` | `SAR_*` | See SAR tables | MOB/SAR tuning |
 | `sim-*` | `VEHICLE_TYPE` | `uav` | `uav`, `uavf`, `usv`, `uuv`, or `ugv` |
 | `sim-*` | `VEHICLE_ID` | auto | Stable vehicle ID |

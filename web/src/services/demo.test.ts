@@ -62,4 +62,83 @@ describe("hardware-free telemetry and commands", () => {
     updateDemoVehicleColor(vehicles, vehicle.vehicle_id, "#123456");
     expect(demoVehicleSnapshot(vehicle)).toMatchObject({ marker_color: "#123456" });
   });
+
+  it("faces the direction of travel when inward-facing mode is disabled", () => {
+    const vehicles = createDemoVehicles();
+    const [yp, vehicle] = vehicles;
+    vehicle.lat = yp.lat - 0.0001;
+    vehicle.lon = yp.lon;
+    const headingBeforeDispatch = vehicle.heading;
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "ship_relative_trajectory", ship_vehicle_id: yp.vehicle_id,
+      local_waypoints: [{ x: 0, y: 0, z: vehicle.alt, yaw_deg: 270 }],
+    });
+    stepDemoVehicle(vehicle, 0.2, 1, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.targetYawDeg).toBeCloseTo(0, 1);
+    expect(Math.abs(vehicle.heading)).toBeLessThan(Math.abs(headingBeforeDispatch));
+  });
+
+  it("faces inward and repeats the full ship-relative waypoint list", () => {
+    const vehicles = createDemoVehicles();
+    const [yp, vehicle] = vehicles;
+    vehicle.lat = yp.lat + 0.00001;
+    vehicle.lon = yp.lon;
+    vehicle.alt = yp.alt;
+    const localWaypoint = { x: 0, y: 0, z: 0, yaw_deg: 0 };
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "ship_relative_trajectory",
+      ship_vehicle_id: yp.vehicle_id,
+      local_waypoints: [localWaypoint],
+      face_ship: true,
+      loop_count: 2,
+    });
+
+    expect(vehicle.shipRelativeWaypoints).toHaveLength(2);
+    stepDemoVehicle(vehicle, 0.2, 1, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.heading).toBeCloseTo(180);
+    expect(vehicle.targetYawDeg).toBeCloseTo(180);
+    stepDemoVehicle(vehicle, 0.2, 2, vehicles);
+    expect(vehicle.mode).toBe("hold");
+    expect(vehicle.heading).toBeCloseTo(180);
+  });
+
+  it("keeps tracking the final relative waypoint when hold is enabled", () => {
+    const vehicles = createDemoVehicles();
+    const [yp, vehicle] = vehicles;
+    vehicle.lat = yp.lat;
+    vehicle.lon = yp.lon;
+    vehicle.alt = yp.alt;
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "ship_relative_trajectory",
+      ship_vehicle_id: yp.vehicle_id,
+      local_waypoints: [{ x: 0, y: 0, z: 0 }],
+      hold_last_waypoint: true,
+    });
+    stepDemoVehicle(vehicle, 0.2, 1, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.shipRelativeIndex).toBe(0);
+    stepDemoVehicle(yp, 2, 2, vehicles);
+    stepDemoVehicle(vehicle, 0.2, 2, vehicles);
+    expect(vehicle.mode).toBe("ship_relative");
+    expect(vehicle.target.latitude).toBeCloseTo(yp.lat);
+    expect(vehicle.target.longitude).toBeCloseTo(yp.lon);
+  });
+
+  it("releases the final relative waypoint when a new waypoint command arrives", () => {
+    const vehicles = createDemoVehicles();
+    const [yp, vehicle] = vehicles;
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "ship_relative_trajectory",
+      ship_vehicle_id: yp.vehicle_id,
+      local_waypoints: [{ x: 0, y: 0, z: 0 }],
+      hold_last_waypoint: true,
+    });
+    const override = { latitude: vehicle.lat + 0.001, longitude: vehicle.lon, altitude: vehicle.alt };
+    handleDemoCommand(vehicles, vehicle.vehicle_id, { type: "waypoint", target: override });
+    expect(vehicle.mode).toBe("waypoint");
+    expect(vehicle.target).toEqual(override);
+    expect(vehicle.shipRelativeWaypoints).toEqual([]);
+  });
 });

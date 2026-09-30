@@ -137,31 +137,75 @@ def create_navsatfix_message(
     }
 
 
+def create_gps_fix_message(vehicle_id: str, msg) -> dict[str, object]:
+    fix_type = getattr(msg, "fix_type", 0)
+    eph = getattr(msg, "eph", 65535)
+    epv = getattr(msg, "epv", 65535)
+    h_acc = getattr(msg, "h_acc", None)
+    v_acc = getattr(msg, "v_acc", None)
+    satellites_visible = getattr(msg, "satellites_visible", 255)
+    fix_labels = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed", 7: "Static", 8: "PPP"}
+    return {
+        "vehicle_id": vehicle_id,
+        "vehicle_type": "uav",
+        "topic": f"/vehicles/{vehicle_id}/gps_fix",
+        "type": f"mavlink/{msg.get_type()}",
+        "stamp": time.time(),
+        "msg": {
+            "fix_type": fix_type,
+            "fix_type_label": fix_labels.get(fix_type, "Unknown"),
+            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
+            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
+            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
+        },
+    }
+
+
 def build_mavlink_connection(port: str, baud: int) -> mavutil.mavlink_connection:
     return mavutil.mavlink_connection(f"serial:{port}:{baud}", source_system=255, autoreconnect=False)
 
 
-_last_guided_request = 0.0
+_last_rtb_step_time = 0.0
+_rtb_guided_forced = False
+_last_land_step_time = 0.0
+_land_step_guided_forced = False
+_landed_state = 0  # MAV_LANDED_STATE_UNDEFINED until EXTENDED_SYS_STATE arrives
+_land_touchdown_since: Optional[float] = None
+_land_touchdown_sent = False
 
 
 def send_radio_command(
     master: mavutil.mavlink_connection,
     command: dict[str, object],
     source: Optional[str] = None,
-) -> None:
-    global _last_guided_request
+) -> bool:
+    """Execute a server command; returns True once touchdown is confirmed and disarmed."""
+    global _last_rtb_step_time, _rtb_guided_forced, _last_land_step_time, _land_step_guided_forced
+    global _land_touchdown_since, _land_touchdown_sent
     cmd_type = command.get("type")
     if cmd_type == "rtb_follow":
         target = command.get("target", {})
         lat = target.get("latitude")
         lon = target.get("longitude")
         if lat is not None and lon is not None:
-            if time.monotonic() - _last_guided_request >= 5.0:
-                try:
+            # A gap in updates means the sequence just (re)started, so force
+            # GUIDED once. While updates are continuous, never force the mode
+            # back -- if the safety pilot switches modes to take control,
+            # respect it and stop guiding.
+            now = time.monotonic()
+            if now - _last_rtb_step_time > 1.0:
+                _rtb_guided_forced = False
+            _last_rtb_step_time = now
+
+            try:
+                if not _rtb_guided_forced:
                     master.set_mode("GUIDED")
-                    _last_guided_request = time.monotonic()
-                except Exception as exc:
-                    print(f"[WARN] Could not set GUIDED mode for RTB follow: {exc}")
+                    _rtb_guided_forced = True
+                elif master.flightmode != "GUIDED":
+                    print("[RTB] Safety pilot has taken control; halting RTB-follow guidance")
+                    return
+            except Exception as exc:
+                print(f"[WARN] Could not set GUIDED mode for RTB follow: {exc}")
             master.mav.set_position_target_global_int_send(
                 0, master.target_system, master.target_component,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
@@ -172,6 +216,58 @@ def send_radio_command(
                 0.0, 0.0, 0.0, float(command.get("heading") or 0.0) * 3.141592653589793 / 180.0, 0.0,
             )
         return
+    if cmd_type == "land_on_boat_step":
+        target = command.get("target", {})
+        lat = target.get("latitude")
+        lon = target.get("longitude")
+        alt = target.get("altitude")
+        if None not in (lat, lon, alt):
+            # A gap in steps means the sequence just (re)started, so force
+            # GUIDED once and reset touchdown tracking for the new attempt.
+            # While steps are continuous, never force the mode back -- if the
+            # safety pilot switches modes to take control, respect it and stop guiding.
+            now = time.monotonic()
+            if now - _last_land_step_time > 1.0:
+                _land_step_guided_forced = False
+                _land_touchdown_since = None
+                _land_touchdown_sent = False
+            _last_land_step_time = now
+
+            # Real ground contact, reported by ArduCopter's own IMU/throttle-based
+            # landing detector -- not a preset altitude the boat deck may not match.
+            if _landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
+                if _land_touchdown_since is None:
+                    _land_touchdown_since = now
+                if bool(command.get("auto_disarm", True)) and not _land_touchdown_sent:
+                    dwell_s = float(command.get("touchdown_dwell_s", 1.5))
+                    if now - _land_touchdown_since >= dwell_s:
+                        master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 21196, 0, 0, 0, 0, 0)
+                        _land_touchdown_sent = True
+                        print("[LAND] Onboard landing detector confirms touchdown; disarmed.")
+                        return True
+                return False
+            _land_touchdown_since = None
+
+            try:
+                if not _land_step_guided_forced:
+                    master.set_mode("GUIDED")
+                    _land_step_guided_forced = True
+                elif master.flightmode != "GUIDED":
+                    print("[LAND] Safety pilot has taken control; halting land-on-boat guidance")
+                    return False
+            except Exception as exc:
+                print(f"[WARN] Could not set GUIDED mode for land-on-boat: {exc}")
+            master.mav.set_position_target_global_int_send(
+                0, master.target_system, master.target_component,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                0b100111000000,
+                int(float(lat) * 1e7), int(float(lon) * 1e7), float(alt),
+                float(command.get("velocity_north_ms") or 0.0),
+                float(command.get("velocity_east_ms") or 0.0),
+                float(command.get("sink_rate_ms") or 0.0),
+                0.0, 0.0, 0.0, float(command.get("heading") or 0.0) * 3.141592653589793 / 180.0, 0.0,
+            )
+        return False
     if cmd_type == "waypoint":
         target = command.get("target", {})
         lat = target.get("latitude")
@@ -181,7 +277,21 @@ def send_radio_command(
             print("[COMMAND] waypoint command missing latitude/lon")
             return
 
-        if source != "rtb_follow":
+        if source == "rtb_follow":
+            # RTB's approach phase before stern-capture also arrives as
+            # "waypoint" commands; share the RTB force-once gate so a vehicle
+            # left in LOITER (or any non-GUIDED mode) still gets switched to
+            # GUIDED at the start of the RTB sequence instead of never forcing.
+            now = time.monotonic()
+            if now - _last_rtb_step_time > 1.0:
+                _rtb_guided_forced = False
+            _last_rtb_step_time = now
+            should_force = not _rtb_guided_forced
+            _rtb_guided_forced = True
+        else:
+            should_force = True
+
+        if should_force:
             mode_mapping = master.mode_mapping()
             if mode_mapping and "GUIDED" in mode_mapping:
                 try:
@@ -295,6 +405,31 @@ def send_radio_command(
         except Exception as exc:
             print(f"[COMMAND] failed to disarm: {exc}")
 
+    elif cmd_type == "takeoff":
+        altitude_m = float(command.get("altitude_m") or 15.0)
+        try:
+            if sar_missions is not None:
+                sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
+            else:
+                master.set_mode("GUIDED")
+            time.sleep(0.3)
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0, 1, 0, 0, 0, 0, 0, 0,
+            )
+            time.sleep(0.3)
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                0, 0, 0, 0, float("nan"), 0, 0, altitude_m,
+            )
+            print(f"[COMMAND] takeoff command sent to {altitude_m}m")
+        except Exception as exc:
+            print(f"[COMMAND] failed to send takeoff: {exc}")
+
     elif cmd_type == "mode":
         mode_name = str(command.get("mode", "")).upper()
         if not mode_name:
@@ -337,9 +472,12 @@ def send_radio_command(
             return
 
         if bool(command.get("auto_arm_start", True)):
-            sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+            # Arm in GUIDED first: ArduPilot refuses to arm from a disarmed AUTO mode.
+            sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
             time.sleep(0.2)
             sar_missions.arm_vehicle(master)
+            time.sleep(0.2)
+            sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
             time.sleep(0.2)
             sar_missions.start_mission(master)
             print("[COMMAND] mission_plan uploaded and started")
@@ -382,7 +520,14 @@ async def handle_server_messages(
             continue
 
         print(f"[WEBSOCKET] received command: {command}")
-        await asyncio.to_thread(send_radio_command, master, command, payload.get("source"))
+        touched_down = await asyncio.to_thread(send_radio_command, master, command, payload.get("source"))
+        if touched_down:
+            await websocket.send(json.dumps({
+                "vehicle_id": vehicle_id,
+                "type": "yp_ground_station/LandOnBoatTouchdown",
+                "msg": {"landed": True},
+                "stamp": time.time(),
+            }))
 
 
 async def read_mavlink_telemetry(
@@ -390,6 +535,7 @@ async def read_mavlink_telemetry(
     master: mavutil.mavlink_connection,
     vehicle_id: str,
 ) -> None:
+    global _landed_state
     print("[INFO] requesting telemetry stream from vehicle")
     master.mav.request_data_stream_send(
         master.target_system,
@@ -398,16 +544,27 @@ async def read_mavlink_telemetry(
         int(DEFAULT_SEND_HZ),
         1,
     )
+    # Explicitly request EXTENDED_SYS_STATE for real ground-contact detection (landed_state).
+    master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, int(1e6 / 2), 0, 0, 0, 0, 0)
+    master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, int(1e6 / 2), 0, 0, 0, 0, 0)
+    master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, int(1e6 / 2), 0, 0, 0, 0, 0)
 
     while True:
         msg = await asyncio.to_thread(
             master.recv_match,
-            type="GLOBAL_POSITION_INT",
+            type=["GLOBAL_POSITION_INT", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW"],
             blocking=True,
             timeout=5,
         )
         if msg is None:
             print("[WARN] no GLOBAL_POSITION_INT message received")
+            continue
+
+        if msg.get_type() == "EXTENDED_SYS_STATE":
+            _landed_state = msg.landed_state
+            continue
+        if msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
+            await websocket.send(json.dumps(create_gps_fix_message(vehicle_id, msg)))
             continue
 
         lat = msg.lat / 1e7

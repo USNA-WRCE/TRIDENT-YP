@@ -8,6 +8,13 @@ export interface ServerSettings {
   rtb_update_hz?: number;
   rtb_stern_distance_m?: number;
   rtb_altitude_m?: number;
+  rtb_yp_safe_distance_m?: number;
+  land_on_boat_hover_clearance_m?: number;
+  land_on_boat_descent_rate_ms?: number;
+  land_on_boat_pad_offset_m?: number;
+  land_on_boat_alignment_radius_m?: number;
+  land_on_boat_auto_disarm?: boolean;
+  land_on_boat_touchdown_dwell_s?: number;
   yp_role_vehicle_id?: string | null;
   trail_seconds?: number;
   show_yp_range_rings?: boolean;
@@ -21,6 +28,17 @@ export interface ServerSettings {
   rtk_host_or_port?: string;
   rtk_network_port?: number;
   rtk_baudrate?: number;
+  coordinated_fallback_range_m?: number;
+}
+
+export interface RtcmStatus {
+  state: "disabled" | "connecting" | "connected" | "stale" | "error";
+  source_type: string;
+  target: string | null;
+  last_frame_at: number | null;
+  frame_count: number;
+  bytes_total: number;
+  error: string | null;
 }
 
 // ===== Authentication helpers =====
@@ -49,6 +67,187 @@ export function getAuthHeaders(): HeadersInit {
 export function websocketUrl(path: string): string {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}${path}`;
+}
+
+export interface AxisCamera {
+  id: string;
+  label: string;
+  online: boolean;
+  last_checked: number | null;
+  stream_url: string;
+  ptz_capable: boolean;
+  mount_heading_deg: number;
+  pan_deg: number | null;
+  tilt_deg: number | null;
+  ship_relative_deg: number | null;
+  spatial: CameraSpatial;
+}
+
+export interface CameraSpatial {
+  x_m: number;
+  y_m: number;
+  z_m: number;
+  heading_deg: number;
+  tilt_deg: number;
+  pan_zero_deg: number;
+  hfov_deg: number;
+  vfov_deg: number;
+}
+
+export async function listAxisCameras(): Promise<AxisCamera[]> {
+  const response = await apiFetch("/api/cameras", { headers: getAuthHeaders() });
+  if (!response.ok) return [];
+  const data = await response.json() as { cameras?: AxisCamera[] };
+  return data.cameras ?? [];
+}
+
+export async function updateCameraSpatial(spatial: Record<string, CameraSpatial>): Promise<void> {
+  const response = await apiFetch("/api/cameras/spatial", {
+    method: "PUT", headers: getAuthHeaders(), body: JSON.stringify(spatial),
+  });
+  if (!response.ok) throw new Error(`camera spatial settings update failed: ${response.status}`);
+}
+
+export interface CameraDetection {
+  label: string;
+  confidence: number;
+  box: [number, number, number, number]; // [x1, y1, x2, y2] in source frame pixels
+  track_id?: number;
+  fusion_id?: number;
+  yp_position?: { x_m: number; y_m: number; z_m: number | null; camera_count: number };
+}
+
+export interface CameraDetectionUpdate {
+  camera_id: string;
+  frame_width: number;
+  frame_height: number;
+  detections: CameraDetection[];
+  timestamp: number;
+}
+
+export async function sendAxisPtz(cameraId: string, pan: number, tilt: number, zoom = 0): Promise<void> {
+  const response = await apiFetch(`/api/cameras/${encodeURIComponent(cameraId)}/ptz`, {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ pan, tilt, zoom }),
+  });
+  if (!response.ok) throw new Error(`PTZ command failed: ${response.status}`);
+}
+
+export async function getCameraTrack(cameraId: string): Promise<boolean> {
+  const response = await apiFetch(`/api/cameras/${encodeURIComponent(cameraId)}/track`, { headers: getAuthHeaders() });
+  if (!response.ok) return false;
+  const data = await response.json() as { tracking?: boolean };
+  return data.tracking ?? false;
+}
+
+export async function getCameraTrackStates(cameraIds: string[]): Promise<Record<string, boolean>> {
+  const states = await Promise.all(cameraIds.map(async (cameraId) => [cameraId, await getCameraTrack(cameraId)] as const));
+  return Object.fromEntries(states);
+}
+
+export async function setCameraTrack(cameraId: string, enabled: boolean): Promise<boolean> {
+  const response = await apiFetch(`/api/cameras/${encodeURIComponent(cameraId)}/track`, {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ enabled }),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Track toggle failed: ${response.status}`);
+  }
+  const data = await response.json() as { tracking?: boolean };
+  return data.tracking ?? enabled;
+}
+
+export async function getCoordinatedCameraTrack(): Promise<boolean> {
+  const response = await apiFetch("/api/cameras/coordinated-track", { headers: getAuthHeaders() });
+  if (!response.ok) return false;
+  return Boolean((await response.json() as { enabled?: boolean }).enabled);
+}
+
+export async function setCoordinatedCameraTrack(enabled: boolean): Promise<boolean> {
+  const response = await apiFetch("/api/cameras/coordinated-track", {
+    method: "POST", headers: getAuthHeaders(), body: JSON.stringify({ enabled }),
+  });
+  if (!response.ok) throw new Error(`Coordinated tracking update failed: ${response.status}`);
+  return Boolean((await response.json() as { enabled?: boolean }).enabled);
+}
+
+export interface TrackSettings {
+  track_gain: number;
+  track_max_speed: number;
+  track_deadzone: number;
+}
+
+export async function getTrackSettings(): Promise<TrackSettings> {
+  const response = await apiFetch("/api/detector/track-settings", { headers: getAuthHeaders() });
+  if (!response.ok) return { track_gain: 160, track_max_speed: 60, track_deadzone: 0.04 };
+  return response.json();
+}
+
+export async function updateTrackSettings(settings: Partial<TrackSettings>): Promise<TrackSettings> {
+  const response = await apiFetch("/api/detector/track-settings", {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Track settings update failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export interface DetectorModels {
+  models: string[];
+  active_model: string;
+  conf_threshold: number;
+  infer_interval_seconds: number;
+}
+
+export async function listDetectorModels(): Promise<DetectorModels> {
+  const response = await apiFetch("/api/detector/models", { headers: getAuthHeaders() });
+  if (!response.ok) return { models: [], active_model: "", conf_threshold: 0.4, infer_interval_seconds: 0.5 };
+  return response.json();
+}
+
+export async function selectDetectorModel(model: string): Promise<DetectorModels> {
+  const response = await apiFetch("/api/detector/model", {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ model }),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Model selection failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function uploadDetectorModel(file: File): Promise<DetectorModels> {
+  const body = new FormData();
+  body.append("file", file);
+  // No Content-Type header: the browser sets the multipart boundary itself.
+  const response = await apiFetch("/api/detector/models", { method: "POST", body });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Model upload failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function updateDetectorSettings(settings: Partial<Pick<DetectorModels, "conf_threshold" | "infer_interval_seconds">>): Promise<DetectorModels> {
+  const response = await apiFetch("/api/detector/settings", {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error ?? `Settings update failed: ${response.status}`);
+  }
+  return response.json();
 }
 
 // ===== Authentication API =====
@@ -163,6 +362,10 @@ export function fetchSettings(): Promise<ServerSettings> {
 
 export function updateSettings(settings: Partial<ServerSettings>): Promise<ServerSettings> {
   return settingsRequest("/api/settings", "settings update failed", settings);
+}
+
+export function fetchRtcmStatus(): Promise<RtcmStatus> {
+  return settingsRequest("/api/rtcm/status", "rtcm status fetch failed");
 }
 
 export async function exportFlightLog(lastHours: number): Promise<Response> {

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import serial
 import socket
+import gzip
 import json
 import math
 import os
@@ -34,12 +35,22 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 from app.auth import init_database, get_current_user, require_permission
 from app.auth_routes import router as auth_router
+from app.axis_cameras import cameras as axis_camera_registry, coordinate_tracking, is_coordinated_tracking, is_tracking, router as axis_camera_router, set_broadcast_callback as set_axis_camera_broadcast, track_from_detections, load_persisted_settings as load_axis_camera_settings
+from app.yolo_models import (
+    router as yolo_models_router,
+    set_broadcast_callback as set_yolo_models_broadcast,
+    set_detector_sender as set_yolo_models_detector_sender,
+    get_active_model as get_active_yolo_model,
+    get_settings as get_active_yolo_settings,
+    load_persisted_settings as load_yolo_model_settings,
+)
 from app.settings import get_deconfliction_settings, update_deconfliction_settings
 from app.settings import APPLICATION_SETTING_DEFAULTS, get_application_settings, update_application_settings
 from app.tiles import router as tile_router, TILE_MAX_CACHE_AGE_SECONDS
 
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
+from yp_common.geometry import bearing_degrees as _bearing_degrees
 
 
 INFLUX_URL = os.getenv("INFLUX_URL", "http://influxdb:8086")
@@ -50,6 +61,9 @@ VEHICLE_TTL_SECONDS = float(os.getenv("VEHICLE_TTL_SECONDS", "30"))
 HISTORY_MAX_POINTS = int(os.getenv("HISTORY_MAX_POINTS", "5000"))
 MESSAGE_RETENTION_SECONDS = float(os.getenv("MESSAGE_RETENTION_SECONDS", str(10 * 60)))
 MESSAGE_CLEANUP_INTERVAL_SECONDS = float(os.getenv("MESSAGE_CLEANUP_INTERVAL_SECONDS", str(10 * 60)))
+LOG_EXPORT_ON_SHUTDOWN = os.getenv("LOG_EXPORT_ON_SHUTDOWN", "true").lower() not in ("0", "false", "no")
+LOG_EXPORT_DIR = os.getenv("LOG_EXPORT_DIR", "/data/logs")
+LOG_EXPORT_SHUTDOWN_TIMEOUT_SECONDS = float(os.getenv("LOG_EXPORT_SHUTDOWN_TIMEOUT_SECONDS", "15"))
 INFLUX_MAX_WRITE_HZ = float(os.getenv("INFLUX_MAX_WRITE_HZ", "5"))
 VIDEO_STREAMS_JSON = os.getenv("VIDEO_STREAMS_JSON", "{}")
 CAMERA_DISCOVERY_PORT = int(os.getenv("CAMERA_DISCOVERY_PORT", "8889"))
@@ -63,19 +77,41 @@ SAR_ALTITUDE_M = float(os.getenv("SAR_ALTITUDE_M", "30.0"))
 SAR_MOB_TRACK_SECONDS = float(os.getenv("SAR_MOB_TRACK_SECONDS", "120.0"))
 SAR_TAKEOFF_ALT_M = float(os.getenv("SAR_TAKEOFF_ALT_M", "30.0"))
 SAR_CLIMB_SPEED_MS = float(os.getenv("SAR_CLIMB_SPEED_MS", "8.0"))
+LAND_ON_BOAT_HOVER_CLEARANCE_M = float(os.getenv("LAND_ON_BOAT_HOVER_CLEARANCE_M", "0.5"))
+LAND_ON_BOAT_DESCENT_RATE_MS = float(os.getenv("LAND_ON_BOAT_DESCENT_RATE_MS", "0.5"))
+LAND_ON_BOAT_PAD_OFFSET_M = float(os.getenv("LAND_ON_BOAT_PAD_OFFSET_M", "-0.4"))
+LAND_ON_BOAT_ALIGNMENT_RADIUS_M = float(os.getenv("LAND_ON_BOAT_ALIGNMENT_RADIUS_M", "1.0"))
+LAND_ON_BOAT_AUTO_DISARM = os.getenv("LAND_ON_BOAT_AUTO_DISARM", "true").lower() not in ("0", "false", "no")
+LAND_ON_BOAT_TOUCHDOWN_DWELL_S = float(os.getenv("LAND_ON_BOAT_TOUCHDOWN_DWELL_S", "1.5"))
 RTB_STERN_DISTANCE_M = float(os.getenv("RTB_STERN_DISTANCE_M", "20.0"))
 RTB_UPDATE_HZ = float(os.getenv("RTB_UPDATE_HZ", "2.0"))
 RTB_ALTITUDE_M = float(os.getenv("RTB_ALTITUDE_M", "30.0"))
+RTB_YP_SAFE_DISTANCE_M = float(os.getenv("RTB_YP_SAFE_DISTANCE_M", "20.0"))
 MISSION_ARRIVAL_RADIUS_M = float(os.getenv("MISSION_ARRIVAL_RADIUS_M", "12.0"))
 EARTH_RADIUS_M = 6_378_137.0
 
 # RTCM streamer variables
 _rtcm_seq_id = 0
+_rtcm_last_broadcast_at = 0.0
+rtcm_watchdog_task: Optional[asyncio.Task[None]] = None
+# Live status surfaced to the UI: state is "disabled" | "connecting" | "connected" | "stale" | "error"
+rtcm_status: dict[str, Any] = {
+    "state": "disabled",
+    "source_type": "disabled",
+    "target": None,
+    "last_frame_at": None,
+    "frame_count": 0,
+    "bytes_total": 0,
+    "error": None,
+}
+_last_gps_fix_log_at: dict[str, float] = {}
 
 
 app = FastAPI(title="YP Ground Station", version="0.1.0")
 app.include_router(tile_router)
 app.include_router(auth_router)
+app.include_router(axis_camera_router)
+app.include_router(yolo_models_router)
 
 
 @app.middleware("http")
@@ -109,12 +145,23 @@ shared_waypoints: dict[str, dict[str, Any]] = {}
 shared_sar_patterns: dict[str, dict[str, Any]] = {}
 shared_mission_plans: dict[str, list[list[float]]] = {}
 shared_mission_completion_targets: dict[str, dict[str, float]] = {}
+# Ship-relative plans store the local waypoints (not resolved lat/lon) so clients
+# can redraw the route as the reference ship moves.
+shared_ship_relative_plans: dict[str, dict[str, Any]] = {}
 
 # SITL MAVLink bridge state
 sitl_bridges: dict[str, asyncio.Task[None]] = {}  # vehicle_id -> running asyncio task
 sitl_bridge_info: dict[str, dict[str, Any]] = {}  # vehicle_id -> status/metadata
-_rtb_follow_tasks: dict[str, asyncio.Task[None]] = {}
-_sitl_follow_guided_requests: dict[str, float] = {}
+_rtb_follow_tasks: dict[str, asyncio.Task[None]] = {} # vehicle_id -> placeholder for running return to boat (RTB) and follow boat task
+_rtb_follow_state: dict[str, bool] = {} # vehicle_id -> True once RTB-follow is issuing velocity-based station-keeping (not still maneuvering into position)
+_land_on_boat_tasks: dict[str, asyncio.Task[None]] = {} # vehicle_id -> placeholder for running land on boat task
+_sitl_follow_guided_requests: dict[str, float] = {} # vehicle_id -> timestamp of last follow-guided request (to avoid spamming the vehicle with repeated requests)
+_sitl_guided_forced: dict[str, bool] = {} # vehicle_id -> True once GUIDED has been forced for the current streaming streak
+_sitl_landed_state: dict[str, int] = {} # vehicle_id -> last EXTENDED_SYS_STATE.landed_state seen (real ground-contact detection)
+_sitl_land_touchdown_since: dict[str, float] = {} # vehicle_id -> monotonic time landed_state first read ON_GROUND for the current attempt
+_sitl_land_touchdown_sent: dict[str, bool] = {} # vehicle_id -> True once auto-disarm has fired for the current attempt
+_sitl_nav_lock = threading.Lock()
+_sitl_nav_states: dict[str, dict[str, float]] = {}
 
 # MAVLink MAV_TYPE -> (vehicle_type, human-readable frame name)
 _MAV_TYPE_MAP: dict[int, tuple[str, str]] = {
@@ -160,6 +207,7 @@ query_api = None
 cleanup_task: Optional[asyncio.Task[None]] = None
 rtcm_task: Optional[asyncio.Task[None]] = None
 deconfliction_task: Optional[asyncio.Task[None]] = None
+_server_start_time: Optional[datetime] = None
 
 
 # YP role assignment: any vehicle whose vehicle_id matches this value will be
@@ -382,9 +430,12 @@ async def root() -> dict[str, Any]:
 @app.on_event("startup")
 async def startup() -> None:
     """Initialize persistence, vehicle services, and background tasks."""
-    global cleanup_task, delete_api, influx_client, write_api, query_api, rtcm_task, deconfliction_task
+    global cleanup_task, delete_api, influx_client, write_api, query_api, rtcm_task, rtcm_watchdog_task, deconfliction_task, _server_start_time
+    _server_start_time = datetime.now(timezone.utc)
     # Initialize authentication database
     init_database()
+    load_yolo_model_settings()
+    load_axis_camera_settings()
 
     persisted_settings = get_application_settings()
     settings.update(persisted_settings)
@@ -405,12 +456,16 @@ async def startup() -> None:
         print(f"InfluxDB unavailable at startup: {exc}")
     cleanup_task = asyncio.create_task(influx_retention_loop())
     load_video_streams_from_env()
+    set_axis_camera_broadcast(broadcast_ui)
+    set_yolo_models_broadcast(broadcast_ui)
+    set_yolo_models_detector_sender(send_to_detector)
     
     # Start deconfliction check task
     deconfliction_task = asyncio.create_task(_deconfliction_check_loop())
 
     # Start background RTCM base station ingestion task
     rtcm_task = asyncio.create_task(rtcm_ingest_loop())
+    rtcm_watchdog_task = asyncio.create_task(rtcm_watchdog_loop())
 
 
 @app.on_event("shutdown")
@@ -418,13 +473,20 @@ async def shutdown() -> None:
     """Cancel background tasks and close external clients on server shutdown."""
     tasks = [
         task for task in (
-            rtcm_task, cleanup_task, deconfliction_task,
+            rtcm_task, rtcm_watchdog_task, cleanup_task, deconfliction_task,
             *sitl_bridges.values(), *_rtb_follow_tasks.values(),
         ) if task is not None
     ]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    if LOG_EXPORT_ON_SHUTDOWN:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(_write_shutdown_log_export), timeout=LOG_EXPORT_SHUTDOWN_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            print("Shutdown log export timed out")
+        except Exception as error:
+            print(f"Shutdown log export failed: {error}")
     if influx_client:
         influx_client.close()
 
@@ -522,6 +584,8 @@ async def disconnect_sitl(vehicle_id: str, authorization: Optional[str] = Header
     async with state_lock:
         vehicles.pop(vehicle_id, None)
     await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+    if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+        await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
     await broadcast_ui({"op": "sitl_bridge_removed", "vehicle_id": vehicle_id})
     return JSONResponse({"ok": True})
 
@@ -649,6 +713,30 @@ async def _run_mavlink_bridge(
                     master.target_system, master.target_component, sid, h, 1
                 )
             )
+        # Explicitly request EXTENDED_SYS_STATE for real ground-contact detection (landed_state).
+        await asyncio.to_thread(
+            lambda: master.mav.command_long_send(
+                master.target_system, master.target_component,
+                _mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                _mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE, int(1e6 / 2), 0, 0, 0, 0, 0,
+            )
+        )
+        # GPS_RAW_INT carries the autopilot's live RTK Float/Fixed solution and
+        # accuracy; request it explicitly because it is not in the position stream.
+        await asyncio.to_thread(
+            lambda: master.mav.command_long_send(
+                master.target_system, master.target_component,
+                _mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                _mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, int(1e6 / 2), 0, 0, 0, 0, 0,
+            )
+        )
+        await asyncio.to_thread(
+            lambda: master.mav.command_long_send(
+                master.target_system, master.target_component,
+                _mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                _mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, int(1e6 / 2), 0, 0, 0, 0, 0,
+            )
+        )
 
         # ------------------------------------------------------------------ #
         # Dedicated MAVLink I/O thread                                        #
@@ -658,12 +746,50 @@ async def _run_mavlink_bridge(
         def _io_thread(m: Any) -> None:
             min_pos_interval = 1.0 / send_hz
             last_pos_time = 0.0
+            last_gps_fix_time = 0.0
+            active_ship_relative: Optional[dict[str, Any]] = None
 
             while not _stop.is_set():
                 # Forward any outbound commands queued by the asyncio side
                 while True:
                     try:
-                        _handle_sitl_command(m, _outbound.get_nowait())
+                        command_payload = _outbound.get_nowait()
+                        command_type = command_payload.get("command", {}).get("type")
+                        if command_type == "_cancel_ship_relative":
+                            active_ship_relative = None
+                            continue
+                        if command_type == "ship_relative_trajectory":
+                            command = command_payload.get("command", {})
+                            ship_vehicle_id = command.get("ship_vehicle_id")
+                            waypoints = command.get("local_waypoints")
+                            try:
+                                loop_count = max(1, min(100, int(command.get("loop_count", 1))))
+                            except (TypeError, ValueError):
+                                loop_count = 1
+                            if ship_vehicle_id and isinstance(waypoints, list) and waypoints:
+                                active_ship_relative = {
+                                    "ship_vehicle_id": str(ship_vehicle_id),
+                                    "waypoints": waypoints * loop_count,
+                                    "index": 0,
+                                    "arrival_radius_m": float(command.get("arrival_radius_m", 6.0)),
+                                    "guided_forced": False,
+                                    "face_ship": bool(command.get("face_ship", False)),
+                                    "hold_last_waypoint": bool(command.get("hold_last_waypoint", False)),
+                                    "vehicle_id": vehicle_id,
+                                }
+                                print(f"[SITL][SHIP-REL] Started {len(waypoints)} waypoints for {vehicle_id} relative to {ship_vehicle_id}")
+                            else:
+                                active_ship_relative = None
+                                print(f"[SITL][SHIP-REL] Invalid ship-relative command for {vehicle_id}")
+                            continue
+
+                        active_ship_relative = None
+                        touched_down = _handle_sitl_command(m, command_payload)
+                        if touched_down:
+                            try:
+                                _inbound.put_nowait(("LAND_TOUCHDOWN", None, time.time()))
+                            except _stdlib_queue.Full:
+                                pass
                     except _stdlib_queue.Empty:
                         break
 
@@ -673,9 +799,12 @@ async def _run_mavlink_bridge(
                     time.sleep(0.05)
                     continue
 
+                if active_ship_relative is not None:
+                    active_ship_relative = _step_sitl_ship_relative(m, active_ship_relative)
+
                 # Blocking read — wakes up as soon as a message arrives
                 msg = m.recv_match(
-                    type=["GLOBAL_POSITION_INT", "SYS_STATUS", "BATTERY_STATUS"],
+                    type=["GLOBAL_POSITION_INT", "SYS_STATUS", "BATTERY_STATUS", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW"],
                     blocking=True,
                     timeout=0.1,
                 )
@@ -685,11 +814,19 @@ async def _run_mavlink_bridge(
                 msg_type = msg.get_type()
                 now = time.time()
 
+                if msg_type == "EXTENDED_SYS_STATE":
+                    _sitl_landed_state[vehicle_id] = msg.landed_state
+                    continue
+
                 # Rate-limit position messages to avoid overwhelming the UI
                 if msg_type == "GLOBAL_POSITION_INT":
                     if now - last_pos_time < min_pos_interval:
                         continue
                     last_pos_time = now
+                elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
+                    if now - last_gps_fix_time < min_pos_interval:
+                        continue
+                    last_gps_fix_time = now
 
                 try:
                     _inbound.put_nowait((msg_type, msg, now))
@@ -717,6 +854,11 @@ async def _run_mavlink_bridge(
                     payload = cmd_queue.get_nowait()
                     queued_commands_processed += 1
                     cmd_type = payload.get("command", {}).get("type")
+                    if cmd_type != "ship_relative_trajectory":
+                        try:
+                            _outbound.put_nowait({"command": {"type": "_cancel_ship_relative"}})
+                        except _stdlib_queue.Full:
+                            print(f"[SITL][SHIP-REL] Could not queue cancellation for {vehicle_id}")
                     if cmd_type == "cancel_sar":
                         _sar_stop_event.set()
                         print(f"[SITL][SAR] Cancel requested for {vehicle_id}")
@@ -770,6 +912,18 @@ async def _run_mavlink_bridge(
                     if msg.battery_remaining >= 0:
                         last_battery_pct = msg.battery_remaining / 100.0
 
+                elif msg_type == "LAND_TOUCHDOWN":
+                    # The IO thread confirmed real ground contact and disarmed
+                    # locally; stop our guidance loop and tell the UI.
+                    await ingest_vehicle_message({
+                        "vehicle_id": vehicle_id,
+                        "vehicle_type": info["vehicle_type"],
+                        "topic": f"/vehicles/{vehicle_id}/land_on_boat",
+                        "type": "yp_ground_station/LandOnBoatTouchdown",
+                        "stamp": now,
+                        "msg": {"landed": True},
+                    })
+
                 elif msg_type == "GLOBAL_POSITION_INT":
                     lat = msg.lat / 1e7
                     lon = msg.lon / 1e7
@@ -811,6 +965,16 @@ async def _run_mavlink_bridge(
                             "msg": {"percentage": last_battery_pct},
                         })
 
+                elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
+                    await ingest_vehicle_message({
+                        "vehicle_id": vehicle_id,
+                        "vehicle_type": info["vehicle_type"],
+                        "topic": f"/vehicles/{vehicle_id}/gps_fix",
+                        "type": f"mavlink/{msg_type}",
+                        "stamp": now,
+                        "msg": _gps_raw_int_to_dict(msg, source=msg_type),
+                    })
+
             # Yield to event loop; shorter sleep when actively draining data
             await asyncio.sleep(0.0 if processed else 0.02)
 
@@ -832,9 +996,11 @@ async def _run_mavlink_bridge(
             info["status"] = "disconnected"
             await broadcast_ui({"op": "sitl_bridge_update", "bridge": dict(info)})
         async with state_lock:
-            if vehicle_id in vehicles:
-                vehicles[vehicle_id]["connected"] = False
-        await broadcast_ui({"op": "vehicle_disconnected", "vehicle_id": vehicle_id})
+            removed_vehicle = vehicles.pop(vehicle_id, None)
+        if removed_vehicle is not None:
+            await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+        if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
 
 
 def _execute_sar_command(
@@ -903,10 +1069,134 @@ def _execute_sar_command(
         print(f"[SITL][SAR] MOB search mission (streaming) {'COMPLETE' if ok else 'FAILED'}")
 
 
-def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
-    """Blocking: translate a ground-station command into MAVLink and send it."""
+def _step_sitl_ship_relative(master: Any, plan: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Send one moving-ship-relative setpoint and advance reached waypoints."""
+    ship_vehicle_id = plan["ship_vehicle_id"]
+    vehicle_id = plan["vehicle_id"]
+    with _sitl_nav_lock:
+        ship = dict(_sitl_nav_states.get(ship_vehicle_id, {}))
+        vehicle = dict(_sitl_nav_states.get(vehicle_id, {}))
+
+    now = time.time()
+    if not ship or now - float(ship.get("stamp", 0.0)) > 2.0:
+        return plan
+    if not vehicle or now - float(vehicle.get("stamp", 0.0)) > 2.0:
+        return plan
+
+    index = int(plan["index"])
+    waypoints = plan["waypoints"]
+    if index >= len(waypoints):
+        return None
+    waypoint = waypoints[index]
+    try:
+        local_x = float(waypoint.get("x", 0.0))
+        local_y = float(waypoint.get("y", 0.0))
+        local_z = float(waypoint.get("z", 0.0))
+        ship_heading = float(ship.get("heading_deg", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        print(f"[SITL][SHIP-REL] Invalid waypoint {index + 1} for {vehicle_id}")
+        return None
+
+    distance_from_ship = math.hypot(local_x, local_y)
+    relative_bearing = math.degrees(math.atan2(local_x, local_y))
+    bearing = math.radians((ship_heading + relative_bearing) % 360.0)
+    angular_distance = distance_from_ship / 6_378_137.0
+    ship_latitude = math.radians(float(ship["lat"]))
+    ship_longitude = math.radians(float(ship["lon"]))
+    target_latitude = math.asin(
+        math.sin(ship_latitude) * math.cos(angular_distance)
+        + math.cos(ship_latitude) * math.sin(angular_distance) * math.cos(bearing)
+    )
+    target_longitude = ship_longitude + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(ship_latitude),
+        math.cos(angular_distance) - math.sin(ship_latitude) * math.sin(target_latitude),
+    )
+    target_lat = math.degrees(target_latitude)
+    target_lon = math.degrees(target_longitude)
+    target_alt = float(ship.get("alt", 0.0)) + local_z
+
+    vehicle_type = sitl_bridge_info.get(vehicle_id, {}).get("vehicle_type", "uav")
+    frame = _mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
+    if vehicle_type in ("usv", "ugv"):
+        target_alt = 0.0
+        frame = _mavutil.mavlink.MAV_FRAME_GLOBAL_INT
+
+    if not plan["guided_forced"]:
+        mode_mapping = master.mode_mapping()
+        if mode_mapping and "GUIDED" in mode_mapping:
+            master.mav.set_mode_send(
+                master.target_system,
+                _mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_mapping["GUIDED"],
+            )
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 1, 0, 0, 0, 0, 0, 0,
+        )
+        plan["guided_forced"] = True
+
+    if plan.get("face_ship"):
+        type_mask = 0b100111000000
+        target_yaw = math.radians(_bearing_degrees(
+            float(vehicle["lat"]), float(vehicle["lon"]),
+            float(ship["lat"]), float(ship["lon"]),
+        ))
+    else:
+        type_mask = 0b100111000000
+        target_yaw = math.radians(_bearing_degrees(
+            float(vehicle["lat"]), float(vehicle["lon"]), target_lat, target_lon,
+        ))
+
+    master.mav.set_position_target_global_int_send(
+        0,
+        master.target_system,
+        master.target_component,
+        frame,
+        type_mask,
+        int(target_lat * 1e7),
+        int(target_lon * 1e7),
+        target_alt,
+        float(ship.get("vn_ms", 0.0)),
+        float(ship.get("ve_ms", 0.0)),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        target_yaw,
+        0.0,
+    )
+
+    distance_m = _haversine_m(float(vehicle["lat"]), float(vehicle["lon"]), target_lat, target_lon)
+    altitude_reached = vehicle_type in ("usv", "ugv") or abs(float(vehicle.get("alt", 0.0)) - target_alt) <= max(
+        2.0, float(plan["arrival_radius_m"]) * 0.5,
+    )
+    if distance_m <= float(plan["arrival_radius_m"]) and altitude_reached:
+        if index + 1 >= len(waypoints):
+            if plan.get("hold_last_waypoint"):
+                if not plan.get("hold_arrival_logged"):
+                    print(f"[SITL][SHIP-REL] Reached final waypoint; holding relative target for {vehicle_id}")
+                    plan["hold_arrival_logged"] = True
+                return plan
+            print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
+            plan["index"] = index + 1
+            print(f"[SITL][SHIP-REL] Mission complete for {vehicle_id}")
+            return None
+        print(f"[SITL][SHIP-REL] Reached waypoint {index + 1}/{len(waypoints)} for {vehicle_id}")
+        plan["index"] = index + 1
+    return plan
+
+
+def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> bool:
+    """Blocking: translate a ground-station command into MAVLink and send it.
+
+    Returns True once real ground contact (EXTENDED_SYS_STATE.landed_state)
+    has been confirmed during a land_on_boat_step sequence and this call has
+    disarmed the vehicle.
+    """
     if _mavutil is None:
-        return
+        return False
     command = cmd_payload.get("command", {})
     cmd_type = command.get("type")
     source = cmd_payload.get("source")
@@ -919,7 +1209,22 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
         if lat is not None and lon is not None:
             # RTB-follow emits frequent waypoint updates; avoid repeated mode/arm
             # chatter so telemetry processing stays responsive.
-            if source != "rtb_follow":
+            if source == "rtb_follow":
+                # The RTB approach phase before stern-capture also arrives as
+                # "waypoint" commands. Share the rtb_follow force-once gate
+                # (keyed below) so a vehicle left in LOITER still gets forced
+                # into GUIDED at the start of the RTB sequence, instead of
+                # never forcing and silently ignoring the position target.
+                vehicle_id = str(cmd_payload.get("vehicle_id") or "")
+                now = time.monotonic()
+                if now - _sitl_follow_guided_requests.get(vehicle_id, 0.0) > 1.0:
+                    _sitl_guided_forced[vehicle_id] = False
+                _sitl_follow_guided_requests[vehicle_id] = now
+                should_force = not _sitl_guided_forced.get(vehicle_id, False)
+                _sitl_guided_forced[vehicle_id] = True
+            else:
+                should_force = True
+            if should_force:
                 # Fire-and-forget: set GUIDED mode then arm without waiting for ACKs
                 # so the IO thread is never stalled over a radio link. ArduPilot
                 # processes MAVLink messages in order, so the position target
@@ -960,7 +1265,15 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
         if lat is not None and lon is not None:
             vehicle_id = str(cmd_payload.get("vehicle_id") or "")
             now = time.monotonic()
-            if now - _sitl_follow_guided_requests.get(vehicle_id, 0.0) >= 5.0:
+            # A gap in updates means the sequence just (re)started, so force
+            # GUIDED once. While updates are continuous, never force the mode
+            # back -- if the safety pilot switches modes to take control,
+            # respect it and stop guiding.
+            if now - _sitl_follow_guided_requests.get(vehicle_id, 0.0) > 1.0:
+                _sitl_guided_forced[vehicle_id] = False
+            _sitl_follow_guided_requests[vehicle_id] = now
+
+            if not _sitl_guided_forced.get(vehicle_id, False):
                 mode_mapping = master.mode_mapping()
                 if mode_mapping and "GUIDED" in mode_mapping:
                     master.mav.set_mode_send(
@@ -968,7 +1281,10 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
                         _mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
                         mode_mapping["GUIDED"],
                     )
-                    _sitl_follow_guided_requests[vehicle_id] = now
+                    _sitl_guided_forced[vehicle_id] = True
+            elif getattr(master, "flightmode", "GUIDED") != "GUIDED":
+                print(f"[RTB] Safety pilot has taken control of {vehicle_id}; halting RTB-follow guidance")
+                return
             master.mav.set_position_target_global_int_send(
                 0,
                 master.target_system,
@@ -981,6 +1297,71 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
                 float(command.get("velocity_north_ms") or 0.0),
                 float(command.get("velocity_east_ms") or 0.0),
                 0.0,
+                0.0,
+                0.0,
+                0.0,
+                math.radians(float(command.get("heading") or 0.0)),
+                0.0,
+            )
+
+    elif cmd_type == "land_on_boat_step":
+        target = command.get("target", {})
+        lat = target.get("latitude")
+        lon = target.get("longitude")
+        if lat is not None and lon is not None:
+            vehicle_id = str(cmd_payload.get("vehicle_id") or "")
+            now = time.monotonic()
+            # Same force-once/respect-override behavior as rtb_follow above,
+            # plus reset touchdown tracking for the new attempt.
+            if now - _sitl_follow_guided_requests.get(vehicle_id, 0.0) > 1.0:
+                _sitl_guided_forced[vehicle_id] = False
+                _sitl_land_touchdown_since.pop(vehicle_id, None)
+                _sitl_land_touchdown_sent[vehicle_id] = False
+            _sitl_follow_guided_requests[vehicle_id] = now
+
+            # Real ground contact, reported by ArduCopter's own IMU/throttle-based
+            # landing detector -- not a preset altitude the boat deck may not match.
+            if _sitl_landed_state.get(vehicle_id) == _mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
+                if vehicle_id not in _sitl_land_touchdown_since:
+                    _sitl_land_touchdown_since[vehicle_id] = now
+                if bool(command.get("auto_disarm", True)) and not _sitl_land_touchdown_sent.get(vehicle_id, False):
+                    dwell_s = float(command.get("touchdown_dwell_s", 1.5))
+                    if now - _sitl_land_touchdown_since[vehicle_id] >= dwell_s:
+                        master.mav.command_long_send(
+                            master.target_system, master.target_component,
+                            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                            0, 0, 21196, 0, 0, 0, 0, 0,
+                        )
+                        _sitl_land_touchdown_sent[vehicle_id] = True
+                        print(f"[LAND] Onboard landing detector confirms touchdown on {vehicle_id}; disarmed.")
+                        return True
+                return False
+            _sitl_land_touchdown_since.pop(vehicle_id, None)
+
+            if not _sitl_guided_forced.get(vehicle_id, False):
+                mode_mapping = master.mode_mapping()
+                if mode_mapping and "GUIDED" in mode_mapping:
+                    master.mav.set_mode_send(
+                        master.target_system,
+                        _mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                        mode_mapping["GUIDED"],
+                    )
+                    _sitl_guided_forced[vehicle_id] = True
+            elif getattr(master, "flightmode", "GUIDED") != "GUIDED":
+                print(f"[LAND] Safety pilot has taken control of {vehicle_id}; halting land-on-boat guidance")
+                return False
+            master.mav.set_position_target_global_int_send(
+                0,
+                master.target_system,
+                master.target_component,
+                _mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                0b100111000000,
+                int(float(lat) * 1e7),
+                int(float(lon) * 1e7),
+                float(target.get("altitude") or 0.0),
+                float(command.get("velocity_north_ms") or 0.0),
+                float(command.get("velocity_east_ms") or 0.0),
+                float(command.get("sink_rate_ms") or 0.0),
                 0.0,
                 0.0,
                 0.0,
@@ -1001,6 +1382,7 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
         mission_items = _sar_missions.build_mission_items(
             waypoints,
             force_guided_on_complete=bool(command.get("force_guided_on_complete", False)),
+            surface_vehicle=sitl_bridge_info.get(str(cmd_payload.get("vehicle_id") or ""), {}).get("vehicle_type") in ("usv", "ugv"),
         )
         if not mission_items:
             print("[SITL] mission_plan ignored: no valid waypoint entries")
@@ -1011,9 +1393,13 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
             return
 
         if bool(command.get("auto_arm_start", True)):
-            _sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+            # Arm in GUIDED first (ArduCopter refuses to arm from a disarmed
+            # AUTO mode unless already flying); then switch to AUTO and start.
+            _sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
             time.sleep(0.2)
             _sar_missions.arm_vehicle(master)
+            time.sleep(0.2)
+            _sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
             time.sleep(0.2)
             _sar_missions.start_mission(master)
 
@@ -1026,6 +1412,45 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> None:
             print("[SITL] set_mode ignored: sar_missions helpers unavailable")
             return
         _sar_missions.set_mode(master, str(mode), wait_for_ack=False)
+
+    elif cmd_type == "disarm":
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,
+            21196,
+            0, 0, 0, 0, 0,
+        )
+
+    elif cmd_type == "arm":
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            1,
+            0,
+            0, 0, 0, 0, 0,
+        )
+
+    elif cmd_type == "takeoff":
+        if _sar_missions is None:
+            print("[SITL] takeoff ignored: sar_missions helpers unavailable")
+            return
+        altitude_m = float(command.get("altitude_m") or 15.0)
+        # ArduPilot only accepts NAV_TAKEOFF while armed in GUIDED.
+        _sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
+        time.sleep(0.3)
+        _sar_missions.arm_vehicle(master)
+        time.sleep(0.3)
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            _mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0, 0, 0, 0, float("nan"), 0, 0, altitude_m,
+        )
 
     elif cmd_type == "rtcm_data":
         flags = command.get("flags", 0)
@@ -1095,6 +1520,12 @@ async def delete_video_stream(vehicle_id: str, authorization: Optional[str] = He
 async def get_settings() -> dict[str, Any]:
     """Return the current server-wide runtime settings."""
     return {**settings, "yp_role_vehicle_id": _yp_role_vehicle_id}
+
+
+@app.get("/api/rtcm/status")
+async def get_rtcm_status() -> dict[str, Any]:
+    """Return the live connection status of the RTCM correction stream."""
+    return dict(rtcm_status)
 
 
 def _parse_log_time(value: str, name: str) -> datetime:
@@ -1169,6 +1600,55 @@ def _query_log_records(start: datetime, end: datetime) -> Any:
   |> filter(fn: (r) => r._measurement == "yp_messages")
   |> pivot(rowKey: ["_time", "vehicle_id", "vehicle_type", "topic", "msg_type"], columnKey: ["_field"], valueColumn: "_value")'''
     return query_api.query_stream(query=flux, org=INFLUX_ORG)
+
+
+def _write_shutdown_log_export() -> None:
+    """Save the retained flight log to disk on shutdown, reusing the /api/logs/export format.
+
+    Runs synchronously in a worker thread from the shutdown event handler so a
+    `docker stop`/Ctrl+C/`docker compose down` always leaves an on-disk copy of
+    whatever telemetry is still retained in InfluxDB.
+    """
+    if not query_api or not _server_start_time:
+        return
+    end_time = datetime.now(timezone.utc)
+    start_time = max(_server_start_time, end_time - timedelta(seconds=MESSAGE_RETENTION_SECONDS))
+    if start_time >= end_time:
+        return
+
+    try:
+        records = (record for record in _query_log_records(start_time, end_time) if not _is_heartbeat_record(record))
+        first_record = next(records)
+    except StopIteration:
+        print("Shutdown log export: no retained flight log data to save")
+        return
+    except Exception as error:
+        print(f"Shutdown log export failed: {error}")
+        return
+
+    metadata = {
+        "format": "yp-ground-station-log",
+        "schema_version": 1,
+        "exported_at": _format_log_time(end_time),
+        "start": _format_log_time(start_time),
+        "end": _format_log_time(end_time),
+        "bucket": INFLUX_BUCKET,
+        "measurement": "yp_messages",
+        "trigger": "shutdown",
+    }
+    filename = f"yp-flight-log-{start_time.strftime('%Y%m%dT%H%M%SZ')}-{end_time.strftime('%Y%m%dT%H%M%SZ')}.jsonl.gz"
+    path = os.path.join(LOG_EXPORT_DIR, filename)
+    try:
+        os.makedirs(LOG_EXPORT_DIR, exist_ok=True)
+        with gzip.open(path, "wt", encoding="utf-8") as handle:
+            handle.write(json.dumps(metadata, separators=(",", ":")) + "\n")
+            handle.write(json.dumps(_influx_log_record(first_record), separators=(",", ":"), default=str) + "\n")
+            for record in records:
+                handle.write(json.dumps(_influx_log_record(record), separators=(",", ":"), default=str) + "\n")
+    except Exception as error:
+        print(f"Shutdown log export failed while writing {path}: {error}")
+        return
+    print(f"Shutdown log export saved: {path}")
 
 
 @app.get("/api/logs/export")
@@ -1564,10 +2044,10 @@ async def vehicle_ws(websocket: WebSocket, vehicle_id: str) -> None:
         if vehicle_queues.get(vehicle_id) is queue:
             vehicle_queues.pop(vehicle_id, None)
             async with state_lock:
-                if vehicle_id in vehicles:
-                    vehicles[vehicle_id]["connected"] = False
-                    vehicles[vehicle_id]["last_seen_age"] = time.time() - vehicles[vehicle_id].get("last_seen", time.time())
-            await broadcast_ui({"op": "vehicle_disconnected", "vehicle_id": vehicle_id})
+                vehicles.pop(vehicle_id, None)
+            await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
+            if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+                await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
 
 
 @app.websocket("/ws/ui")
@@ -1592,6 +2072,9 @@ async def ui_ws(websocket: WebSocket, token: Optional[str] = None) -> None:
                 "waypoints": list(shared_waypoints.values()),
                 "sar_patterns": shared_sar_patterns,
                 "mission_plans": shared_mission_plans,
+                "ship_relative_plans": shared_ship_relative_plans,
+                "rtcm_status": dict(rtcm_status),
+                "rtb_follow_state": dict(_rtb_follow_state),
             })
         while True:
             payload = await websocket.receive_json()
@@ -1611,6 +2094,34 @@ async def ui_ws(websocket: WebSocket, token: Optional[str] = None) -> None:
         ui_connections.discard(websocket)
 
 
+@app.websocket("/ws/ship_state")
+async def ship_state_ws(websocket: WebSocket) -> None:
+    """Unauthenticated, read-only vehicle position feed for companion bridges' ship-relative
+    tracking (e.g. arducopter_bridge_wServer.py). Same trust boundary as /ws/vehicle -- these
+    connections originate from the trusted vehicle network, not a browser, and cannot obtain
+    the interactive-user JWT that /ws/ui requires."""
+    await websocket.accept()
+    ui_connections.add(websocket)
+    try:
+        async with state_lock:
+            # Omit "history" (up to HISTORY_MAX_POINTS per vehicle) -- companion
+            # bridges only need current position, and the full snapshot can
+            # exceed the websockets client library's default 1MB frame limit.
+            await websocket.send_json({
+                "op": "snapshot",
+                "vehicles": [
+                    {k: v for k, v in public_vehicle(vehicle).items() if k != "history"}
+                    for vehicle in vehicles.values()
+                ],
+            })
+        while True:
+            await websocket.receive_text()  # keep-alive; inbound messages are ignored
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ui_connections.discard(websocket)
+
+
 def _check_command_permission(user: "User", cmd_type: Optional[str]) -> bool:
     """Check if a user has permission to execute a specific command type."""
     if not user or not user.active:
@@ -1624,10 +2135,14 @@ def _check_command_permission(user: "User", cmd_type: Optional[str]) -> bool:
         "cancel_sar": "cancel_sar",
         "search_grid": "search_grid",
         "mob": "trigger_mob",
+        "land_on_boat": "send_rtb",
         "clear_sar_pattern": "cancel_sar",
         "mission_plan": "upload_mission",
         "ship_relative_trajectory": "upload_mission",
         "trajectory": "send_waypoint",
+        "arm": "arm_disarm",
+        "disarm": "arm_disarm",
+        "takeoff": "arm_disarm",
     }
     
     required_permission = command_permissions.get(cmd_type)
@@ -1664,9 +2179,122 @@ async def rosbridge_ws(websocket: WebSocket) -> None:
         ros_connections.pop(websocket, None)
 
 
+_detector_ws: Optional[WebSocket] = None
+_fusion_tracks: dict[int, dict[str, Any]] = {}
+_pending_observations: list[dict[str, Any]] = []
+_next_fusion_id = 1
+
+
+def _camera_bearing(camera_id: str, detection: dict[str, Any], frame_width: float) -> float | None:
+    camera = axis_camera_registry.get(camera_id)
+    spatial = camera.get("spatial", {}) if camera else {}
+    hfov = float(spatial.get("hfov_deg", 70.0))
+    if not frame_width or not 0 < hfov < 180:
+        return None
+    left, _, right, _ = detection.get("box", [0, 0, 0, 0])
+    center_fraction = ((left + right) / 2.0) / frame_width
+    heading = (float(spatial.get("heading_deg", 0.0))
+               + float(spatial.get("pan_zero_deg", 0.0))
+               + float(camera.get("pan_deg") or 0.0) if camera else 0.0)
+    return (heading + (center_fraction - 0.5) * hfov) % 360.0
+
+
+def _intersect_bearings(first: tuple[float, float, float], second: tuple[float, float, float]) -> tuple[float, float] | None:
+    x1, y1, bearing1 = first
+    x2, y2, bearing2 = second
+    r1, r2 = math.radians(bearing1), math.radians(bearing2)
+    dx1, dy1, dx2, dy2 = math.cos(r1), math.sin(r1), math.cos(r2), math.sin(r2)
+    denominator = dx1 * dy2 - dy1 * dx2
+    if abs(denominator) < 1e-5:
+        return None
+    delta_x, delta_y = x2 - x1, y2 - y1
+    distance = (delta_x * dy2 - delta_y * dx2) / denominator
+    other_distance = (delta_x * dy1 - delta_y * dx1) / denominator
+    if distance < 0 or other_distance < 0:
+        return None
+    return x1 + distance * dx1, y1 + distance * dy1
+
+
+def _update_fusion(payload: dict[str, Any]) -> None:
+    global _next_fusion_id
+    camera_id = str(payload.get("camera_id", ""))
+    timestamp = float(payload.get("timestamp") or time.time())
+    frame_width = float(payload.get("frame_width") or 0)
+    camera = axis_camera_registry.get(camera_id)
+    spatial = camera.get("spatial", {}) if camera else {}
+    camera_x, camera_y = float(spatial.get("x_m", 0.0)), float(spatial.get("y_m", 0.0))
+    for detection in payload.get("detections", []):
+        bearing = _camera_bearing(camera_id, detection, frame_width)
+        if bearing is None:
+            continue
+        if is_coordinated_tracking() and is_tracking(camera_id):
+            # Before a second camera sees the object, use a temporary range
+            # point on the leader camera's bearing to turn the other cameras.
+            bearing_radians = math.radians(bearing)
+            asyncio.create_task(coordinate_tracking(
+                camera_x + float(settings.get("coordinated_fallback_range_m", 20.0)) * math.cos(bearing_radians),
+                camera_y + float(settings.get("coordinated_fallback_range_m", 20.0)) * math.sin(bearing_radians),
+            ))
+        observation = {"camera_id": camera_id, "track_id": detection.get("track_id"), "label": detection.get("label"), "timestamp": timestamp, "x_m": camera_x, "y_m": camera_y, "bearing_deg": bearing}
+        match = next((item for item in _pending_observations if item["label"] == observation["label"] and item["camera_id"] != camera_id and timestamp - item["timestamp"] <= 0.8), None)
+        if not match:
+            _pending_observations.append(observation)
+            continue
+        position = _intersect_bearings((camera_x, camera_y, bearing), (match["x_m"], match["y_m"], match["bearing_deg"]))
+        if not position:
+            continue
+        _pending_observations.remove(match)
+        fusion_id = _next_fusion_id
+        _next_fusion_id += 1
+        _fusion_tracks[fusion_id] = {"label": observation["label"], "x_m": position[0], "y_m": position[1], "last_seen": timestamp}
+        detection["fusion_id"] = fusion_id
+        detection["yp_position"] = {"x_m": round(position[0], 2), "y_m": round(position[1], 2), "z_m": None, "camera_count": 2}
+        asyncio.create_task(coordinate_tracking(position[0], position[1]))
+    _pending_observations[:] = [item for item in _pending_observations if timestamp - item["timestamp"] <= 0.8]
+
+
+async def send_to_detector(payload: dict[str, Any]) -> bool:
+    """Push a command (e.g. set_model) to the connected YOLO detector service, if any."""
+    if _detector_ws is None:
+        return False
+    try:
+        await _detector_ws.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+@app.websocket("/ws/detector")
+async def detector_ws(websocket: WebSocket) -> None:
+    """Internal endpoint for the YOLO detection service to publish bounding-box results for UI overlay."""
+    global _detector_ws
+    await websocket.accept()
+    _detector_ws = websocket
+    await send_to_detector({"op": "set_model", "model": get_active_yolo_model()})
+    await send_to_detector({"op": "set_settings", **get_active_yolo_settings()})
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            if payload.get("op") == "camera_detection_update":
+                _update_fusion(payload)
+                await broadcast_ui(payload)
+                await track_from_detections(
+                    payload.get("camera_id", ""),
+                    payload.get("detections", []),
+                    payload.get("frame_width", 0),
+                    payload.get("frame_height", 0),
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if _detector_ws is websocket:
+            _detector_ws = None
+
+
 async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
     """Update vehicle state from an incoming telemetry message and fan it out to clients."""
-    now = float(payload.get("stamp") or time.time())
+    received_at = time.time()
+    now = float(payload.get("stamp") or received_at)
     vehicle_id = str(payload.get("vehicle_id") or topic_vehicle_id(payload.get("topic", "")) or "unknown")
     # Natural type from the message payload; stored so clearing the YP role can revert it.
     natural_type = normalize_vehicle_type(payload.get("vehicle_type") or infer_vehicle_type(vehicle_id))
@@ -1676,10 +2304,22 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
     msg_type = str(payload.get("type") or payload.get("msg_type") or "unknown")
     msg = payload.get("msg", {})
 
+    if "GPS_RAW_INT" in msg_type or "GPS2_RAW" in msg_type:
+        last_logged_at = _last_gps_fix_log_at.get(vehicle_id, 0.0)
+        if received_at - last_logged_at >= 10.0:
+            _last_gps_fix_log_at[vehicle_id] = received_at
+            print(f"[GPS] Received {msg_type} from {vehicle_id} at {received_at:.3f} (payload stamp {now:.3f})")
+
     if msg_type == "yp_ground_station/MissionComplete":
         shared_mission_completion_targets.pop(vehicle_id, None)
         if shared_mission_plans.pop(vehicle_id, None) is not None:
             await broadcast_ui({"op": "mission_plan_cleared", "vehicle_id": vehicle_id})
+
+    if msg_type == "yp_ground_station/LandOnBoatTouchdown":
+        # The bridge confirmed real ground contact (onboard landing detector)
+        # and already disarmed locally; just stop our guidance loop and tell the UI.
+        await _stop_land_on_boat(vehicle_id)
+        await broadcast_ui({"op": "land_on_boat_touchdown", "vehicle_id": vehicle_id})
 
     update: dict[str, Any] = {
         "vehicle_id": vehicle_id,
@@ -1747,9 +2387,41 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
         if heading is not None:
             vehicle["heading"] = heading
 
+        if nav:
+            with _sitl_nav_lock:
+                previous_nav = _sitl_nav_states.get(vehicle_id, {})
+                north_velocity = float(previous_nav.get("vn_ms", 0.0))
+                east_velocity = float(previous_nav.get("ve_ms", 0.0))
+                previous_stamp = float(previous_nav.get("stamp", 0.0))
+                if previous_nav and now > previous_stamp:
+                    latitude_delta = math.radians(float(nav["latitude"]) - float(previous_nav["lat"]))
+                    longitude_delta = math.radians(float(nav["longitude"]) - float(previous_nav["lon"]))
+                    mean_latitude = math.radians((float(nav["latitude"]) + float(previous_nav["lat"])) / 2.0)
+                    elapsed = now - previous_stamp
+                    north_velocity = latitude_delta * 6_378_137.0 / elapsed
+                    east_velocity = longitude_delta * 6_378_137.0 * math.cos(mean_latitude) / elapsed
+                _sitl_nav_states[vehicle_id] = {
+                    "lat": float(nav["latitude"]),
+                    "lon": float(nav["longitude"]),
+                    "alt": float(nav.get("altitude", 0.0)),
+                    "heading_deg": float(vehicle.get("heading") or 0.0) % 360.0,
+                    "vn_ms": north_velocity,
+                    "ve_ms": east_velocity,
+                    "stamp": now,
+                }
+
         battery = extract_battery(topic, msg_type, msg)
         if battery:
             vehicle["battery"] = battery
+
+        gps_fix = extract_gps_fix(topic, msg_type, msg)
+        if gps_fix:
+            previous_gps_fix = vehicle.get("gps_fix") or {}
+            if (
+                int(gps_fix.get("fix_type") or 0) >= int(previous_gps_fix.get("fix_type") or 0)
+                or received_at - float(previous_gps_fix.get("stamp") or 0) > 10.0
+            ):
+                vehicle["gps_fix"] = {**gps_fix, "stamp": received_at}
 
         vehicle_snapshot = public_vehicle(vehicle)
         # Strip history from the per-message update — it grows to thousands of entries
@@ -1815,6 +2487,10 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
         if shared_mission_plans.pop(vehicle_id, None) is not None:
             await broadcast_ui({"op": "mission_plan_cleared", "vehicle_id": vehicle_id})
 
+    if not is_temporary_avoidance and cmd_type != "ship_relative_trajectory":
+        if shared_ship_relative_plans.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "ship_relative_plan_cleared", "vehicle_id": vehicle_id})
+
     if not is_temporary_avoidance and cmd_type == "waypoint":
         target = command.get("target", {})
         lat, lon = target.get("latitude"), target.get("longitude")
@@ -1837,14 +2513,21 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
         await _emit_command_ack(vehicle_id, command, source)
         return
 
-    # Any operator command except RTB should terminate active RTB-follow.
-    if source != "rtb_follow" and cmd_type != "rtb":
+    # Any operator command except RTB or Land should terminate active RTB-follow / Landing
+    if source not in ("rtb_follow", "land_on_boat") and cmd_type not in ("rtb", "land_on_boat"):
         await _stop_rtb_follow(vehicle_id)
+        await _stop_land_on_boat(vehicle_id)
 
     if cmd_type == "rtb":
         if vehicle_id in vehicles:
             await _update_deconfliction_state(vehicle_id, vehicles[vehicle_id], command)
         await _start_rtb_follow(vehicle_id, source)
+        await _emit_command_ack(vehicle_id, command, source)
+        return
+
+    # HANDLER FOR LAND COMMANDS
+    if cmd_type == "land_on_boat":
+        await _start_land_on_boat(vehicle_id, source)
         await _emit_command_ack(vehicle_id, command, source)
         return
 
@@ -1899,6 +2582,14 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
                 "vehicle_id": vehicle_id,
                 "waypoints": mission_points,
             })
+
+    if cmd_type == "ship_relative_trajectory":
+        ship_vehicle_id = command.get("ship_vehicle_id")
+        local_waypoints = command.get("local_waypoints") or []
+        if ship_vehicle_id and local_waypoints:
+            plan = {"ship_vehicle_id": ship_vehicle_id, "local_waypoints": local_waypoints}
+            shared_ship_relative_plans[vehicle_id] = plan
+            await broadcast_ui({"op": "ship_relative_plan_overlay", "vehicle_id": vehicle_id, **plan})
 
     # Update deconfliction engine with the command
     if vehicle_id in vehicles and not is_temporary_avoidance:
@@ -2012,6 +2703,75 @@ def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return math.degrees(math.atan2(y, x)) % 360.0
 
 
+def _angular_diff_deg(a_deg: float, b_deg: float) -> float:
+    """Return the smallest absolute difference between two compass bearings."""
+    diff = abs((a_deg - b_deg) % 360.0)
+    return diff if diff <= 180.0 else 360.0 - diff
+
+
+def _bearing_dist_blocked_by_circle(
+    bearing_a_deg: float, dist_a_m: float, bearing_b_deg: float, dist_b_m: float, radius_m: float,
+) -> bool:
+    """Return whether the straight path from A to B passes within radius_m of the origin.
+
+    A and B are given as bearing/distance from a shared origin (the YP position); the
+    check is done in a local flat-earth projection, which is accurate at RTB ranges.
+    """
+    ax = dist_a_m * math.sin(math.radians(bearing_a_deg))
+    ay = dist_a_m * math.cos(math.radians(bearing_a_deg))
+    bx = dist_b_m * math.sin(math.radians(bearing_b_deg))
+    by = dist_b_m * math.cos(math.radians(bearing_b_deg))
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-9:
+        t = 0.0
+    else:
+        t = max(0.0, min(1.0, -(ax * dx + ay * dy) / length_sq))
+    closest_x, closest_y = ax + t * dx, ay + t * dy
+    return math.hypot(closest_x, closest_y) < radius_m
+
+
+def _tangent_point_around_yp(
+    yp_lat: float, yp_lon: float, bearing_c_to_a: float, dist_c_to_a: float, radius_m: float, side: int,
+) -> tuple[float, float]:
+    """Return the initial tangent bearing/point used to pick which side to divert around.
+
+    `side` (+1/-1) selects which of the two tangent solutions to use. This is only used to
+    lock in a direction; ongoing guidance around the circle uses `_lead_point_around_yp`,
+    since a pure tangent point degenerates to the vehicle's own position once it reaches
+    the boundary and stops providing forward progress.
+    """
+    if dist_c_to_a <= radius_m:
+        # Already inside the safe zone (shouldn't normally happen): head straight outward.
+        tangent_bearing = bearing_c_to_a
+    else:
+        alpha_deg = math.degrees(math.acos(max(-1.0, min(1.0, radius_m / dist_c_to_a))))
+        tangent_bearing = (bearing_c_to_a + alpha_deg * side) % 360.0
+    return _destination_point(yp_lat, yp_lon, tangent_bearing, radius_m)
+
+
+RTB_AVOID_LEAD_DEG = 30.0
+RTB_MAX_YAW_RATE_DEG_S = 25.0
+
+
+def _lead_point_around_yp(
+    yp_lat: float, yp_lon: float, bearing_c_to_a: float, bearing_c_to_b: float, radius_m: float, side: int,
+) -> tuple[float, float]:
+    """Return a point on the safe-distance circle a fixed arc ahead of the vehicle.
+
+    Steering toward a point that is always a fixed arc-angle ahead (rather than the exact
+    tangent/closest point) keeps the vehicle making forward progress around the YP instead
+    of stalling once it reaches the boundary. The lead is capped by the *unsigned* angular
+    distance remaining to the stern bearing (not a one-directional modulo, which wraps to
+    ~360 degrees and sends the vehicle looping around the far side once real vehicle
+    dynamics/turn radius cause it to overshoot slightly past the stern line).
+    """
+    remaining_deg = _angular_diff_deg(bearing_c_to_a, bearing_c_to_b)
+    lead_deg = min(RTB_AVOID_LEAD_DEG, remaining_deg)
+    lead_bearing = (bearing_c_to_a + lead_deg * side) % 360.0
+    return _destination_point(yp_lat, yp_lon, lead_bearing, radius_m)
+
+
 async def _stop_rtb_follow(vehicle_id: str) -> None:
     """Cancel and await a vehicle's running RTB-follow task, if any."""
     task = _rtb_follow_tasks.pop(vehicle_id, None)
@@ -2035,9 +2795,17 @@ async def _start_rtb_follow(vehicle_id: str, source: str) -> None:
 
 
 async def _rtb_follow_loop(vehicle_id: str) -> None:
-    """Continuously steer a vehicle to a moving point directly aft of the YP."""
+    """Continuously steer a vehicle to a moving point directly aft of the YP.
+
+    Vehicles head straight for the stern point whenever that direct line clears the
+    YP's safe-distance zone (the most economical route). If the direct line would pass
+    too close to the YP, the vehicle is instead steered around the near side of the
+    safe-distance circle until it can approach from the stern.
+    """
     approach_side: Optional[int] = None
     approach_stage = 0
+    smoothed_heading: Optional[float] = None
+    stern_captured = False
     try:
         while True:
             rtb_update_hz = float(settings.get("rtb_update_hz") or RTB_UPDATE_HZ)
@@ -2069,50 +2837,92 @@ async def _rtb_follow_loop(vehicle_id: str) -> None:
                     approach_lat, approach_lon = stern_lat, stern_lon
                     follow_heading = yp_heading
                     if vehicle_lat is not None and vehicle_lon is not None:
-                        relative_bearing = (
-                            _bearing_deg(
-                                float(yp_pos["latitude"]),
-                                float(yp_pos["longitude"]),
-                                float(vehicle_lat),
-                                float(vehicle_lon),
-                            ) - yp_heading
-                        ) % 360.0
-                        if approach_side is None and not 165.0 <= relative_bearing <= 195.0:
-                            approach_side = -1 if relative_bearing < 180.0 else 1
-                            approach_stage = 1
-                        if approach_side is not None:
-                            safety_radius = (
-                                deconfliction_engine.get_radius(target_vehicle.get("vehicle_type", "uav"))
-                                + deconfliction_engine.get_radius("yp")
-                            )
-                            route_distance = max(
-                                float(settings.get("rtb_stern_distance_m", RTB_STERN_DISTANCE_M)) + 10.0,
-                                (safety_radius * 2.0) + 10.0,
-                            )
-                            if approach_stage == 1:
-                                approach_bearing = (yp_heading + (90.0 if approach_side < 0 else 270.0)) % 360.0
-                                approach_distance = route_distance
+                        yp_lat = float(yp_pos["latitude"])
+                        yp_lon = float(yp_pos["longitude"])
+                        safe_radius = float(settings.get("rtb_yp_safe_distance_m", RTB_YP_SAFE_DISTANCE_M))
+                        route_radius = safe_radius + max(2.0, safe_radius * 0.1)
+                        bearing_c_to_a = _bearing_deg(yp_lat, yp_lon, float(vehicle_lat), float(vehicle_lon))
+                        dist_c_to_a = _haversine_m(yp_lat, yp_lon, float(vehicle_lat), float(vehicle_lon))
+                        bearing_c_to_b = _bearing_deg(yp_lat, yp_lon, stern_lat, stern_lon)
+                        dist_c_to_b = _haversine_m(yp_lat, yp_lon, stern_lat, stern_lon)
+                        stern_distance = _haversine_m(
+                            float(vehicle_lat), float(vehicle_lon), stern_lat, stern_lon,
+                        )
+                        stern_capture_radius = max(4.0, min(8.0, dist_c_to_b * 0.2))
+                        stern_bearing_error = _angular_diff_deg(bearing_c_to_a, bearing_c_to_b)
+                        if stern_captured and (
+                            stern_distance > stern_capture_radius * 2.0 or stern_bearing_error > 45.0
+                        ):
+                            stern_captured = False
+                        blocked = _bearing_dist_blocked_by_circle(
+                            bearing_c_to_a, dist_c_to_a, bearing_c_to_b, dist_c_to_b, safe_radius,
+                        )
+                        if approach_stage == 0:
+                            if blocked:
+                                if dist_c_to_a > route_radius:
+                                    alpha_deg = math.degrees(
+                                        math.acos(max(-1.0, min(1.0, route_radius / dist_c_to_a)))
+                                    )
+                                    candidate_plus = (bearing_c_to_a + alpha_deg) % 360.0
+                                    candidate_minus = (bearing_c_to_a - alpha_deg) % 360.0
+                                    approach_side = (
+                                        1
+                                        if _angular_diff_deg(candidate_plus, bearing_c_to_b)
+                                        <= _angular_diff_deg(candidate_minus, bearing_c_to_b)
+                                        else -1
+                                    )
+                                else:
+                                    approach_side = 1
+                                approach_stage = 1
                             else:
-                                approach_bearing = (yp_heading + 180.0) % 360.0
-                                approach_distance = route_distance
-                            approach_lat, approach_lon = _destination_point(
-                                float(yp_pos["latitude"]),
-                                float(yp_pos["longitude"]),
-                                approach_bearing,
-                                approach_distance,
-                            )
-                            follow_heading = _bearing_deg(
-                                float(vehicle_lat), float(vehicle_lon), approach_lat, approach_lon,
-                            )
-                            approach_tolerance = max(5.0, min(10.0, route_distance * 0.2))
-                            if approach_stage == 1 and _haversine_m(
-                                float(vehicle_lat), float(vehicle_lon), approach_lat, approach_lon,
-                            ) <= approach_tolerance:
                                 approach_stage = 2
-                            elif approach_stage == 2 and _haversine_m(
+                        if approach_stage == 1 and approach_side is not None:
+                            gate_bearing = (bearing_c_to_b - approach_side * 50.0) % 360.0
+                            approach_lat, approach_lon = _destination_point(
+                                yp_lat, yp_lon, gate_bearing, route_radius,
+                            )
+                            gate_distance = _haversine_m(
                                 float(vehicle_lat), float(vehicle_lon), approach_lat, approach_lon,
-                            ) <= approach_tolerance:
-                                approach_side = None
+                            )
+                            if gate_distance <= max(5.0, route_radius * 0.25):
+                                approach_stage = 2
+                                approach_lat, approach_lon = stern_lat, stern_lon
+                        elif approach_stage == 2:
+                            approach_lat, approach_lon = stern_lat, stern_lon
+                        if (
+                            not stern_captured
+                            and approach_stage == 2
+                            and stern_distance <= stern_capture_radius
+                            and stern_bearing_error <= 25.0
+                        ):
+                            stern_captured = True
+                        # Point the vehicle the direction it is actually traveling. Close to the
+                        # target, blend toward the YP's own heading (its direction of travel)
+                        # instead of bearing-to-target, since GPS noise makes that bearing
+                        # unstable once the vehicle and target are nearly co-located.
+                        dist_to_target = _haversine_m(
+                            float(vehicle_lat), float(vehicle_lon), approach_lat, approach_lon,
+                        )
+                        bearing_to_target = _bearing_deg(
+                            float(vehicle_lat), float(vehicle_lon), approach_lat, approach_lon,
+                        )
+                        near_m, far_m = 3.0, 10.0
+                        if dist_to_target <= near_m:
+                            desired_heading = yp_heading
+                        elif dist_to_target >= far_m:
+                            desired_heading = bearing_to_target
+                        else:
+                            blend = (dist_to_target - near_m) / (far_m - near_m)
+                            delta = ((bearing_to_target - yp_heading + 540.0) % 360.0) - 180.0
+                            desired_heading = (yp_heading + delta * blend) % 360.0
+                        if smoothed_heading is None:
+                            smoothed_heading = desired_heading
+                        else:
+                            max_step_deg = RTB_MAX_YAW_RATE_DEG_S * period_s
+                            delta = ((desired_heading - smoothed_heading + 540.0) % 360.0) - 180.0
+                            clamped_delta = max(-max_step_deg, min(max_step_deg, delta))
+                            smoothed_heading = (smoothed_heading + clamped_delta) % 360.0
+                        follow_heading = smoothed_heading
                     # Use the configured RTB transit altitude rather than the vehicle's
                     # live altitude; re-sampling live altitude each cycle would let any
                     # small descent become the new setpoint, causing drift.
@@ -2150,8 +2960,13 @@ async def _rtb_follow_loop(vehicle_id: str) -> None:
                 await asyncio.sleep(period_s)
                 continue
 
+            is_following = stern_captured
+            if _rtb_follow_state.get(vehicle_id) != is_following:
+                _rtb_follow_state[vehicle_id] = is_following
+                await broadcast_ui({"op": "rtb_follow_state", "vehicle_id": vehicle_id, "following": is_following})
+
             follow_command = {
-                "type": "rtb_follow" if approach_side is None else "waypoint",
+                "type": "rtb_follow" if stern_captured else "waypoint",
                 "target": {
                     "latitude": target_snapshot["lat"],
                     "longitude": target_snapshot["lon"],
@@ -2159,7 +2974,7 @@ async def _rtb_follow_loop(vehicle_id: str) -> None:
                 },
             }
             if follow_command["type"] == "rtb_follow":
-                follow_command["heading"] = target_snapshot["yp_heading"]
+                follow_command["heading"] = target_snapshot["follow_heading"]
                 follow_command["speed_mps"] = target_snapshot["yp_speed_mps"]
                 follow_command["velocity_north_ms"] = target_snapshot["yp_velocity_north_ms"]
                 follow_command["velocity_east_ms"] = target_snapshot["yp_velocity_east_ms"]
@@ -2181,7 +2996,147 @@ async def _rtb_follow_loop(vehicle_id: str) -> None:
         current_task = _rtb_follow_tasks.get(vehicle_id)
         if current_task is asyncio.current_task():
             _rtb_follow_tasks.pop(vehicle_id, None)
+        if _rtb_follow_state.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "rtb_follow_state", "vehicle_id": vehicle_id, "following": False})
 
+async def _stop_land_on_boat(vehicle_id: str) -> None:
+    """Cancel and await a vehicle's running landing task, if any."""
+    task = _land_on_boat_tasks.pop(vehicle_id, None)
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        print(f"[LAND] Stop task error for {vehicle_id}: {exc}")
+
+
+async def _start_land_on_boat(vehicle_id: str, source: str) -> None:
+    """Stop RTB or existing landing tasks and start the landing loop."""
+    await _stop_land_on_boat(vehicle_id)
+    await _stop_rtb_follow(vehicle_id)
+    task = asyncio.create_task(_land_on_boat_loop(vehicle_id), name=f"land-boat-{vehicle_id}")
+    _land_on_boat_tasks[vehicle_id] = task
+    print(f"[LAND] Started land-on-boat sequence for {vehicle_id} (source={source})")
+
+
+async def _land_on_boat_loop(vehicle_id: str) -> None:
+    """Track the moving pad, descend to a hover clearance, and hold there.
+
+    The vehicle bridge (not this loop) confirms actual ground contact via
+    ArduCopter's onboard landing detector and disarms locally, then reports
+    a touchdown event that stops this loop -- no altitude guess is involved.
+    """
+    STATE_APPROACH = 0
+    STATE_DESCENT = 1
+    STATE_HOVER = 2
+
+    current_state = STATE_APPROACH
+    target_alt_m: Optional[float] = None
+
+    try:
+        while True:
+            period_s = 0.05  # High-rate 20 Hz loop for smooth dynamic tracking
+            step_command: Optional[dict[str, Any]] = None
+
+            async with state_lock:
+                target_vehicle = vehicles.get(vehicle_id)
+                yp_vehicle = _select_yp_vehicle_locked()
+
+                if not target_vehicle or not target_vehicle.get("connected") or not yp_vehicle:
+                    print(f"[LAND] Vehicle or YP unavailable; cancelling land sequence for {vehicle_id}")
+                    return
+
+                target_pos = target_vehicle.get("position") or {}
+                yp_pos = yp_vehicle.get("position") or {}
+
+                if yp_pos.get("latitude") is None or target_pos.get("latitude") is None:
+                    target_alt_m = None
+                else:
+                    yp_heading = float(yp_vehicle.get("heading") or 0.0) % 360.0
+
+                    yp_history = yp_vehicle.get("history") or []
+                    yp_speed_mps = 0.0
+                    if len(yp_history) >= 2:
+                        p1, p2 = yp_history[-2], yp_history[-1]
+                        dt = float(p2.get("stamp") or 0) - float(p1.get("stamp") or 0)
+                        if dt > 0:
+                            yp_speed_mps = _haversine_m(
+                                p1["latitude"], p1["longitude"],
+                                p2["latitude"], p2["longitude"],
+                            ) / dt
+
+                    pad_lat, pad_lon = _destination_point(
+                        float(yp_pos["latitude"]),
+                        float(yp_pos["longitude"]),
+                        yp_heading + 180.0,
+                        float(settings.get("land_on_boat_pad_offset_m", LAND_ON_BOAT_PAD_OFFSET_M)),
+                    )
+                    horiz_dist_m = _haversine_m(
+                        float(target_pos["latitude"]), float(target_pos["longitude"]),
+                        pad_lat, pad_lon,
+                    )
+                    hover_clearance_m = float(settings.get("land_on_boat_hover_clearance_m", LAND_ON_BOAT_HOVER_CLEARANCE_M))
+                    descent_rate_ms = float(settings.get("land_on_boat_descent_rate_ms", LAND_ON_BOAT_DESCENT_RATE_MS))
+                    alignment_radius_m = float(settings.get("land_on_boat_alignment_radius_m", LAND_ON_BOAT_ALIGNMENT_RADIUS_M))
+                    pad_hover_alt_m = float(yp_pos.get("altitude") or 0.0) + hover_clearance_m
+                    vehicle_alt_m = float(target_pos.get("altitude") or 0.0)
+
+                    # Avoid an abrupt first altitude command; descend from the
+                    # current reported altitude toward the pad-relative target.
+                    if target_alt_m is None:
+                        target_alt_m = max(vehicle_alt_m, pad_hover_alt_m)
+
+                    sink_rate_ms = 0.0
+                    if current_state == STATE_APPROACH and horiz_dist_m <= alignment_radius_m:
+                        current_state = STATE_DESCENT
+                        print(f"[LAND] Aligned with pad; descending to {hover_clearance_m:.2f}m hover on {vehicle_id}")
+
+                    if current_state == STATE_DESCENT:
+                        target_alt_m = max(
+                            pad_hover_alt_m,
+                            target_alt_m - descent_rate_ms * period_s,
+                        )
+                        if target_alt_m <= pad_hover_alt_m:
+                            target_alt_m = pad_hover_alt_m
+                            current_state = STATE_HOVER
+                            print(f"[LAND] Hover clearance reached on {vehicle_id}; holding above pad")
+                        else:
+                            sink_rate_ms = descent_rate_ms
+
+                    if current_state == STATE_HOVER:
+                        target_alt_m = pad_hover_alt_m
+
+                    step_command = {
+                        "type": "land_on_boat_step",
+                        "target": {
+                            "latitude": pad_lat,
+                            "longitude": pad_lon,
+                            "altitude": target_alt_m,
+                        },
+                        "heading": yp_heading,
+                        "velocity_north_ms": yp_speed_mps * math.cos(math.radians(yp_heading)),
+                        "velocity_east_ms": yp_speed_mps * math.sin(math.radians(yp_heading)),
+                        "sink_rate_ms": sink_rate_ms,
+                        # Let the bridge disarm the instant its own onboard
+                        # landing detector confirms ground contact.
+                        "auto_disarm": bool(settings.get("land_on_boat_auto_disarm", LAND_ON_BOAT_AUTO_DISARM)),
+                        "touchdown_dwell_s": float(settings.get("land_on_boat_touchdown_dwell_s", LAND_ON_BOAT_TOUCHDOWN_DWELL_S)),
+                    }
+
+            if step_command is not None:
+                await _dispatch_vehicle_command(vehicle_id, step_command, source="land_on_boat", emit_ack=False, write_log=False)
+
+            await asyncio.sleep(period_s)
+
+    except asyncio.CancelledError:
+        return
+    finally:
+        current_task = _land_on_boat_tasks.get(vehicle_id)
+        if current_task is asyncio.current_task():
+            _land_on_boat_tasks.pop(vehicle_id, None)
 
 async def _deconfliction_check_loop() -> None:
     """Periodically check for vehicle conflicts and issue deconfliction commands."""
@@ -2485,6 +3440,51 @@ def extract_battery(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, A
     }
 
 
+# MAV_GPS_FIX_TYPE labels, used to surface RTK correction quality to the UI.
+GPS_FIX_TYPE_LABELS = {
+    0: "No GPS",
+    1: "No Fix",
+    2: "2D Fix",
+    3: "3D Fix",
+    4: "DGPS",
+    5: "RTK Float",
+    6: "RTK Fixed",
+    7: "Static",
+    8: "PPP",
+}
+
+
+def _gps_raw_int_to_dict(msg: Any, source: str = "GPS_RAW_INT") -> dict[str, Any]:
+    """Convert a pymavlink GPS_RAW_INT/GPS2_RAW message into a plain dictionary."""
+    fix_type = int(getattr(msg, "fix_type", 0))
+    eph = getattr(msg, "eph", 65535)
+    epv = getattr(msg, "epv", 65535)
+    satellites_visible = int(getattr(msg, "satellites_visible", 255))
+    # h_acc/v_acc (mm) are more precise than eph/epv (cm) and present on most modern dialects.
+    h_acc = getattr(msg, "h_acc", None)
+    v_acc = getattr(msg, "v_acc", None)
+    horizontal_accuracy_m = (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None)
+    vertical_accuracy_m = (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None)
+    return {
+        "source": source,
+        "fix_type": fix_type,
+        "fix_type_label": GPS_FIX_TYPE_LABELS.get(fix_type, "Unknown"),
+        "satellites_visible": satellites_visible if satellites_visible != 255 else None,
+        "horizontal_accuracy_m": horizontal_accuracy_m,
+        "vertical_accuracy_m": vertical_accuracy_m,
+    }
+
+
+def extract_gps_fix(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, Any]]:
+    """Extract fix type/accuracy from a GPS_RAW_INT-shaped message, or None if not applicable."""
+    if not isinstance(msg, dict):
+        return None
+    if "GPS_RAW_INT" not in msg_type and "GPS2_RAW" not in msg_type and not topic.endswith("gps_fix"):
+        return None
+    return dict(msg)
+
+
+
 def extract_heading(msg: Any) -> Optional[float]:
     """Extract a normalized 0-360 degree heading from a message, or None if absent."""
     if not isinstance(msg, dict):
@@ -2509,10 +3509,16 @@ def quaternion_to_yaw_deg(q: dict[str, Any]) -> Optional[float]:
 
 
 
+async def _set_rtcm_status(**updates: Any) -> None:
+    """Merge fields into the global rtcm_status and push the new snapshot to connected UIs."""
+    rtcm_status.update(updates)
+    await broadcast_ui({"op": "rtcm_status_update", "status": dict(rtcm_status)})
+
+
 # # Distribute RTCM correction frames for RTK fix distribution to all connected vehicles that can accept it
 async def rtcm_ingest_loop():
     """Background loop that dynamically connects to configured RTCM sources with automatic retry logic."""
-    global _rtcm_seq_id
+    global _rtcm_seq_id, _rtcm_last_broadcast_at
     loop = asyncio.get_running_loop()
     
     while True:
@@ -2523,8 +3529,13 @@ async def rtcm_ingest_loop():
         baudrate = int(settings.get("rtk_baudrate", 115200))
 
         if source_type == "disabled":
+            if rtcm_status["state"] != "disabled":
+                await _set_rtcm_status(state="disabled", source_type="disabled", target=None, error=None)
             await asyncio.sleep(2.0)
             continue
+
+        target_label = port_or_host if source_type == "serial" else f"{port_or_host}:{network_port}"
+        await _set_rtcm_status(state="connecting", source_type=source_type, target=target_label, error=None)
 
         buffer = bytearray()
         stream_reader = None
@@ -2550,6 +3561,8 @@ async def rtcm_ingest_loop():
                 sock.bind((port_or_host, network_port))
                 sock.setblocking(False)
                 print(f"[RTCM] Listening for UDP RTCM stream on {port_or_host}:{network_port}")
+
+            await _set_rtcm_status(state="connected", error=None)
 
             # Stream processing loop
             while settings.get("rtk_source_type") == source_type:
@@ -2593,9 +3606,19 @@ async def rtcm_ingest_loop():
                     await distribute_rtcm_frame(rtcm_frame, _rtcm_seq_id)
                     _rtcm_seq_id = (_rtcm_seq_id + 1) % 32
 
+                    now = time.time()
+                    rtcm_status["frame_count"] += 1
+                    rtcm_status["bytes_total"] += len(rtcm_frame)
+                    rtcm_status["last_frame_at"] = now
+                    # Throttle UI broadcasts so a fast correction stream doesn't flood the websocket
+                    if now - _rtcm_last_broadcast_at > 0.5:
+                        _rtcm_last_broadcast_at = now
+                        await _set_rtcm_status(state="connected")
+
         except (serial.SerialException, asyncio.TimeoutError, OSError, ConnectionRefusedError) as exc:
             # Gracefully log stream outage without crashing the server
             print(f"[RTCM] Stream unavailable ({source_type}://{port_or_host}): {exc}. Retrying in 5 seconds...")
+            await _set_rtcm_status(state="error", error=str(exc))
             await asyncio.sleep(5.0)  # Wait before attempting auto-reconnect
             
         finally:
@@ -2606,6 +3629,21 @@ async def rtcm_ingest_loop():
                 writer.close()
             elif source_type == "udp" and 'sock' in locals():
                 sock.close()
+
+
+async def rtcm_watchdog_loop() -> None:
+    """Mark the RTCM stream as \"stale\" if the transport is open but no frames have arrived recently."""
+    STALE_AFTER_S = 8.0
+    while True:
+        await asyncio.sleep(2.0)
+        if rtcm_status["state"] not in ("connected", "stale"):
+            continue
+        last_frame_at = rtcm_status["last_frame_at"]
+        is_stale = last_frame_at is None or (time.time() - last_frame_at) > STALE_AFTER_S
+        if is_stale and rtcm_status["state"] != "stale":
+            await _set_rtcm_status(state="stale")
+        elif not is_stale and rtcm_status["state"] != "connected":
+            await _set_rtcm_status(state="connected")
 
 def fragment_rtcm_frame(rtcm_bytes: bytes, sequence_id: int) -> list[dict]:
     """Break raw RTCM bytes into standard MAVLink GPS_RTCM_DATA payload dictionaries."""

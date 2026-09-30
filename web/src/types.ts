@@ -17,6 +17,8 @@ export interface RelativeWaypoint {
   x: number;
   y: number;
   z: number;
+  // Degrees relative to ship heading, 0 = ship's bow, clockwise positive.
+  yaw_deg?: number;
 }
 
 export interface Vehicle {
@@ -44,11 +46,19 @@ export interface Vehicle {
     voltage?: number;
     current?: number;
   };
+  gps_fix?: {
+    fix_type: number;
+    fix_type_label: string;
+    satellites_visible?: number | null;
+    horizontal_accuracy_m?: number | null;
+    vertical_accuracy_m?: number | null;
+    stamp?: number;
+  };
   messages: Record<string, VehicleMessage>;
 }
 
 export interface Command {
-  type: "rtb" | "waypoint" | "trajectory" | "search_grid" | "ship_relative_trajectory" | "cancel_sar" | "clear_sar_pattern" | "mission_plan" | "set_mode";
+  type: "rtb" | "waypoint" | "trajectory" | "search_grid" | "ship_relative_trajectory" | "cancel_sar" | "clear_sar_pattern" | "mission_plan" | "set_mode" | "land_on_boat" | "arm" | "disarm" | "takeoff";
   target?: {
     latitude: number;
     longitude: number;
@@ -56,7 +66,7 @@ export interface Command {
   };
   // set_mode fields
   mode?: string;
-  // search_grid fields
+  // search_grid fields, also reused by takeoff for target altitude
   lat?: number;
   lon?: number;
   grid_size_m?: number;
@@ -66,6 +76,9 @@ export interface Command {
   local_waypoints?: RelativeWaypoint[];
   arrival_radius_m?: number;
   update_hz?: number;
+  face_ship?: boolean;
+  loop_count?: number;
+  hold_last_waypoint?: boolean;
   // mission_plan fields
   waypoints?: Array<{
     latitude: number;

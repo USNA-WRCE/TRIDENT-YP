@@ -10,14 +10,28 @@ services:
       DOCKER_INFLUXDB_INIT_ORG: yp
       DOCKER_INFLUXDB_INIT_BUCKET: telemetry
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: yp-dev-token
+      # WAL replay is normal on startup; keep routine file-by-file messages out
+      # of the compose log while retaining warnings and errors.
+      INFLUXD_LOG_LEVEL: warn
     volumes:
       - influx-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
   yp-server:
     build:
       context: .
       dockerfile: services/server/Dockerfile
       network: host
+    extra_hosts:
+      # Docker Desktop (Mac/Windows) resolves this automatically; plain Linux
+      # Docker Engine needs it mapped explicitly to reach the host machine
+      # (e.g. the RTK relay agent listening on host.docker.internal:<port>).
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
       # MAVLink UDP ingress from external radios / BlueOS endpoints
@@ -42,16 +56,51 @@ services:
       MESSAGE_CLEANUP_INTERVAL_SECONDS: "600"
       INFLUX_MAX_WRITE_HZ: "5"
       TILE_MAX_CACHE_AGE_SECONDS: "31536000"
+      # Axis VAPIX PTZ cameras mounted on the YP. Leave a HOST blank until
+      # that camera is installed/reachable on the network - it simply won't
+      # show up in the UI until a host is set and it responds.
+      AXIS_CAMERA_USERNAME: root
+      AXIS_CAMERA_PASSWORD: "usna1845"
+      AXIS_CAMERA_PORT_HOST: "10.10.40.12"
+      AXIS_CAMERA_PORT_HEADING_DEG: "270"
+      AXIS_CAMERA_STARBOARD_HOST: ""
+      AXIS_CAMERA_STARBOARD_HEADING_DEG: "90"
+      AXIS_CAMERA_AFT_HOST: "10.10.40.11"
+      LOG_EXPORT_ON_SHUTDOWN: "true"
+      LOG_EXPORT_DIR: /data/logs
+      AXIS_CAMERA_AFT_HEADING_DEG: "180"
     volumes:
       - ./data/auth:/data/auth
       - ./data/tiles:/data/tiles:ro
       - ./data/tile-cache:/data/tile-cache
+      - ./data/yolo_models:/data/yolo_models
+      - ./data/logs:/data/logs
     depends_on:
-      - influxdb
-    # To connect an RFD-900 (or any serial telemetry radio) via the browser UI,
-    # pass the USB device through to the server container. Adjust the device path
-    # to match what appears on your host (check with: python -m serial.tools.list_ports)
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    # Give the shutdown handler time to query InfluxDB and write the flight
+    # log to ./data/logs before Docker sends SIGKILL (docker stop/down default
+    # is 10s, which can be too short for a slow Influx query).
+    stop_grace_period: 30s
+    # Recommended: connect an RFD-900 telemetry radio or RTK base station
+    # (e.g. u-blox / Here+) via `python services/com_tcp_relay.py --port <port>
+    # --tcp-port <n>` on the host, then pick "TCP" as the source in the browser
+    # UI (Connections panel / Settings -> RTK Correction) using
+    # tcp:host.docker.internal:<n>. This works identically on Windows, Linux,
+    # and macOS and needs no compose edits or container restarts to switch
+    # ports/devices.
+    #
+    # Alternative (Linux hosts only): pass the USB device straight through
+    # instead of using the relay. Requires editing this file and recreating
+    # the container whenever the device path changes.
     # devices:
+    #   - /dev/ttyACM0:/dev/ttyACM0
     #   - /dev/ttyUSB0:/dev/ttyUSB0
 
   web:
@@ -61,7 +110,8 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   yp-gps:
     build:
@@ -88,6 +138,79 @@ services:
     # devices:
     #   - /dev/ttyUSB0:/dev/ttyUSB0
 
+  # yolo-detector:
+  #   build:
+  #     context: ./services/yolo_detector
+  #     network: host
+  #   # Use this service instead of yolo-detector-nvidia on a host with an AMD
+  #   # GPU (ROCm) or no GPU at all; otherwise the detector runs on CPU.
+  #   # Only enable one of yolo-detector / yolo-detector-nvidia at a time.
+  #   devices:
+  #     - /dev/kfd
+  #     - /dev/dri
+  #   group_add:
+  #     - "992"
+  #     - "44"
+  #   ipc: host
+  #   shm_size: "8g"
+  #   environment:
+  #     SERVER_WS_URL: ws://yp-server:8000/ws/detector
+  #     SERVER_HTTP_URL: http://yp-server:8000
+  #     # Auto-discovers online Axis cameras from /api/cameras every
+  #     # YOLO_DISCOVERY_INTERVAL_SECONDS; set YOLO_CAMERA_IDS (comma list) to
+  #     # pin specific cameras instead.
+  #     YOLO_CAMERA_IDS: ""
+  #     YOLO_MODEL_PATH: yolov8n.pt
+  #     YOLO_MODELS_DIR: /data/yolo_models
+  #     YOLO_CONF_THRESHOLD: "0.4"
+  #     YOLO_INFER_INTERVAL_SECONDS: "0.5"
+  #     YOLO_DISCOVERY_INTERVAL_SECONDS: "15"
+  #     YOLO_CLASSES: ""
+  #   volumes:
+  #     - ./data/yolo_models:/data/yolo_models
+  #   depends_on:
+  #     yp-server:
+  #       condition: service_healthy
+
+  # yolo-detector-nvidia:
+  #   # Use this service instead of yolo-detector on a host with an NVIDIA GPU.
+  #   # Requires the NVIDIA Container Toolkit installed on the host so Docker can
+  #   # grant GPU access (https://github.com/NVIDIA/nvidia-container-toolkit).
+  #   # Only enable one of yolo-detector / yolo-detector-nvidia at a time.
+  #   build:
+  #     context: ./services/yolo_detector
+  #     network: host
+  #     args:
+  #       # Empty selects standard PyPI torch/torchvision wheels, which already
+  #       # bundle CUDA support on Linux; pin a specific index (e.g.
+  #       # https://download.pytorch.org/whl/cu124) if you need an exact CUDA version.
+  #       TORCH_INDEX_URL: ""
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   environment:
+  #     SERVER_WS_URL: ws://yp-server:8000/ws/detector
+  #     SERVER_HTTP_URL: http://yp-server:8000
+  #     # Auto-discovers online Axis cameras from /api/cameras every
+  #     # YOLO_DISCOVERY_INTERVAL_SECONDS; set YOLO_CAMERA_IDS (comma list) to
+  #     # pin specific cameras instead.
+  #     YOLO_CAMERA_IDS: ""
+  #     YOLO_MODEL_PATH: yolov8n.pt
+  #     YOLO_MODELS_DIR: /data/yolo_models
+  #     YOLO_CONF_THRESHOLD: "0.4"
+  #     YOLO_INFER_INTERVAL_SECONDS: "0.5"
+  #     YOLO_DISCOVERY_INTERVAL_SECONDS: "15"
+  #     YOLO_CLASSES: ""
+  #   volumes:
+  #     - ./data/yolo_models:/data/yolo_models
+  #   depends_on:
+  #     yp-server:
+  #       condition: service_healthy
+
   sim-uav1:
     build:
       context: ./services/sim_vehicle
@@ -96,14 +219,15 @@ services:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
       VEHICLE_TYPE: uav
       VEHICLE_ID: sim-uav1
-      HOME_LAT: "38.984250"
-      HOME_LON: "-76.508618"
+      HOME_LAT: "38.988650"
+      HOME_LON: "-76.485618"
       HOME_ALT: "45.0"
       SPAWN_JITTER_DEG: "0.0002"
       TARGET_JITTER_DEG: "0.0011"
       SEND_HZ: "5"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   sim-uav2:
     build:
@@ -120,7 +244,8 @@ services:
       TARGET_JITTER_DEG: "0.0010"
       SEND_HZ: "5"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   sim-usv:
     build:
@@ -137,7 +262,8 @@ services:
       TARGET_JITTER_DEG: "0.0010"
       SEND_HZ: "5"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   sim-uuv:
     build:
@@ -154,7 +280,8 @@ services:
       TARGET_JITTER_DEG: "0.0010"
       SEND_HZ: "5"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   sim-umaa:
     build:
@@ -167,7 +294,8 @@ services:
       SEND_HZ: "5"
       UMAA_BACKEND: loopback
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   px4-sitl-uav:
     profiles: ["px4"]
@@ -185,7 +313,8 @@ services:
       - "14580:14580/udp"
       - "18570:18570/udp"
     depends_on:
-      - yp-server
+      yp-server:
+        condition: service_healthy
 
   ros-master:
     profiles: ["px4"]

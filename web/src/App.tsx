@@ -1,6 +1,7 @@
 import L from "leaflet";
 import {
   AlertTriangle,
+  Camera,
   Cable,
   Crosshair,
   EthernetPort,
@@ -22,21 +23,23 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { MapContainer, Polyline, TileLayer, useMap, useMapEvents } from "react-leaflet";
 
-import { connectSITL, disconnectSITL, exportFlightLog, fetchSettings, getCurrentUser, listSITLBridges, sendCommand, setYpRole, triggerMOB, updateSettings, logout as logoutUser, fetchDeconflictionSettings, updateDeconflictionSettings } from "./api";
-import type { CurrentUser, SITLBridge } from "./api";
-import type { Command, Position, Vehicle, VehicleType } from "./types";
+import { connectSITL, disconnectSITL, exportFlightLog, fetchSettings, fetchRtcmStatus, getCurrentUser, listAxisCameras, listSITLBridges, sendCommand, setYpRole, triggerMOB, updateSettings, logout as logoutUser, fetchDeconflictionSettings, updateDeconflictionSettings } from "./api";
+import type { AxisCamera, CameraDetectionUpdate, CurrentUser, SITLBridge, RtcmStatus } from "./api";
+import type { Command, Position, RelativeWaypoint, Vehicle, VehicleType } from "./types";
 import Login from "./Login";
 const UserManagement = lazy(() => import("./UserManagement"));
-import { destinationPoint } from "./utils/geo";
+import { destinationPoint, localToGlobalWaypoint } from "./utils/geo";
 import { useTelemetrySocket } from "./hooks/useTelemetrySocket";
 import { MessageDrawer, type StreamMessage } from "./components/MessageDrawer";
 import { SITLPanel } from "./components/SITLPanel";
 import { VehicleModal } from "./components/VehicleModal";
 import { VideoViewer } from "./components/VideoViewer";
+import { CameraPanel } from "./components/CameraPanel";
 import { FitAllControl, FollowYpCenter, SarPatternOverlay, VehicleLayer, WaypointCrosshair, YpRangeRings, type WaypointMarker } from "./components/map/VehicleLayers";
 import { vehicleMarkerColor } from "./utils/vehicleStyle";
 import { WeatherRadarLayer, WindLayer } from "./components/map/OverlayLayers";
 import { createDemoVehicles, demoVehicleSnapshot, handleDemoCommand, stepDemoVehicle, updateDemoVehicleColor, type DemoMessagePayload, type DemoVehicle } from "./services/demo";
+import { isAgentAvailable, startAgentRelay } from "./services/relayAgent";
 
 const MissionPlannerMode = lazy(() => import("./components/MissionPlannerMode").then((module) => ({ default: module.MissionPlannerMode })));
 const WaypointPlanner = lazy(() => import("./components/WaypointPlanner").then((module) => ({ default: module.WaypointPlanner })));
@@ -50,6 +53,32 @@ const VIEW_MODE = !DEMO_MODE && (window.location.pathname.startsWith("/view") ||
 /** Returns true if a vehicle ID belongs to a docker-spawned sim vehicle. */
 function isSimVehicle(vehicleId: string): boolean {
   return vehicleId.startsWith("sim-");
+}
+const RTCM_STATUS_LABELS: Record<RtcmStatus["state"], string> = {
+  disabled: "Disabled",
+  connecting: "Connecting…",
+  connected: "Receiving Corrections",
+  stale: "No Data Received",
+  error: "Connection Error",
+};
+/** Buckets a MAV_GPS_FIX_TYPE value into a quality tier used for RTK tab styling. */
+function gpsFixQuality(fixType: number): "good" | "warn" | "bad" {
+  if (fixType >= 6) return "good"; // RTK Fixed / Static / PPP
+  if (fixType >= 4) return "warn"; // DGPS / RTK Float
+  return "bad"; // No GPS / No Fix / 2D / 3D only
+}
+/** A GPS fix reading older than this is likely leftover from before a link drop or config change. */
+const GPS_FIX_STALE_AFTER_S = 10;
+function isGpsFixStale(stamp: number | undefined): boolean {
+  return stamp == null || Date.now() / 1000 - stamp > GPS_FIX_STALE_AFTER_S;
+}
+/** Renders elapsed time since a unix-seconds timestamp as a short human string. */
+function formatSecondsAgo(epochSeconds: number | null): string {
+  if (epochSeconds == null) return "never";
+  const deltaS = Math.max(0, Date.now() / 1000 - epochSeconds);
+  if (deltaS < 1) return "just now";
+  if (deltaS < 60) return `${Math.round(deltaS)}s ago`;
+  return `${Math.round(deltaS / 60)}m ago`;
 }
 const BRAND_LOGO_URL = `${import.meta.env.BASE_URL}logos/usna_crest_jhublue.png`;
 type MapBase = "satellite" | "street";
@@ -127,6 +156,13 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [rtbUpdateHz, setRtbUpdateHz] = useState(2.0);
   const [rtbSternDistanceM, setRtbSternDistanceM] = useState(35);
   const [rtbAltitudeM, setRtbAltitudeM] = useState(30);
+  const [rtbYpSafeDistanceM, setRtbYpSafeDistanceM] = useState(20);
+  const [landOnBoatHoverClearanceM, setLandOnBoatHoverClearanceM] = useState(0.5);
+  const [landOnBoatDescentRateMs, setLandOnBoatDescentRateMs] = useState(0.5);
+  const [landOnBoatPadOffsetM, setLandOnBoatPadOffsetM] = useState(-0.4);
+  const [landOnBoatAlignmentRadiusM, setLandOnBoatAlignmentRadiusM] = useState(1.0);
+  const [landOnBoatAutoDisarm, setLandOnBoatAutoDisarm] = useState(true);
+  const [landOnBoatTouchdownDwellS, setLandOnBoatTouchdownDwellS] = useState(1.5);
   const [settingsLoaded, setSettingsLoaded] = useState(DEMO_MODE);
   const [mapActionMenu, setMapActionMenu] = useState<MapActionMenuState | null>(null);
   const [streamVehicleId, setStreamVehicleId] = useState<string | null>(null);
@@ -147,6 +183,19 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [rtkHostOrPort, setRtkHostOrPort] = useState("/dev/ttyACM0");
   const [rtkNetworkPort, setRtkNetworkPort] = useState(9000);
   const [rtkBaudrate, setRtkBaudrate] = useState(115200);
+  const [rtkRelayPort, setRtkRelayPort] = useState("/dev/ttyACM0");
+  const [rtkAgentAvailable, setRtkAgentAvailable] = useState(false);
+  const [rtkRelayStarting, setRtkRelayStarting] = useState(false);
+  const [rtkRelayError, setRtkRelayError] = useState<string | null>(null);
+  const [rtcmStatus, setRtcmStatus] = useState<RtcmStatus>({
+    state: "disabled",
+    source_type: "disabled",
+    target: null,
+    last_frame_at: null,
+    frame_count: 0,
+    bytes_total: 0,
+    error: null,
+  });
   const [deconflictionEnabled, setDeconflictionEnabled] = useState(false);
   const [deconflictionSettingsLoaded, setDeconflictionSettingsLoaded] = useState(DEMO_MODE);
   const [deconflictionGlobalRadius, setDeconflictionGlobalRadius] = useState(10.0);
@@ -160,17 +209,25 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [deconflictionOrbitRadius, setDeconflictionOrbitRadius] = useState(50.0);
   const [deconflictionMaxPause, setDeconflictionMaxPause] = useState(300.0);
   const [showSITL, setShowSITL] = useState(false);
+  const [showCameras, setShowCameras] = useState(false);
+  const [axisCameras, setAxisCameras] = useState<AxisCamera[]>([]);
+  const [cameraDetections, setCameraDetections] = useState<Record<string, CameraDetectionUpdate>>({});
   const [showUserManagement, setShowUserManagement] = useState(false);
   const [sitlBridges, setSitlBridges] = useState<Record<string, SITLBridge>>({});
   const [ypRoleVehicleId, setYpRoleVehicleId] = useState<string | null>(null);
   const [sarPatterns, setSarPatterns] = useState<Record<string, { patternType: string; waypoints: [number, number][] }>>({});
   const [missionPlans, setMissionPlans] = useState<Record<string, [number, number][]>>({});
+  const [shipRelativePlans, setShipRelativePlans] = useState<Record<string, { shipVehicleId: string; localWaypoints: RelativeWaypoint[] }>>({});
   const [sarMissionActiveByVehicle, setSarMissionActiveByVehicle] = useState<Record<string, boolean>>({});
+  const [rtbFollowState, setRtbFollowState] = useState<Record<string, boolean>>({});
   const followBeforeWaypointDragRef = useRef(false);
   const { connected: socketConnected, socketRef: wsRef } = useTelemetrySocket({
     enabled: !DEMO_MODE,
     onAuthenticationExpired: onLogout,
     onPayload: (payload) => {
+      if (payload.error && !payload.op) {
+        console.warn("[YP] command rejected:", payload.error, payload.command_type ? `(${payload.command_type})` : "");
+      }
       if (payload.op === "snapshot") {
         const snapshotVehicles = payload.vehicles as Vehicle[];
         setVehicles(Object.fromEntries(snapshotVehicles.map((vehicle) => [vehicle.vehicle_id, withLocalVehicleColor(vehicle, localVehicleColorsRef.current)])));
@@ -178,6 +235,24 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         setWaypointMarkers(Object.fromEntries((payload.waypoints as WaypointMarker[] | undefined ?? []).map((waypoint) => [waypoint.vehicle_id, waypoint])));
         setSarPatterns(Object.fromEntries(Object.entries(payload.sar_patterns as Record<string, { pattern_type: string; waypoints: [number, number][] }> | undefined ?? {}).map(([vehicleId, pattern]) => [vehicleId, { patternType: pattern.pattern_type, waypoints: pattern.waypoints }])));
         setMissionPlans(payload.mission_plans as Record<string, [number, number][]> ?? {});
+        setShipRelativePlans(Object.fromEntries(Object.entries(payload.ship_relative_plans as Record<string, { ship_vehicle_id: string; local_waypoints: RelativeWaypoint[] }> | undefined ?? {}).map(([vehicleId, plan]) => [vehicleId, { shipVehicleId: plan.ship_vehicle_id, localWaypoints: plan.local_waypoints }])));
+        setRtbFollowState(payload.rtb_follow_state as Record<string, boolean> ?? {});
+      }
+      if (payload.op === "rtb_follow_state") {
+        const vehicleId = payload.vehicle_id as string;
+        const following = Boolean(payload.following);
+        setRtbFollowState((current) => {
+          if (!following) {
+            const next = { ...current };
+            delete next[vehicleId];
+            return next;
+          }
+          return { ...current, [vehicleId]: true };
+        });
+        if (payload.rtcm_status) setRtcmStatus(payload.rtcm_status as RtcmStatus);
+      }
+      if (payload.op === "rtcm_status_update") {
+        setRtcmStatus(payload.status as RtcmStatus);
       }
       if (payload.op === "vehicle_update") {
         const incoming = withLocalVehicleColor(payload.vehicle as Vehicle, localVehicleColorsRef.current);
@@ -216,6 +291,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         setVehicles((current) => { const next = { ...current }; delete next[removedId]; return next; });
         setSarMissionActiveByVehicle((current) => { const next = { ...current }; delete next[removedId]; return next; });
         setSitlBridges((current) => { const next = { ...current }; delete next[removedId]; return next; });
+        setRtbFollowState((current) => { const next = { ...current }; delete next[removedId]; return next; });
       }
       if (payload.op === "sar_pattern") {
         setSarPatterns((current) => ({ ...current, [payload.vehicle_id as string]: { patternType: payload.pattern_type as string, waypoints: payload.waypoints as [number, number][] } }));
@@ -230,11 +306,38 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       if (payload.op === "mission_plan_cleared") {
         setMissionPlans((current) => { const next = { ...current }; delete next[payload.vehicle_id as string]; return next; });
       }
+      if (payload.op === "ship_relative_plan_overlay") {
+        const vehicleId = payload.vehicle_id as string;
+        setShipRelativePlans((current) => ({ ...current, [vehicleId]: { shipVehicleId: payload.ship_vehicle_id as string, localWaypoints: payload.local_waypoints as RelativeWaypoint[] } }));
+      }
+      if (payload.op === "ship_relative_plan_cleared") {
+        setShipRelativePlans((current) => { const next = { ...current }; delete next[payload.vehicle_id as string]; return next; });
+      }
       if (payload.op === "sar_pattern_cleared") {
         setSarPatterns((current) => { const next = { ...current }; delete next[payload.vehicle_id as string]; return next; });
       }
       if (payload.op === "vehicle_disconnected") {
-        setVehicles((current) => ({ ...current, [payload.vehicle_id as string]: { ...current[payload.vehicle_id as string], connected: false } }));
+        const disconnectedId = payload.vehicle_id as string;
+        setVehicles((current) => {
+          const next = { ...current };
+          delete next[disconnectedId];
+          return next;
+        });
+        setSarMissionActiveByVehicle((current) => {
+          const next = { ...current };
+          delete next[disconnectedId];
+          return next;
+        });
+        setSitlBridges((current) => {
+          const next = { ...current };
+          delete next[disconnectedId];
+          return next;
+        });
+        setRtbFollowState((current) => {
+          const next = { ...current };
+          delete next[disconnectedId];
+          return next;
+        });
       }
       if (payload.op === "video_stream_update") {
         const incoming = payload.video as Vehicle["video"] & { vehicle_id?: string };
@@ -255,6 +358,16 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           delete nextVehicle.video;
           return { ...current, [vehicleId]: nextVehicle };
         });
+      }
+      if (payload.op === "camera_status_update") {
+        const camera = payload.camera as AxisCamera;
+        setAxisCameras((current) => current.some((item) => item.id === camera.id)
+          ? current.map((item) => item.id === camera.id ? camera : item)
+          : [...current, camera]);
+      }
+      if (payload.op === "camera_detection_update") {
+        const update = payload as unknown as CameraDetectionUpdate & { op: string };
+        setCameraDetections((current) => ({ ...current, [update.camera_id]: update }));
       }
     },
   });
@@ -300,6 +413,11 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         setSitlBridges(Object.fromEntries(bridges.map((b) => [b.vehicle_id, b])))
       )
       .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (DEMO_MODE) return;
+    void listAxisCameras().then(setAxisCameras).catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -349,6 +467,27 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         if (typeof serverSettings.rtb_altitude_m === "number") {
           setRtbAltitudeM(serverSettings.rtb_altitude_m);
         }
+        if (typeof serverSettings.rtb_yp_safe_distance_m === "number") {
+          setRtbYpSafeDistanceM(serverSettings.rtb_yp_safe_distance_m);
+        }
+        if (typeof serverSettings.land_on_boat_hover_clearance_m === "number") {
+          setLandOnBoatHoverClearanceM(serverSettings.land_on_boat_hover_clearance_m);
+        }
+        if (typeof serverSettings.land_on_boat_descent_rate_ms === "number") {
+          setLandOnBoatDescentRateMs(serverSettings.land_on_boat_descent_rate_ms);
+        }
+        if (typeof serverSettings.land_on_boat_pad_offset_m === "number") {
+          setLandOnBoatPadOffsetM(serverSettings.land_on_boat_pad_offset_m);
+        }
+        if (typeof serverSettings.land_on_boat_alignment_radius_m === "number") {
+          setLandOnBoatAlignmentRadiusM(serverSettings.land_on_boat_alignment_radius_m);
+        }
+        if (typeof serverSettings.land_on_boat_auto_disarm === "boolean") {
+          setLandOnBoatAutoDisarm(serverSettings.land_on_boat_auto_disarm);
+        }
+        if (typeof serverSettings.land_on_boat_touchdown_dwell_s === "number") {
+          setLandOnBoatTouchdownDwellS(serverSettings.land_on_boat_touchdown_dwell_s);
+        }
         setYpRoleVehicleId(serverSettings.yp_role_vehicle_id ?? null);
         if (typeof serverSettings.mob_track_seconds === "number") {
           setMobTrackSeconds(serverSettings.mob_track_seconds);
@@ -389,6 +528,44 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   }, []);
 
   useEffect(() => {
+    if (DEMO_MODE) return;
+    let cancelled = false;
+    fetchRtcmStatus()
+      .then((status) => {
+        if (!cancelled) setRtcmStatus(status);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (settingsTab !== "rtk") return;
+    let cancelled = false;
+    isAgentAvailable().then((available) => { if (!cancelled) setRtkAgentAvailable(available); });
+    return () => { cancelled = true; };
+  }, [settingsTab]);
+
+  const handleStartRtkRelay = async () => {
+    setRtkRelayError(null);
+    if (rtkNetworkPort < 1024) {
+      setRtkRelayError("Network port must be 1024 or higher (ports below 1024 require root and will fail to bind).");
+      return;
+    }
+    setRtkRelayStarting(true);
+    try {
+      await startAgentRelay(rtkRelayPort, rtkBaudrate, rtkNetworkPort);
+      setRtkSourceType("tcp");
+      setRtkHostOrPort("host.docker.internal");
+    } catch (error) {
+      setRtkRelayError(String(error));
+    } finally {
+      setRtkRelayStarting(false);
+    }
+  };
+
+  useEffect(() => {
     if (DEMO_MODE || !settingsLoaded) return;
     const timeout = window.setTimeout(() => {
       updateSettings({
@@ -398,6 +575,13 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         rtb_update_hz: rtbUpdateHz,
         rtb_stern_distance_m: rtbSternDistanceM,
         rtb_altitude_m: rtbAltitudeM,
+        rtb_yp_safe_distance_m: rtbYpSafeDistanceM,
+        land_on_boat_hover_clearance_m: landOnBoatHoverClearanceM,
+        land_on_boat_descent_rate_ms: landOnBoatDescentRateMs,
+        land_on_boat_pad_offset_m: landOnBoatPadOffsetM,
+        land_on_boat_alignment_radius_m: landOnBoatAlignmentRadiusM,
+        land_on_boat_auto_disarm: landOnBoatAutoDisarm,
+        land_on_boat_touchdown_dwell_s: landOnBoatTouchdownDwellS,
         mob_track_seconds: mobTrackSeconds,
         mob_swath_m: mobSwathM,
         mob_altitude_m: mobAltM,
@@ -412,7 +596,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }).catch(() => undefined);
     }, 350);
     return () => window.clearTimeout(timeout);
-  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
+  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, rtbYpSafeDistanceM, landOnBoatHoverClearanceM, landOnBoatDescentRateMs, landOnBoatPadOffsetM, landOnBoatAlignmentRadiusM, landOnBoatAutoDisarm, landOnBoatTouchdownDwellS, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
 
   useEffect(() => {
     if (DEMO_MODE) return;
@@ -665,6 +849,15 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           {Object.entries(missionPlans).map(([vehicleId, waypoints]) => (
             waypoints.length > 1 && <Polyline key={`mission-${vehicleId}`} positions={waypoints} pathOptions={{ color: "#2563eb", weight: 3, opacity: 0.9 }} />
           ))}
+          {Object.entries(shipRelativePlans).map(([vehicleId, plan]) => {
+            const ship = vehicles[plan.shipVehicleId];
+            if (!ship?.position || ship.heading == null) return null;
+            const positions: [number, number][] = plan.localWaypoints.map((waypoint) => {
+              const global = localToGlobalWaypoint(ship.position!.latitude, ship.position!.longitude, ship.heading!, ship.position!.altitude, waypoint.x, waypoint.y, waypoint.z);
+              return [global.latitude, global.longitude];
+            });
+            return positions.length > 1 && <Polyline key={`ship-relative-${vehicleId}`} positions={positions} pathOptions={{ color: "#f59e0b", weight: 3, opacity: 0.9 }} />;
+          })}
           {Object.values(waypointMarkers)
             .filter((waypoint) => !VIEW_MODE || isSimVehicle(waypoint.vehicle_id))
             .map((waypoint) => (
@@ -887,6 +1080,15 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
               <Cable size={19} />
             </button>
           )}
+          {!DEMO_MODE && (
+            <button
+              className={showCameras ? "icon-button active" : "icon-button"}
+              title="YP Cameras"
+              onClick={() => { setShowCameras((value) => !value); setShowSettings(false); setShowSITL(false); }}
+            >
+              <Camera size={19} />
+            </button>
+          )}
           <button
             ref={settingsButtonRef}
             className={showSettings ? "icon-button active" : "icon-button"}
@@ -940,6 +1142,8 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         </div>
       )}
 
+      {showCameras && !DEMO_MODE && <CameraPanel cameras={axisCameras} detections={cameraDetections} onClose={() => setShowCameras(false)} />}
+
       {showUserManagement && currentUser?.permissions.includes("manage_users") && (
         <Suspense fallback={null}>
           <UserManagement onClose={() => setShowUserManagement(false)} />
@@ -982,6 +1186,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
               onClick={() => setSettingsTab("rtk")}
             >
               RTK Correction
+              {rtcmStatus.state !== "disabled" && <span className={`rtcm-tab-dot rtcm-status-${rtcmStatus.state}`} />}
             </button>
           </div>          {settingsTab === "display" && (
             <>
@@ -1011,6 +1216,45 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           )}
           {settingsTab === "rtk" && (
             <>
+              <div className={`rtcm-status-indicator rtcm-status-${rtcmStatus.state}`}>
+                <span className="rtcm-status-dot" />
+                <span className="rtcm-status-text">{RTCM_STATUS_LABELS[rtcmStatus.state]}</span>
+              </div>
+              {rtcmStatus.state !== "disabled" && (
+                <p className="settings-hint">
+                  {rtcmStatus.target && <>Source: {rtcmStatus.target} · </>}
+                  {rtcmStatus.state === "error"
+                    ? rtcmStatus.error ?? "Unknown error"
+                    : `${rtcmStatus.frame_count} frames received · last frame ${formatSecondsAgo(rtcmStatus.last_frame_at)}`}
+                </p>
+              )}
+              {Object.values(vehicles).some((vehicle) => vehicle.gps_fix) && (
+                <div className="gps-fix-list">
+                  {Object.values(vehicles)
+                    .filter((vehicle) => vehicle.gps_fix)
+                    .map((vehicle) => {
+                      const fix = vehicle.gps_fix!;
+                      const stale = isGpsFixStale(fix.stamp);
+                      return (
+                        <div
+                          key={vehicle.vehicle_id}
+                          className={`gps-fix-row ${stale ? "gps-fix-stale" : `gps-fix-${gpsFixQuality(fix.fix_type)}`}`}
+                        >
+                          <span className="gps-fix-vehicle">{vehicle.vehicle_id}</span>
+                          <span className="gps-fix-type">{fix.fix_type_label}</span>
+                          <span className="gps-fix-accuracy">
+                            {fix.horizontal_accuracy_m != null ? `±${fix.horizontal_accuracy_m.toFixed(2)}m H` : "—"}
+                            {fix.vertical_accuracy_m != null ? ` / ±${fix.vertical_accuracy_m.toFixed(2)}m V` : ""}
+                          </span>
+                          {fix.satellites_visible != null && (
+                            <span className="gps-fix-sats">{fix.satellites_visible} sats</span>
+                          )}
+                          <span className="gps-fix-age">{stale ? `stale · ${formatSecondsAgo(fix.stamp ?? null)}` : formatSecondsAgo(fix.stamp ?? null)}</span>
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
               <label>
                 Source Mode
                 <select
@@ -1060,13 +1304,40 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                       Network Port
                       <input
                         type="number"
-                        min={1}
+                        min={1024}
                         max={65535}
                         value={rtkNetworkPort}
                         disabled={DEMO_MODE}
                         onChange={(e) => setRtkNetworkPort(Number(e.target.value))}
                       />
                     </label>
+                  )}
+                  {rtkSourceType === "tcp" && !DEMO_MODE && (
+                    <div className="settings-hint">
+                      <p>Have a serial RTK receiver plugged into this machine instead of a network base station?</p>
+                      <label>
+                        Local Serial Port
+                        <input
+                          type="text"
+                          value={rtkRelayPort}
+                          placeholder="/dev/ttyACM0 or COM12"
+                          onChange={(e) => setRtkRelayPort(e.target.value)}
+                        />
+                      </label>
+                      {rtkAgentAvailable ? (
+                        <>
+                          <button className="settings-action-btn" onClick={handleStartRtkRelay} disabled={rtkRelayStarting}>
+                            {rtkRelayStarting ? "Starting…" : "Start relay automatically"}
+                          </button>
+                          {rtkRelayError && <div className="sitl-error">{rtkRelayError}</div>}
+                        </>
+                      ) : (
+                        <p>
+                          Run <code>python services/relay_agent.py</code> once on the host so this button can bridge that
+                          port to TCP for you, without a separate terminal each time.
+                        </p>
+                      )}
+                    </div>
                   )}
                 </>
               )}
@@ -1204,6 +1475,53 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 <span>{rtbAltitudeM} m</span>
               </label>
               <input min={5} max={150} step={5} type="range" value={rtbAltitudeM} disabled={DEMO_MODE} onChange={(event) => setRtbAltitudeM(Number(event.target.value))} />
+              <label>
+                RTB YP safe distance
+                <span>{rtbYpSafeDistanceM} m</span>
+              </label>
+              <input min={5} max={100} step={5} type="range" value={rtbYpSafeDistanceM} disabled={DEMO_MODE} onChange={(event) => setRtbYpSafeDistanceM(Number(event.target.value))} />
+              <label>
+                Landing hover clearance
+                <span>{landOnBoatHoverClearanceM.toFixed(1)} m</span>
+              </label>
+              <input min={0.1} max={5} step={0.1} type="range" value={landOnBoatHoverClearanceM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatHoverClearanceM(Number(event.target.value))} />
+              <label>
+                Landing descent rate
+                <span>{landOnBoatDescentRateMs.toFixed(1)} m/s</span>
+              </label>
+              <input min={0.1} max={3} step={0.1} type="range" value={landOnBoatDescentRateMs} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatDescentRateMs(Number(event.target.value))} />
+              <label>
+                Landing pad offset
+                <span>{landOnBoatPadOffsetM.toFixed(1)} m</span>
+              </label>
+              <input min={-5} max={5} step={0.1} type="range" value={landOnBoatPadOffsetM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatPadOffsetM(Number(event.target.value))} />
+              <label>
+                Landing alignment radius
+                <span>{landOnBoatAlignmentRadiusM.toFixed(1)} m</span>
+              </label>
+              <input min={0.2} max={10} step={0.1} type="range" value={landOnBoatAlignmentRadiusM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatAlignmentRadiusM(Number(event.target.value))} />
+              <label>
+                <input
+                  type="checkbox"
+                  checked={landOnBoatAutoDisarm}
+                  disabled={DEMO_MODE}
+                  onChange={(event) => setLandOnBoatAutoDisarm(event.target.checked)}
+                />
+                {" "}Auto-disarm on touchdown
+              </label>
+              <label>
+                Touchdown dwell time
+                <span>{landOnBoatTouchdownDwellS.toFixed(1)} s</span>
+              </label>
+              <input
+                min={0.5}
+                max={10}
+                step={0.1}
+                type="range"
+                value={landOnBoatTouchdownDwellS}
+                disabled={DEMO_MODE || !landOnBoatAutoDisarm}
+                onChange={(event) => setLandOnBoatTouchdownDwellS(Number(event.target.value))}
+              />
             </>
           )}
           {settingsTab === "mob" && (
@@ -1264,6 +1582,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           shipVehicle={yp}
           sarMissionActive={Boolean(sarMissionActiveByVehicle[selected.vehicle_id])}
           canCommand={!VIEW_MODE || isSimVehicle(selected.vehicle_id)}
+          landOnBoatReady={Boolean(rtbFollowState[selected.vehicle_id])}
           onClose={() => setSelected(null)}
           onRtb={() => {
             command(selected.vehicle_id, { type: "cancel_sar" });
@@ -1287,6 +1606,29 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
 
             setSelected(null);
           }}
+          onLandOnBoat={() => {
+            // 1. Cancel any active search missions
+            command(selected.vehicle_id, { type: "cancel_sar" });
+            // 2. Dispatch the land_on_boat command to main.py
+            command(selected.vehicle_id, { type: "land_on_boat" });
+
+            // 3. Lock the map crosshair overlay onto the YP boat
+            const ypLat = yp?.position?.latitude;
+            const ypLon = yp?.position?.longitude;
+
+            if (ypLat !== undefined && ypLon !== undefined) {
+              setWaypointMarkers((current) => ({
+                ...current,
+                [selected.vehicle_id]: {
+                  vehicle_id: selected.vehicle_id,
+                  latitude: ypLat,
+                  longitude: ypLon,
+                  trackingYP: true,
+                }
+              }));
+            }
+            setSelected(null);
+          }}
           onEndSar={() => {
             command(selected.vehicle_id, { type: "cancel_sar" });
             setSelected(null);
@@ -1302,6 +1644,16 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           onColorSave={(color) => setVehicleColor(selected.vehicle_id, color)}
           onSetMode={(mode) => {
             command(selected.vehicle_id, { type: "set_mode", mode });
+            setSelected(null);
+          }}
+          onArm={() => {
+            command(selected.vehicle_id, { type: "arm" });
+          }}
+          onDisarm={() => {
+            command(selected.vehicle_id, { type: "disarm" });
+          }}
+          onTakeoff={(altitudeM) => {
+            command(selected.vehicle_id, { type: "takeoff", altitude_m: altitudeM });
             setSelected(null);
           }}
         />

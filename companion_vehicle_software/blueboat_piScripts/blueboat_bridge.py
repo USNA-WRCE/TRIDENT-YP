@@ -11,8 +11,10 @@ import websockets
 
 import sar_missions
 from yp_common.geometry import (
+    bearing_degrees as _bearing_degrees,
     destination_point as _destination_point,
     relative_waypoint_to_global as _relative_waypoint_to_global,
+    relative_yaw_to_global as _relative_yaw_to_global,
     distance_m as _distance_m,
     north_east_delta_m as _north_east_delta_m,
 )
@@ -75,8 +77,9 @@ _ship_state = {
     "stamp": 0.0,
 }
 _ship_relative_thread: threading.Thread | None = None
-_ship_relative_stop_event = threading.Event()
-_last_guided_request = 0.0
+_ship_relative_stop_event: threading.Event | None = None
+_last_rtb_step_time = 0.0
+_rtb_guided_forced = False
 
 
 def create_navsatfix_message(lat: float, lon: float, alt: float, heading: float | None = None) -> dict:
@@ -110,11 +113,20 @@ def create_navsatfix_message(lat: float, lon: float, alt: float, heading: float 
     return payload
 
 
+def create_gps_fix_message(msg) -> dict:
+    fix_type = getattr(msg, "fix_type", 0)
+    eph, epv = getattr(msg, "eph", 65535), getattr(msg, "epv", 65535)
+    h_acc, v_acc = getattr(msg, "h_acc", None), getattr(msg, "v_acc", None)
+    satellites_visible = getattr(msg, "satellites_visible", 255)
+    labels = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed", 7: "Static", 8: "PPP"}
+    return {"vehicle_id": VEHICLE_ID, "vehicle_type": VEHICLE_TYPE, "topic": f"/vehicles/{VEHICLE_ID}/gps_fix", "type": f"mavlink/{msg.get_type()}", "stamp": time.time(), "msg": {"fix_type": fix_type, "fix_type_label": labels.get(fix_type, "Unknown"), "satellites_visible": satellites_visible if satellites_visible != 255 else None, "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None), "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None)}}
+
+
 def _ui_ws_url() -> str:
     base = SERVER_WS_URL.rstrip("/")
     marker = "/ws/vehicle"
     if marker in base:
-        return f"{base.split(marker, 1)[0]}/ws/ui"
+        return f"{base.split(marker, 1)[0]}/ws/ship_state"
     return base
 
 
@@ -170,12 +182,16 @@ def _update_ship_state(vehicle: dict) -> None:
     vehicle_id = vehicle.get("vehicle_id")
 
     with _ship_state_lock:
+        same_ship = _ship_state.get("vehicle_id") == vehicle_id
         prev_lat = _ship_state.get("lat")
         prev_lon = _ship_state.get("lon")
         prev_stamp = float(_ship_state.get("stamp") or 0.0)
         vn_ms = float(_ship_state.get("vn_ms") or 0.0)
         ve_ms = float(_ship_state.get("ve_ms") or 0.0)
-        if prev_lat is not None and prev_lon is not None and stamp > prev_stamp:
+        if not same_ship:
+            vn_ms = 0.0
+            ve_ms = 0.0
+        elif prev_lat is not None and prev_lon is not None and stamp > prev_stamp:
             north_m, east_m = _north_east_delta_m(float(prev_lat), float(prev_lon), float(lat), float(lon))
             dt = stamp - prev_stamp
             if dt > 0:
@@ -235,18 +251,20 @@ async def ship_state_listener_loop() -> None:
 
 
 def _stop_ship_relative_mission() -> None:
-    global _ship_relative_thread
+    global _ship_relative_thread, _ship_relative_stop_event
 
     thread = _ship_relative_thread
+    stop_event = _ship_relative_stop_event
     if thread and thread.is_alive():
-        _ship_relative_stop_event.set()
+        if stop_event:
+            stop_event.set()
         thread.join(timeout=1.0)
-    _ship_relative_stop_event.clear()
     _ship_relative_thread = None
+    _ship_relative_stop_event = None
 
 
 def _launch_ship_relative_mission(master, command_data: dict) -> None:
-    global _ship_relative_thread
+    global _ship_relative_thread, _ship_relative_stop_event
 
     local_waypoints = command_data.get("local_waypoints", [])
     ship_vehicle_id = command_data.get("ship_vehicle_id")
@@ -256,21 +274,28 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
     if not local_waypoints:
         print("[ERROR] ship_relative_trajectory requires at least one waypoint.")
         return
+    loop_count = max(1, min(100, int(command_data.get("loop_count", 1))))
 
     _stop_ship_relative_mission()
+    stop_event = threading.Event()
+    _ship_relative_stop_event = stop_event
     _ship_relative_thread = threading.Thread(
         target=_run_ship_relative_mission,
-        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), _ship_relative_stop_event),
+        args=(master, ship_vehicle_id, local_waypoints, float(command_data.get("arrival_radius_m", SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M)), float(command_data.get("update_hz", SHIP_RELATIVE_DEFAULT_UPDATE_HZ)), stop_event, bool(command_data.get("face_ship", False)), loop_count, bool(command_data.get("hold_last_waypoint", False))),
         daemon=True,
     )
     _ship_relative_thread.start()
 
 
-def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event) -> None:
+def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1, hold_last_waypoint: bool = False) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     print(f"[SHIP-REL] Starting mission with {len(local_waypoints)} waypoints relative to {ship_vehicle_id}")
+    # SET_POSITION_TARGET_GLOBAL_INT is silently ignored unless already armed in GUIDED.
+    sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
+    sar_missions.arm_vehicle(master)
 
-    for index, waypoint in enumerate(local_waypoints, start=1):
+    repeated_waypoints = local_waypoints * max(1, min(100, int(loop_count)))
+    for index, waypoint in enumerate(repeated_waypoints, start=1):
         while not stop_event.is_set():
             ship_state = _snapshot_ship_state(ship_vehicle_id)
             vehicle_state = _snapshot_vehicle_state()
@@ -299,12 +324,24 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
             if VEHICLE_TYPE in ["usv", "ugv"]:
                 target_alt = 0.0
 
+            yaw_deg = waypoint.get("yaw_deg")
+            if face_ship:
+                type_mask = int(0b100111000000)
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]), ship_lat, ship_lon,
+                ))
+            else:
+                type_mask = int(0b100111000000)
+                target_yaw_rad = math.radians(_bearing_degrees(
+                    float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon,
+                ))
+
             master.mav.set_position_target_global_int_send(
                 0,
                 master.target_system,
                 master.target_component,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                int(0b110111000000),
+                type_mask,
                 int(target_lat * 1e7),
                 int(target_lon * 1e7),
                 target_alt,
@@ -314,8 +351,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                 0,
                 0,
                 0,
-                0,
-                0,
+                target_yaw_rad,
+                0.0,
             )
 
             distance_m = _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon)
@@ -329,7 +366,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
 
             if distance_m <= arrival_radius_m and alt_condition_met:
                 print(f"[SHIP-REL] Reached waypoint {index}/{len(local_waypoints)}")
-                break
+                if index < len(repeated_waypoints) or not hold_last_waypoint:
+                    break
 
             time.sleep(update_period_s)
 
@@ -337,7 +375,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
             print("[SHIP-REL] Mission interrupted.")
             return
 
-    print("[SHIP-REL] Mission complete.")
+    if not hold_last_waypoint:
+        print("[SHIP-REL] Mission complete.")
 
 
 def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_guided=True):
@@ -374,17 +413,29 @@ def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_
 
 def follow_yp_velocity(master, command_data: dict) -> None:
     """Stream a YP-relative velocity and heading while holding the aft target."""
-    global _last_guided_request
+    global _last_rtb_step_time, _rtb_guided_forced
     target = command_data.get("target", {})
     lat, lon = target.get("latitude"), target.get("longitude")
     if lat is None or lon is None:
         return
-    if time.monotonic() - _last_guided_request >= 5.0:
-        try:
+
+    # A gap in updates means the sequence just (re)started, so force GUIDED
+    # once. While updates are continuous, never force the mode back -- if the
+    # safety pilot switches modes to take control, respect it and stop guiding.
+    now = time.monotonic()
+    if now - _last_rtb_step_time > 1.0:
+        _rtb_guided_forced = False
+    _last_rtb_step_time = now
+
+    try:
+        if not _rtb_guided_forced:
             master.set_mode("GUIDED")
-            _last_guided_request = time.monotonic()
-        except Exception as exc:
-            print(f"[WARN] Could not set GUIDED mode for RTB follow: {exc}")
+            _rtb_guided_forced = True
+        elif master.flightmode != "GUIDED":
+            print("[RTB] Safety pilot has taken control; halting RTB-follow guidance")
+            return
+    except Exception as exc:
+        print(f"[WARN] Could not set GUIDED mode for RTB follow: {exc}")
     master.mav.set_position_target_global_int_send(
         0, master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
@@ -434,6 +485,8 @@ async def telemetry_loop() -> None:
         int(SEND_HZ),
         1,
     )
+    master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, int(1e6 / 2), 0, 0, 0, 0, 0)
+    master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, int(1e6 / 2), 0, 0, 0, 0, 0)
     print("[SUCCESS] Telemetry stream requested")
 
     asyncio.create_task(ship_state_listener_loop())
@@ -458,6 +511,9 @@ async def telemetry_loop() -> None:
                             command_data = server_msg.get("command", {})
                             cmd_type = command_data.get("type")
 
+                            if cmd_type != "ship_relative_trajectory":
+                                _stop_ship_relative_mission()
+
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
                             elif cmd_type == "waypoint":
@@ -475,7 +531,10 @@ async def telemetry_loop() -> None:
                                         target_lat,
                                         target_lon,
                                         target_alt,
-                                        force_guided=(source != "rtb_follow"),
+                                        force_guided=(
+                                            True if source != "rtb_follow"
+                                            else _rtb_waypoint_should_force_guided()
+                                        ),
                                     )
                                     print("[SUCCESS] Waypoint command routed to vehicle.")
                                 else:
@@ -517,6 +576,12 @@ async def telemetry_loop() -> None:
                             elif cmd_type == "cancel_sar":
                                 _sar_stop_event.set()
                                 print("[SAR] Cancel requested by operator.")
+
+                            elif cmd_type == "arm":
+                                sar_missions.arm_vehicle(master)
+
+                            elif cmd_type == "disarm":
+                                master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
 
                             elif cmd_type == "rtcm_data":
                                 flags = command_data.get("flags", 0)
@@ -562,12 +627,14 @@ async def telemetry_loop() -> None:
                 # 2. Check for MAVLink telemetry (non-blocking).
                 msg = None
                 if not _sar_mission_lock.locked():
-                    msg = master.recv_match(type="GLOBAL_POSITION_INT", blocking=False)
+                    msg = master.recv_match(type=["GLOBAL_POSITION_INT", "GPS_RAW_INT", "GPS2_RAW"], blocking=False)
                
                 # 3. Process and send telemetry at the specified SEND_HZ rate
                 now = time.time()
                 telemetry_sample = None
-                if msg is not None:
+                if msg is not None and msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
+                    await ws.send(json.dumps(create_gps_fix_message(msg)))
+                elif msg is not None:
                     lat = msg.lat / 1e7
                     lon = msg.lon / 1e7
                     alt = msg.relative_alt / 1000.0
@@ -704,9 +771,12 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
                 return
 
             if auto_arm_start:
-                sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+                # Arm in GUIDED first: ArduPilot refuses to arm from a disarmed AUTO mode.
+                sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
                 time.sleep(0.2)
                 sar_missions.arm_vehicle(master)
+                time.sleep(0.2)
+                sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
                 time.sleep(0.2)
                 sar_missions.start_mission(master)
                 print("[MISSION] Mission armed and started")
