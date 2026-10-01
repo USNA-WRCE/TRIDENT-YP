@@ -1,0 +1,19 @@
+command line syntax to start Apache connector to YPCS
+
+
+Apache startup process:
+
+1) Run mediamtx server to bridge video to GCS network
+./mediamtx mediamtx.yml
+* mediamtx.yml has configuration parameters, ensure webrtcAdditionalHosts parameter includes the pi's IP address
+
+note: mediamtx bridges the RTSP feed coming from rtsp://admin:Admin1234@192.168.53.64:554/h264/ch1/main/av_stream to the webRTC stream on the GCS network at address <IP-ADDRESS>:8889/apache
+
+
+2) In a separate terminal activate virtual environment in apache_piScripts directory
+source apachenv/bin/activate
+
+
+3) Run apache3_bridge_wServer.py
+Navigate to <PI IP-ADDRESS>:8080 to specify GCS ip address, set video streaming IP, and mavlink address parameters as needed
+* ensure that the IP address of GCS matches IP address of computer running GCS server
