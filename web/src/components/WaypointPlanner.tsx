@@ -8,7 +8,7 @@ import { Circle, Download, Trash2, Upload } from "lucide-react";
 import { WaypointScene } from "./3d/WaypointScene";
 import type { Command, RelativeWaypoint, Vehicle } from "../types";
 import { applyDispatchAltitudeOffset, parseLocalWaypointPlan, serializeLocalWaypointPlan } from "../services/localWaypointPlan";
-import { generateCircularWaypoints } from "../services/circularWaypoints";
+import { generateCircularWaypoints, yawTowardOrigin } from "../services/circularWaypoints";
 
 type LocalWaypoint = { id: string; x: number; y: number; z: number; yaw: number };
 
@@ -30,6 +30,9 @@ export function WaypointPlanner({
   const [dispatchAltitudeOffset, setDispatchAltitudeOffset] = useState(15);
   const [circleRadius, setCircleRadius] = useState(30);
   const [circleWaypointCount, setCircleWaypointCount] = useState(8);
+  const previewWaypoints = faceInward
+    ? waypoints.map((waypoint) => ({ ...waypoint, yaw: yawTowardOrigin(waypoint.x, waypoint.y) }))
+    : waypoints;
   const importFileRef = useRef<HTMLInputElement>(null);
   const updateWaypoint = (id: string, updates: Partial<LocalWaypoint>) =>
     setWaypoints((items) =>
@@ -147,7 +150,7 @@ export function WaypointPlanner({
           overflow: "hidden",
         }}
       >
-        <WaypointScene waypoints={waypoints} selectedId={selectedId} />
+        <WaypointScene waypoints={previewWaypoints} selectedId={selectedId} />
       </div>
       <div
         style={{
@@ -205,8 +208,9 @@ export function WaypointPlanner({
             }}
           >
             <InteractiveWaypoint2D
-              waypoints={waypoints}
+              waypoints={previewWaypoints}
               selectedId={selectedId}
+              orientationForced={faceInward}
               onSelect={setSelectedId}
               onAdd={(x, y) => {
                 const id = Date.now().toString();
@@ -401,12 +405,14 @@ export function WaypointPlanner({
 function InteractiveWaypoint2D({
   waypoints,
   selectedId,
+  orientationForced,
   onSelect,
   onAdd,
   onUpdate,
 }: {
   waypoints: LocalWaypoint[];
   selectedId: string | null;
+  orientationForced: boolean;
   onSelect: (id: string) => void;
   onAdd: (x: number, y: number) => void;
   onUpdate: (id: string, updates: Partial<LocalWaypoint>) => void;
@@ -443,6 +449,23 @@ function InteractiveWaypoint2D({
     };
     target.addEventListener("pointermove", move);
     target.addEventListener("pointerup", up);
+  };
+  const yawFromPointer = (waypoint: LocalWaypoint, event: ReactPointerEvent<SVGCircleElement>) => {
+    if (!ref.current) return;
+    const rect = ref.current.getBoundingClientRect();
+    const centerX = rect.left + (waypoint.x / width + 0.5) * rect.width;
+    const centerY = rect.top + (-waypoint.y / height + 0.5) * rect.height;
+    const yaw = Math.atan2(event.clientX - centerX, centerY - event.clientY) * (180 / Math.PI);
+    onUpdate(waypoint.id, { yaw: (yaw + 360) % 360 });
+  };
+  const rotate = (waypoint: LocalWaypoint, event: ReactPointerEvent<SVGCircleElement>) => {
+    event.stopPropagation();
+    onSelect(waypoint.id);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    yawFromPointer(waypoint, event);
+  };
+  const handleRotate = (waypoint: LocalWaypoint, event: ReactPointerEvent<SVGCircleElement>) => {
+    if (event.buttons === 1) yawFromPointer(waypoint, event);
   };
   return (
     <div
@@ -508,6 +531,69 @@ function InteractiveWaypoint2D({
             height: 0,
           }}
         >
+          {(() => {
+            const yaw = ((waypoint.yaw % 360) + 360) % 360;
+            const angle = (yaw * Math.PI) / 180;
+            const tipX = 36 + Math.sin(angle) * 29;
+            const tipY = 36 - Math.cos(angle) * 29;
+            const baseX = tipX - Math.sin(angle) * 9;
+            const baseY = tipY + Math.cos(angle) * 9;
+            const perpX = Math.cos(angle) * 4;
+            const perpY = Math.sin(angle) * 4;
+            const color = waypoint.id === selectedId ? "#38bdf8" : "#f59e0b";
+            return (
+              <svg
+                viewBox="0 0 72 72"
+                style={{
+                  position: "absolute",
+                  left: -36,
+                  top: -36,
+                  width: 72,
+                  height: 72,
+                  overflow: "visible",
+                  pointerEvents: "none",
+                  zIndex: 5,
+                }}
+              >
+                <line x1="36" y1="36" x2={tipX} y2={tipY} stroke={color} strokeWidth="2.5" />
+                <polygon
+                  points={`${tipX},${tipY} ${baseX + perpX},${baseY + perpY} ${baseX - perpX},${baseY - perpY}`}
+                  fill={color}
+                />
+                <circle
+                  role="slider"
+                  aria-label={`Waypoint ${index + 1} yaw`}
+                  aria-valuemin={0}
+                  aria-valuemax={359}
+                  aria-valuenow={Math.round(yaw)}
+                  aria-valuetext={`${Math.round(yaw)} deg clockwise from ship bow`}
+                  aria-disabled={orientationForced}
+                  tabIndex={orientationForced ? -1 : 0}
+                  cx={tipX}
+                  cy={tipY}
+                  r="5"
+                  fill={color}
+                  stroke="white"
+                  strokeWidth="1.5"
+                  style={{ pointerEvents: orientationForced ? "none" : "all", cursor: orientationForced ? "default" : "grab", touchAction: "none" }}
+                  onPointerDown={orientationForced ? undefined : (event) => rotate(waypoint, event)}
+                  onPointerMove={orientationForced ? undefined : (event) => handleRotate(waypoint, event)}
+                  onKeyDown={(event) => {
+                    if (orientationForced) return;
+                    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                    event.preventDefault();
+                    const step = event.shiftKey ? 15 : 5;
+                    onSelect(waypoint.id);
+                    onUpdate(waypoint.id, {
+                      yaw: (yaw + (event.key === "ArrowRight" ? step : -step) + 360) % 360,
+                    });
+                  }}
+                >
+                  <title>{orientationForced ? `Waypoint ${index + 1} facing YP: ${Math.round(yaw)} deg` : `Waypoint ${index + 1} yaw: ${Math.round(yaw)} deg; drag or use arrow keys`}</title>
+                </circle>
+              </svg>
+            );
+          })()}
           <div
             onPointerDown={(event) => drag(waypoint.id, event)}
             style={{

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { generateCircularWaypoints } from "./circularWaypoints";
+import { generateCircularWaypoints, yawTowardOrigin } from "./circularWaypoints";
 
 describe("circular local waypoint generation", () => {
   it("creates evenly spaced points at the requested radius starting at the bow", () => {
@@ -16,6 +16,13 @@ describe("circular local waypoint generation", () => {
 
   it("uses zero waypoint adjustment by default", () => {
     expect(generateCircularWaypoints(10, 3).every((point) => point.z === 0)).toBe(true);
+  });
+
+  it("calculates clockwise yaw toward the ship from each local position", () => {
+    expect(yawTowardOrigin(0, 20)).toBeCloseTo(180);
+    expect(yawTowardOrigin(20, 0)).toBeCloseTo(270);
+    expect(yawTowardOrigin(0, -20)).toBeCloseTo(0);
+    expect(yawTowardOrigin(-20, 0)).toBeCloseTo(90);
   });
 
   it("rejects a radius or count that cannot form a track", () => {

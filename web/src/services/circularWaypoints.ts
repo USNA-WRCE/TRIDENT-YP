@@ -5,6 +5,11 @@ export interface CircularWaypoint {
   yaw_deg: number;
 }
 
+export function yawTowardOrigin(x: number, y: number): number {
+  const yaw = (Math.atan2(-x, -y) * 180) / Math.PI;
+  return (yaw + 360) % 360;
+}
+
 export function generateCircularWaypoints(
   radiusMeters: number,
   waypointCount: number,

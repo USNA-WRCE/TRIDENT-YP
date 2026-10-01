@@ -36,15 +36,17 @@ export function WaypointScene({ waypoints, selectedId }: { waypoints: SceneWaypo
         </Sphere>
       ))}
       {waypoints.map((waypoint) => (
-        // Cone points along ship-relative yaw (0deg = ship's bow), matching the 2D planner's convention.
-        <mesh
+        <group
           key={`${waypoint.id}-yaw`}
           position={[-waypoint.x, waypoint.z, waypoint.y]}
-          rotation={[Math.PI / 2, -((waypoint.yaw ?? 0) * Math.PI) / 180, 0]}
+          rotation={[0, -((waypoint.yaw ?? 0) * Math.PI) / 180, 0]}
         >
-          <coneGeometry args={[0.8, 3, 12]} />
-          <meshStandardMaterial color={waypoint.id === selectedId ? "#38bdf8" : "#f59e0b"} />
-        </mesh>
+          <Line points={[[0, 0, 0], [0, 0, 6]]} color={waypoint.id === selectedId ? "#38bdf8" : "#f59e0b"} lineWidth={2} />
+          <mesh position={[0, 0, 5.4]} rotation={[Math.PI / 2, 0, 0]}>
+            <coneGeometry args={[0.8, 1.8, 12]} />
+            <meshStandardMaterial color={waypoint.id === selectedId ? "#38bdf8" : "#f59e0b"} />
+          </mesh>
+        </group>
       ))}
       {linePoints.length > 1 && <Line points={linePoints} color="#f59e0b" lineWidth={5} />}
       <OrbitControls makeDefault target={[0, 0, 0]} />
