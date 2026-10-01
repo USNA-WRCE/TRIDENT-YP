@@ -115,6 +115,11 @@ class APIContractTests(DatabaseTestCase):
 
 
 class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
+    def test_sitl_rtk_corrections_do_not_cancel_ship_relative_plan(self):
+        self.assertFalse(main._sitl_command_cancels_ship_relative("rtcm_data"))
+        self.assertFalse(main._sitl_command_cancels_ship_relative("ship_relative_trajectory"))
+        self.assertTrue(main._sitl_command_cancels_ship_relative("waypoint"))
+
     def test_sitl_ship_relative_dispatch_sends_and_completes_waypoint(self):
         now = time.time()
         ship_lat, ship_lon = 38.9, -76.4

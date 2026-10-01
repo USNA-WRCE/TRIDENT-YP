@@ -789,7 +789,8 @@ async def _run_mavlink_bridge(
                                 print(f"[SITL][SHIP-REL] Invalid ship-relative command for {vehicle_id}")
                             continue
 
-                        active_ship_relative = None
+                        if _sitl_command_cancels_ship_relative(command_type):
+                            active_ship_relative = None
                         touched_down = _handle_sitl_command(m, command_payload)
                         if touched_down:
                             try:
@@ -860,7 +861,7 @@ async def _run_mavlink_bridge(
                     payload = cmd_queue.get_nowait()
                     queued_commands_processed += 1
                     cmd_type = payload.get("command", {}).get("type")
-                    if cmd_type != "ship_relative_trajectory":
+                    if _sitl_command_cancels_ship_relative(cmd_type):
                         try:
                             _outbound.put_nowait({"command": {"type": "_cancel_ship_relative"}})
                         except _stdlib_queue.Full:
@@ -1073,6 +1074,10 @@ def _execute_sar_command(
             telemetry_callback=telemetry_callback,
         )
         print(f"[SITL][SAR] MOB search mission (streaming) {'COMPLETE' if ok else 'FAILED'}")
+
+
+def _sitl_command_cancels_ship_relative(command_type: Any) -> bool:
+    return command_type not in ("ship_relative_trajectory", "rtcm_data")
 
 
 def _step_sitl_ship_relative(master: Any, plan: dict[str, Any]) -> Optional[dict[str, Any]]:

@@ -5,7 +5,7 @@ import json
 import math
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Coroutine, Optional
 
 import serial
 import websockets
@@ -54,12 +54,35 @@ async def main() -> None:
                 # Reset timing so the reconnect gap doesn't produce a large dt
                 sim_state["last_step"] = time.time()
                 if GPS_MODE == "serial":
-                    await serial_loop(ws)
+                    await _run_websocket_session(ws, serial_loop(ws))
                 else:
-                    await sim_loop(ws, sim_state)
+                    await _run_websocket_session(ws, sim_loop(ws, sim_state))
         except Exception as exc:
             print(f"YP GPS reconnecting after error: {exc}")
             await asyncio.sleep(2.0)
+
+
+async def _run_websocket_session(
+    ws: websockets.WebSocketClientProtocol,
+    telemetry_loop: Coroutine[Any, Any, None],
+) -> None:
+    telemetry_task = asyncio.create_task(telemetry_loop)
+    command_task = asyncio.create_task(_drain_server_commands(ws))
+    tasks = (telemetry_task, command_task)
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _drain_server_commands(ws: websockets.WebSocketClientProtocol) -> None:
+    async for _ in ws:
+        pass
 
 
 async def sim_loop(ws: websockets.WebSocketClientProtocol, state: dict) -> None:

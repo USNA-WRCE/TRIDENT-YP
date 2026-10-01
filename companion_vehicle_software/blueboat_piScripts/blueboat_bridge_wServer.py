@@ -887,7 +887,7 @@ async def telemetry_loop(current_config: dict) -> None:
                             command_data = server_msg.get("command", {})
                             cmd_type = command_data.get("type")
 
-                            if cmd_type != "ship_relative_trajectory":
+                            if cmd_type not in ("ship_relative_trajectory", "rtcm_data"):
                                 _stop_ship_relative_mission()
 
                             if cmd_type == "rtb_follow":
