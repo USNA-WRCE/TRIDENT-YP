@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
-import { Anchor, Brush, CircleDashed, Maximize2, PlaneTakeoff, Power, PowerOff, RotateCcw, Route, Video, X } from "lucide-react";
+import { Activity, Anchor, Brush, CircleDashed, Maximize2, PlaneTakeoff, Power, PowerOff, RotateCcw, Route, Video, X } from "lucide-react";
 
 import type { Vehicle, VehicleType } from "../types";
 import { calculateRelativePosition } from "../utils/geo";
@@ -125,6 +125,14 @@ export function VehicleModal({
   };
   const endDrag = (event: ReactPointerEvent<HTMLElement>) => { if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null; };
 
+  const handleOpenMCT = () => {
+    window.open(
+      `/openmct.html?vehicle=${encodeURIComponent(vehicle.vehicle_id)}`,
+      `openmct_${vehicle.vehicle_id}`,
+      "width=1024,height=768,resizable=yes,scrollbars=yes"
+    );
+  };
+
   return (
     <div ref={modalRef} className={styles.vehicleModal} style={{ position: "fixed", left: frame.x, top: frame.y, width: frame.width, margin: 0, zIndex: 5000, boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.5)", cursor: "default", maxHeight: "calc(100vh - 24px)", overflowY: "auto", overscrollBehavior: "contain" }} onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
       <div className={styles.modalHeader} style={{ cursor: "grab" }} onPointerDown={(event) => startDrag("move", event)} onPointerMove={moveDrag} onPointerUp={endDrag}>
@@ -172,6 +180,11 @@ export function VehicleModal({
         {canCommand && VEHICLE_MODES[vehicle.vehicle_type]?.length > 0 && <button className={styles.secondary} onClick={() => setShowModeSelector((value) => !value)}>Settings{showModeSelector && <X size={14} aria-label="Close mode selector" />}</button>}
         {canStreamVideo && <button className={styles.stream} onClick={onStreamVideo}><Video size={18} />Stream Video</button>}
         {canCommand && <button className={styles.primary} onClick={onWaypoint}><Route size={18} />Waypoint</button>}
+        
+        {/* OpenMCT Analysis Button */}
+        <button className={styles.secondary} onClick={handleOpenMCT} title="Open OpenMCT Analysis View">
+          <Activity size={18} />Analyze Data
+        </button>
       </div>
       {showColorPalette && <div className={styles.colorPanel}><div className={styles.colorSwatches}>{VEHICLE_COLOR_PALETTE.map((color) => <button key={color} className={`${styles.colorSwatch} ${draftColor === color ? styles.selected : ""}`} style={{ backgroundColor: color }} title={color} onClick={() => { setDraftColor(color); onColorSave(color); }} />)}</div></div>}
       {showTakeoffPanel && TAKEOFF_CAPABLE_TYPES.includes(vehicle.vehicle_type) && (

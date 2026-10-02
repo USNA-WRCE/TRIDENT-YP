@@ -2163,6 +2163,46 @@ def _check_command_permission(user: "User", cmd_type: Optional[str]) -> bool:
     return user.has_permission(required_permission)
 
 
+
+@app.get("/api/openmct/history/{vehicle_id}/{measurement}/{field}")
+async def get_openmct_history(
+    vehicle_id: str,
+    measurement: str,
+    field: str,
+    start: float = Query(..., description="Start time in epoch milliseconds"),
+    end: float = Query(..., description="End time in epoch milliseconds"),
+):
+    """
+    Query InfluxDB for historical field values within a time window for OpenMCT plots.
+    """
+    if not query_api:
+        return JSONResponse({"error": "InfluxDB unavailable"}, status_code=503)
+
+    # Convert milliseconds to ISO 8601 string for Flux
+    start_iso = datetime.fromtimestamp(start / 1000.0, tz=timezone.utc).isoformat()
+    end_iso = datetime.fromtimestamp(end / 1000.0, tz=timezone.utc).isoformat()
+
+    flux_query = f'''
+    from(bucket: "{INFLUX_BUCKET}")
+      |> range(start: time(v: "{start_iso}"), stop: time(v: "{end_iso}"))
+      |> filter(fn: (r) => r.vehicle_id == "{vehicle_id}")
+      |> filter(fn: (r) => r._field == "{field}")
+    '''
+
+    try:
+        tables = query_api.query(query=flux_query, org=INFLUX_ORG)
+        results = []
+        for table in tables:
+            for record in table.records:
+                results.append({
+                    "timestamp": int(record.get_time().timestamp() * 1000), # epoch ms
+                    "value": record.get_value(),
+                    "id": f"{vehicle_id}.{field}"
+                })
+        return JSONResponse(results)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.websocket("/ws/rosbridge")
 async def rosbridge_ws(websocket: WebSocket) -> None:
     """Minimal rosbridge-protocol WebSocket for subscribe/publish/command ops."""

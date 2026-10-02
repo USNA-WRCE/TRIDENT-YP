@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Telemetry Analysis - OpenMCT</title>
+    
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist/openmct.css">
+    <script src="https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist/openmct.js"></script>
+
+    <style>
+        html, body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #111;
+            color: #fff;
+            font-family: sans-serif;
+        }
+        #openmct-container {
+            width: 100%;
+            height: 100%;
+        }
+        #error-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(220, 38, 38, 0.9);
+            color: white;
+            padding: 12px;
+            border-radius: 6px;
+            display: none;
+            z-index: 9999;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="error-overlay"></div>
+    <div id="openmct-container"></div>
+
+    <script>
+        window.addEventListener('error', function(e) {
+            const errBox = document.getElementById('error-overlay');
+            errBox.style.display = 'block';
+            errBox.innerText = 'OpenMCT Error: ' + e.message;
+        });
+
+        document.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const vehicleId = urlParams.get('vehicle') || 'quadrotorYP';
+
+            openmct.setAssetPath('https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist');
+
+            // 1. Install Base Plugins and Navigation/Layout Tree Plugins
+            openmct.install(openmct.plugins.LocalStorage());
+            openmct.install(openmct.plugins.Espresso());
+            openmct.install(openmct.plugins.Plot());
+            openmct.install(openmct.plugins.MyItems()); // Enables sidebar tree navigation
+
+            // 2. Register UTC Time System
+            openmct.install(openmct.plugins.UTCTimeSystem());
+
+            // 3. Initialize Conductor Plugin
+            const now = Date.now();
+            const fifteenMinutes = 15 * 60 * 1000;
+
+            const conductorPlugin = openmct.plugins.Conductor || openmct.plugins.TimeConductor;
+            if (typeof conductorPlugin === 'function') {
+                openmct.install(conductorPlugin({
+                    menuOptions: [
+                        {
+                            name: "Fixed Bounds",
+                            timeSystem: 'utc',
+                            mode: 'fixed',
+                            bounds: {
+                                start: now - fifteenMinutes,
+                                end: now
+                            }
+                        },
+                        {
+                            name: "Realtime",
+                            timeSystem: 'utc',
+                            mode: 'realtime',
+                            bounds: {
+                                start: -fifteenMinutes,
+                                end: 0
+                            }
+                        }
+                    ]
+                }));
+            }
+
+            // Set default time system to UTC
+            openmct.time.timeSystem('utc', {
+                start: now - fifteenMinutes,
+                end: now
+            });
+
+            // 4. Define Vehicle Taxonomy & Register Under "My Items" (mine)
+            const telemetryFields = [
+                { key: 'latitude', name: 'Latitude', unit: 'deg' },
+                { key: 'longitude', name: 'Longitude', unit: 'deg' },
+                { key: 'altitude', name: 'Altitude', unit: 'm' },
+                { key: 'battery_percentage', name: 'Battery', unit: '%' }
+            ];
+
+            const vehicleFolderKey = `vehicle_folder_${vehicleId}`;
+
+            // Add the root folder into the sidebar "My Items" directory
+            openmct.objects.addRoot({
+                namespace: 'vehicle.taxonomy',
+                key: vehicleFolderKey
+            }, openmct.priority.HIGH);
+
+            openmct.objects.addProvider('vehicle.taxonomy', {
+                get: function (identifier) {
+                    if (identifier.key === vehicleFolderKey) {
+                        return Promise.resolve({
+                            identifier: identifier,
+                            name: `Vehicle ${vehicleId}`,
+                            type: 'folder',
+                            location: 'mine',
+                            composition: telemetryFields.map(f => ({
+                                namespace: 'vehicle.taxonomy',
+                                key: f.key
+                            }))
+                        });
+                    }
+
+                    const field = telemetryFields.find(f => f.key === identifier.key);
+                    if (field) {
+                        return Promise.resolve({
+                            identifier: identifier,
+                            name: field.name,
+                            type: 'telemetry.telemetryPoint',
+                            telemetry: {
+                                values: [
+                                    { key: 'value', name: 'Value', units: field.unit, format: 'float', hints: { range: 1 } },
+                                    { key: 'utc', name: 'Timestamp', format: 'utc', hints: { domain: 1 } }
+                                ]
+                            },
+                            location: `vehicle.taxonomy:${vehicleFolderKey}`
+                        });
+                    }
+
+                    return Promise.reject(new Error('Object not found'));
+                }
+            });
+
+            // 5. Historical Telemetry Provider (FastAPI -> InfluxDB)
+            openmct.telemetry.addProvider({
+                supportsRequest: function (domainObject) {
+                    return domainObject.type === 'telemetry.telemetryPoint';
+                },
+                request: function (domainObject, options) {
+                    const field = domainObject.identifier.key;
+                    const url = `/api/openmct/history/${encodeURIComponent(vehicleId)}/yp_messages/${field}?start=${options.start}&end=${options.end}`;
+                    
+                    return fetch(url)
+                        .then(res => res.ok ? res.json() : [])
+                        .then(data => data.map(pt => ({ utc: pt.timestamp, value: pt.value })))
+                        .catch(() => []);
+                }
+            });
+
+            // 6. Realtime Telemetry Provider (WebSocket)
+            openmct.telemetry.addProvider({
+                supportsSubscribe: function (domainObject) {
+                    return domainObject.type === 'telemetry.telemetryPoint';
+                },
+                subscribe: function (domainObject, callback) {
+                    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/ship_state`);
+                    
+                    ws.onmessage = function (event) {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.op === 'vehicle_update' && data.vehicle && data.vehicle.vehicle_id === vehicleId) {
+                                const fieldKey = domainObject.identifier.key;
+                                let val = null;
+                                if (fieldKey === 'latitude' || fieldKey === 'longitude' || fieldKey === 'altitude') {
+                                    val = data.vehicle.position ? data.vehicle.position[fieldKey] : null;
+                                } else if (fieldKey === 'battery_percentage') {
+                                    val = data.vehicle.battery ? data.vehicle.battery.percentage : null;
+                                }
+
+                                if (val !== null && typeof val === 'number') {
+                                    callback({
+                                        utc: Date.now(),
+                                        value: val
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            console.error("WS Parse Error", e);
+                        }
+                    };
+
+                    return function unsubscribe() {
+                        ws.close();
+                    };
+                }
+            });
+
+            // Mount OpenMCT UI to container
+            openmct.start(document.getElementById('openmct-container'));
+        });
+    </script>
+</body>
+</html>
