@@ -751,6 +751,93 @@
   cursor: default;
 }
 
+.settings-danger-zone {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #f0c5c1;
+}
+
+.settings-danger-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #9f2218;
+  font-size: 13px;
+}
+
+.settings-danger-zone p {
+  margin: 0;
+  color: #64716d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-danger-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid #b42318;
+  border-radius: 6px;
+  background: #b42318;
+  color: #fff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settings-danger-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-danger-confirm label {
+  margin-bottom: 5px;
+  color: #7f1d1d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.settings-danger-confirm input {
+  box-sizing: border-box;
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid #d7a29e;
+  border-radius: 5px;
+  background: #fff;
+  color: #182622;
+}
+
+.settings-danger-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.settings-danger-actions > button:not(.settings-danger-btn) {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.settings-danger-actions > button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.settings-danger-zone .settings-danger-status { color: #126736; }
+.settings-danger-zone .settings-danger-error { color: #9f2218; }
+
 .settings-tabs {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

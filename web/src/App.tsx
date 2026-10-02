@@ -1,5 +1,6 @@
 import L from "leaflet";
 import {
+  Activity,
   AlertTriangle,
   Camera,
   Cable,
@@ -14,6 +15,7 @@ import {
   Save,
   Settings,
   Ship,
+  Trash2,
   Wifi,
   WifiOff,
   Map as MapIcon,
@@ -23,7 +25,7 @@ import {
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { MapContainer, Polyline, TileLayer, useMap, useMapEvents } from "react-leaflet";
 
-import { connectSITL, disconnectSITL, exportFlightLog, fetchSettings, fetchRtcmStatus, getCurrentUser, listAxisCameras, listSITLBridges, sendCommand, setYpRole, triggerMOB, updateSettings, logout as logoutUser, fetchDeconflictionSettings, updateDeconflictionSettings } from "./api";
+import { connectSITL, deleteInfluxData, disconnectSITL, exportFlightLog, fetchSettings, fetchRtcmStatus, getCurrentUser, listAxisCameras, listSITLBridges, sendCommand, setYpRole, triggerMOB, updateSettings, logout as logoutUser, fetchDeconflictionSettings, updateDeconflictionSettings } from "./api";
 import type { AxisCamera, CameraDetectionUpdate, CurrentUser, SITLBridge, RtcmStatus } from "./api";
 import type { Command, Position, RelativeWaypoint, Vehicle, VehicleType } from "./types";
 import Login from "./Login";
@@ -35,6 +37,7 @@ import { SITLPanel } from "./components/SITLPanel";
 import { VehicleModal } from "./components/VehicleModal";
 import { VideoViewer } from "./components/VideoViewer";
 import { CameraPanel } from "./components/CameraPanel";
+import { HistoryExplorer } from "./components/HistoryExplorer";
 import { FitAllControl, FollowYpCenter, SarPatternOverlay, VehicleLayer, WaypointCrosshair, YpRangeRings, type WaypointMarker } from "./components/map/VehicleLayers";
 import { vehicleMarkerColor } from "./utils/vehicleStyle";
 import { WeatherRadarLayer, WindLayer } from "./components/map/OverlayLayers";
@@ -153,6 +156,11 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [flightLogHours, setFlightLogHours] = useState(8);
   const [flightLogExporting, setFlightLogExporting] = useState(false);
   const [flightLogError, setFlightLogError] = useState<string | null>(null);
+  const [influxDeleteConfirmOpen, setInfluxDeleteConfirmOpen] = useState(false);
+  const [influxDeleteConfirmation, setInfluxDeleteConfirmation] = useState("");
+  const [influxDeletePending, setInfluxDeletePending] = useState(false);
+  const [influxDeleteStatus, setInfluxDeleteStatus] = useState("");
+  const [influxDeleteError, setInfluxDeleteError] = useState("");
   const [rtbUpdateHz, setRtbUpdateHz] = useState(2.0);
   const [rtbSternDistanceM, setRtbSternDistanceM] = useState(35);
   const [rtbAltitudeM, setRtbAltitudeM] = useState(30);
@@ -385,7 +393,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const messagesButtonRef = useRef<HTMLButtonElement | null>(null);
   const mapMenuToggleRef = useRef<HTMLButtonElement | null>(null);
   
-  const [activeTab, setActiveTab] = useState<"map" | "mission" | "planner">("map");
+  const [activeTab, setActiveTab] = useState<"map" | "mission" | "planner" | "history">("map");
 
   const updateSarMissionState = (vehicleId: string, commandType: string) => {
     setSarMissionActiveByVehicle((current) => {
@@ -820,10 +828,30 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
     }
   };
 
+  const confirmDeleteInfluxData = async () => {
+    if (influxDeleteConfirmation !== "DELETE") return;
+    setInfluxDeletePending(true);
+    setInfluxDeleteError("");
+    setInfluxDeleteStatus("");
+    try {
+      await deleteInfluxData();
+      window.dispatchEvent(new Event("influxdb-data-deleted"));
+      setInfluxDeleteStatus("InfluxDB data deleted. New telemetry will continue to be recorded.");
+      setInfluxDeleteConfirmOpen(false);
+      setInfluxDeleteConfirmation("");
+    } catch (error) {
+      setInfluxDeleteError(error instanceof Error ? error.message : "InfluxDB data deletion failed.");
+    } finally {
+      setInfluxDeletePending(false);
+    }
+  };
+
   return (
     <div className="app" onClick={() => mapActionMenu && setMapActionMenu(null)}>
       
-      {activeTab === "map" ? (
+      {activeTab === "history" ? (
+        <HistoryExplorer />
+      ) : activeTab === "map" ? (
         <MapContainer center={mapCenter} zoom={mapZoom} minZoom={3} maxZoom={20} zoomControl className="map">
           <TileLayer key={`${mapBase}-${renderedMapSource}`} url={mapLayer.url} attribution={mapLayer.attribution} maxNativeZoom={mapLayer.maxNativeZoom} maxZoom={20} />
                     {showWeatherRadar && <WeatherRadarLayer />}
@@ -957,7 +985,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         />
       )}
 
-      {activeTab !== "planner" && (
+      {activeTab !== "planner" && activeTab !== "history" && (
         <MapMenu
           mapBase={mapBase}
           mapSource={mapSource}
@@ -1070,6 +1098,16 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
             >
             <Crosshair size={19} />
           </button>
+          {!DEMO_MODE && (
+            <button
+              className={activeTab === "history" ? "icon-button active" : "icon-button"}
+              title="Historical Telemetry"
+              aria-label="Historical Telemetry"
+              onClick={() => { setActiveTab("history"); setShowSettings(false); setShowSITL(false); setShowCameras(false); setShowFlightLogOptions(false); setSelected(null); }}
+            >
+              <Activity size={19} />
+            </button>
+          )}
           {!VIEW_MODE && !DEMO_MODE && (
             <button
               ref={sitlButtonRef}
@@ -1212,6 +1250,52 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 disabled={DEMO_MODE}
                 onChange={(event) => setMessageRetentionMinutes(Number(event.target.value))}
               />
+              {currentUser.permissions.includes("manage_users") && (
+                <section className="settings-danger-zone" aria-labelledby="influx-delete-title">
+                  <div className="settings-danger-heading">
+                    <Trash2 size={16} />
+                    <strong id="influx-delete-title">Delete InfluxDB data</strong>
+                  </div>
+                  <p>All vehicle telemetry records in the configured InfluxDB bucket will be permanently deleted. The bucket stays in place and new telemetry will continue to be recorded.</p>
+                  {!influxDeleteConfirmOpen ? (
+                    <button
+                      className="settings-danger-btn"
+                      type="button"
+                      onClick={() => { setInfluxDeleteStatus(""); setInfluxDeleteError(""); setInfluxDeleteConfirmation(""); setInfluxDeleteConfirmOpen(true); }}
+                    >
+                      <Trash2 size={15} /> Delete all InfluxDB data
+                    </button>
+                  ) : (
+                    <div className="settings-danger-confirm">
+                      <label htmlFor="influx-delete-confirmation">Type DELETE to confirm</label>
+                      <input
+                        id="influx-delete-confirmation"
+                        autoComplete="off"
+                        value={influxDeleteConfirmation}
+                        onChange={(event) => setInfluxDeleteConfirmation(event.target.value)}
+                        disabled={influxDeletePending}
+                      />
+                      <div className="settings-danger-actions">
+                        <button
+                          type="button"
+                          onClick={() => { setInfluxDeleteConfirmOpen(false); setInfluxDeleteConfirmation(""); }}
+                          disabled={influxDeletePending}
+                        >Cancel</button>
+                        <button
+                          className="settings-danger-btn"
+                          type="button"
+                          onClick={() => void confirmDeleteInfluxData()}
+                          disabled={influxDeletePending || influxDeleteConfirmation !== "DELETE"}
+                        >
+                          <Trash2 size={15} /> {influxDeletePending ? "Deleting..." : "Delete permanently"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {influxDeleteStatus && <p className="settings-danger-status" role="status">{influxDeleteStatus}</p>}
+                  {influxDeleteError && <p className="settings-danger-error" role="alert">{influxDeleteError}</p>}
+                </section>
+              )}
             </>
           )}
           {settingsTab === "rtk" && (

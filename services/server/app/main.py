@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover
     _sar_missions = None  # type: ignore[assignment]
 
-from fastapi import Body, FastAPI, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, Cookie, FastAPI, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from influxdb_client import InfluxDBClient, Point
@@ -1715,6 +1715,46 @@ async def export_log(
     )
 
 
+@app.delete("/api/influxdb/data")
+async def delete_influxdb_data(
+    payload: dict[str, Any] = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Cookie(default=None),
+) -> JSONResponse:
+    """Delete all application telemetry points from the configured InfluxDB bucket."""
+    if authorization is not None:
+        if not authorization.startswith("Bearer "):
+            return JSONResponse({"error": "missing or invalid authorization header"}, status_code=401)
+        token = authorization[7:]
+    else:
+        token = auth_token
+
+    user = get_current_user(token)
+    if not user:
+        return JSONResponse({"error": "invalid or expired token"}, status_code=401)
+    if not user.has_permission("manage_users"):
+        return JSONResponse({"error": "administrator permission required"}, status_code=403)
+    if payload.get("confirmation") != "DELETE":
+        return JSONResponse({"error": "explicit DELETE confirmation required"}, status_code=400)
+    if not delete_api:
+        return JSONResponse({"error": "InfluxDB unavailable"}, status_code=503)
+
+    try:
+        await asyncio.to_thread(
+            delete_api.delete,
+            start=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            stop=datetime(2262, 4, 11, 23, 47, tzinfo=timezone.utc),
+            predicate='_measurement="yp_messages"',
+            bucket=INFLUX_BUCKET,
+            org=INFLUX_ORG,
+        )
+    except Exception as error:
+        print(f"InfluxDB data deletion failed: {error}")
+        return JSONResponse({"error": "Unable to delete InfluxDB data"}, status_code=503)
+
+    return JSONResponse({"deleted": True})
+
+
 @app.put("/api/settings")
 async def update_settings(payload: dict[str, Any], authorization: Optional[str] = Header(default=None)) -> JSONResponse:
     """Validate, apply, and persist Settings modal values."""
@@ -2164,6 +2204,36 @@ def _check_command_permission(user: "User", cmd_type: Optional[str]) -> bool:
 
 
 
+@app.get("/api/openmct/vehicles")
+async def get_openmct_vehicles() -> JSONResponse:
+    """List vehicle IDs with telemetry still inside the configured retention window."""
+    if not query_api:
+        return JSONResponse({"error": "InfluxDB unavailable"}, status_code=503)
+
+    retention_seconds = float(settings["message_retention_seconds"])
+    flux_query = f'''
+        from(bucket: {json.dumps(INFLUX_BUCKET)})
+            |> range(start: -{int(retention_seconds)}s)
+            |> filter(fn: (r) => r._measurement == "yp_messages")
+            |> last()
+            |> keep(columns: ["vehicle_id"])
+            |> group()
+            |> distinct(column: "vehicle_id")
+    '''
+
+    try:
+        tables = query_api.query(query=flux_query, org=INFLUX_ORG)
+        vehicle_ids = sorted({
+            str(record.get_value())
+            for table in tables
+            for record in table.records
+            if record.get_value()
+        })
+        return JSONResponse({"vehicles": vehicle_ids, "retention_seconds": retention_seconds})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+
+
 @app.get("/api/openmct/history/{vehicle_id}/{measurement}/{field}")
 async def get_openmct_history(
     vehicle_id: str,
@@ -2177,16 +2247,24 @@ async def get_openmct_history(
     """
     if not query_api:
         return JSONResponse({"error": "InfluxDB unavailable"}, status_code=503)
+    if measurement != "yp_messages":
+        return JSONResponse({"error": "Unsupported measurement"}, status_code=400)
+    if start >= end:
+        return JSONResponse({"error": "start must be before end"}, status_code=400)
 
     # Convert milliseconds to ISO 8601 string for Flux
     start_iso = datetime.fromtimestamp(start / 1000.0, tz=timezone.utc).isoformat()
     end_iso = datetime.fromtimestamp(end / 1000.0, tz=timezone.utc).isoformat()
+    measurement_value = json.dumps(measurement)
+    vehicle_value = json.dumps(vehicle_id)
+    field_value = json.dumps(field)
 
     flux_query = f'''
-    from(bucket: "{INFLUX_BUCKET}")
+    from(bucket: {json.dumps(INFLUX_BUCKET)})
       |> range(start: time(v: "{start_iso}"), stop: time(v: "{end_iso}"))
-      |> filter(fn: (r) => r.vehicle_id == "{vehicle_id}")
-      |> filter(fn: (r) => r._field == "{field}")
+      |> filter(fn: (r) => r._measurement == {measurement_value})
+      |> filter(fn: (r) => r.vehicle_id == {vehicle_value})
+      |> filter(fn: (r) => r._field == {field_value})
     '''
 
     try:

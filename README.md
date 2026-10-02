@@ -136,6 +136,12 @@ Exports do not modify InfluxDB and include only data still retained there. The `
 
 By default, `yp-server` also writes a shutdown export when stopped cleanly with Ctrl+C, `docker compose stop`, or `docker compose down`. It saves a gzip-compressed JSON Lines file named `yp-flight-log-<start>-<end>.jsonl.gz` under `data/logs/` (mounted into the container as `/data/logs`). This automatic copy covers the current server run and retained non-heartbeat records. It can be disabled with `LOG_EXPORT_ON_SHUTDOWN=false`; `LOG_EXPORT_DIR` changes the destination. Compose allows 30 seconds for the export to finish during shutdown. A forced kill or unavailable InfluxDB can prevent the file from being written.
 
+### Historical telemetry analysis
+
+Open **Historical Telemetry** from the top toolbar to explore numeric telemetry in OpenMCT. Select a vehicle and time range, then choose **Load history**; available vehicles and time ranges are limited to records still inside the configured InfluxDB retention window. Use **Backup** to load a previously exported `.jsonl` or `.jsonl.gz` flight log into the same explorer. The selected backup is read in the browser and is not uploaded to the server. A vehicle modal's **Analyze Data** button opens its OpenMCT view in a separate window.
+
+Administrators can permanently delete all `yp_messages` telemetry points in the configured InfluxDB bucket from **Settings > Display**. The action requires typing `DELETE`; export any needed records first. It does not remove saved flight-log files, and new telemetry continues to be recorded after deletion.
+
 ### Demo and view-only modes
 
 Static demo mode renders local vehicles without a live server or login. Use `/demo`, `?demo=true`, or `npm run build:demo` in `web/`. The demo uses the same map, mission planners, messages, and display controls as the live application. Hardware connections, account administration, flight-log export, and MOB dispatch require the live stack. Demo settings and vehicles reset on reload.

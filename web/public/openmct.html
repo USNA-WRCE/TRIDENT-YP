@@ -48,9 +48,33 @@
             errBox.innerText = 'OpenMCT Error: ' + e.message;
         });
 
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', async () => {
             const urlParams = new URLSearchParams(window.location.search);
             const vehicleId = urlParams.get('vehicle') || 'quadrotorYP';
+            const backupUrl = urlParams.get('backup');
+
+            let backupRecords = null;
+            if (backupUrl) {
+                try {
+                    const response = await fetch(backupUrl);
+                    if (!response.ok) throw new Error('Could not read the selected flight log backup.');
+                    const lines = (await response.text()).split(/\r?\n/).filter(line => line.trim());
+                    backupRecords = lines.slice(1).map(line => {
+                        const record = JSON.parse(line);
+                        return {
+                            vehicleId: record.vehicle_id,
+                            utc: Date.parse(record.timestamp),
+                            fields: record.fields || {}
+                        };
+                    }).filter(record => record.vehicleId === vehicleId && Number.isFinite(record.utc));
+                    if (backupRecords.length === 0) throw new Error('The backup has no records for this vehicle.');
+                } catch (error) {
+                    const errBox = document.getElementById('error-overlay');
+                    errBox.style.display = 'block';
+                    errBox.innerText = 'Flight log error: ' + error.message;
+                    return;
+                }
+            }
 
             openmct.setAssetPath('https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist');
 
@@ -66,19 +90,23 @@
             // 3. Initialize Conductor Plugin
             const now = Date.now();
             const fifteenMinutes = 15 * 60 * 1000;
+            const requestedStart = Number(urlParams.get('start'));
+            const requestedEnd = Number(urlParams.get('end'));
+            const initialBounds = urlParams.has('start') && urlParams.has('end')
+                && Number.isFinite(requestedStart) && Number.isFinite(requestedEnd)
+                && requestedStart < requestedEnd
+                ? { start: requestedStart, end: requestedEnd }
+                : { start: now - fifteenMinutes, end: now };
 
             const conductorPlugin = openmct.plugins.Conductor || openmct.plugins.TimeConductor;
             if (typeof conductorPlugin === 'function') {
                 openmct.install(conductorPlugin({
                     menuOptions: [
                         {
-                            name: "Fixed Bounds",
+                            name: "Historical Range",
                             timeSystem: 'utc',
                             mode: 'fixed',
-                            bounds: {
-                                start: now - fifteenMinutes,
-                                end: now
-                            }
+                            bounds: initialBounds
                         },
                         {
                             name: "Realtime",
@@ -94,18 +122,23 @@
             }
 
             // Set default time system to UTC
-            openmct.time.timeSystem('utc', {
-                start: now - fifteenMinutes,
-                end: now
-            });
+            openmct.time.timeSystem('utc', initialBounds);
 
             // 4. Define Vehicle Taxonomy & Register Under "My Items" (mine)
-            const telemetryFields = [
+            const liveTelemetryFields = [
                 { key: 'latitude', name: 'Latitude', unit: 'deg' },
                 { key: 'longitude', name: 'Longitude', unit: 'deg' },
                 { key: 'altitude', name: 'Altitude', unit: 'm' },
                 { key: 'battery_percentage', name: 'Battery', unit: '%' }
             ];
+            const backupFieldKeys = backupRecords
+                ? [...new Set(backupRecords.flatMap(record => Object.entries(record.fields)
+                    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+                    .map(([key]) => key)))]
+                : [];
+            const telemetryFields = backupRecords
+                ? backupFieldKeys.map(key => ({ key, name: key.replace(/_/g, ' '), unit: '' }))
+                : liveTelemetryFields;
 
             const vehicleFolderKey = `vehicle_folder_${vehicleId}`;
 
@@ -157,6 +190,12 @@
                 },
                 request: function (domainObject, options) {
                     const field = domainObject.identifier.key;
+                    if (backupRecords) {
+                        return Promise.resolve(backupRecords
+                            .filter(record => record.utc >= options.start && record.utc < options.end
+                                && typeof record.fields[field] === 'number')
+                            .map(record => ({ utc: record.utc, value: record.fields[field] })));
+                    }
                     const url = `/api/openmct/history/${encodeURIComponent(vehicleId)}/yp_messages/${field}?start=${options.start}&end=${options.end}`;
                     
                     return fetch(url)
@@ -169,7 +208,7 @@
             // 6. Realtime Telemetry Provider (WebSocket)
             openmct.telemetry.addProvider({
                 supportsSubscribe: function (domainObject) {
-                    return domainObject.type === 'telemetry.telemetryPoint';
+                    return !backupRecords && domainObject.type === 'telemetry.telemetryPoint';
                 },
                 subscribe: function (domainObject, callback) {
                     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';

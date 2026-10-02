@@ -1,0 +1,132 @@
+.explorer {
+  position: absolute;
+  z-index: 700;
+  inset: 132px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #cbd5d1;
+  border-radius: 8px;
+  background: #f4f7f6;
+  box-shadow: 0 12px 30px rgba(22, 38, 34, 0.18);
+}
+
+.toolbar {
+  z-index: 1;
+  display: grid;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(190px, 1fr) minmax(190px, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  padding: 12px 14px 9px;
+  border-bottom: 1px solid #cbd5d1;
+  background: #fff;
+}
+
+.control {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: #40514d;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.control select,
+.control input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  padding: 0 9px;
+  border: 1px solid #b8c5c0;
+  border-radius: 5px;
+  background: #fbfdfc;
+  color: #182622;
+  font: inherit;
+  font-size: 13px;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+}
+
+.loadButton,
+.refreshButton,
+.fileButton {
+  display: inline-flex;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid #17624b;
+  border-radius: 5px;
+  background: #17624b;
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.loadButton { padding: 0 12px; }
+.refreshButton { width: 36px; background: #fff; color: #17624b; }
+.fileButton { position: relative; padding: 0 10px; background: #fff; color: #17624b; cursor: pointer; }
+.fileButton input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.loadButton:disabled, .refreshButton:disabled, .fileButton:has(input:disabled) { cursor: wait; opacity: 0.55; }
+
+.retention {
+  grid-column: 1 / 3;
+  overflow: hidden;
+  color: #61716c;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.error {
+  grid-column: 3 / -1;
+  color: #a12b23;
+  font-size: 11px;
+  text-align: right;
+}
+
+.openmct {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  border: 0;
+  background: #111;
+}
+
+.emptyState {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 20px;
+  color: #52635e;
+  font-size: 14px;
+}
+
+.spin { animation: spin 1s linear infinite; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 760px) {
+  .explorer { inset: 124px 8px 8px; }
+  .toolbar { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; padding: 9px; }
+  .actions { align-items: end; }
+  .retention { grid-column: 1 / 2; }
+  .error { grid-column: 2 / -1; }
+}

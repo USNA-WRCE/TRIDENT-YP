@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchSettings, login, updateSettings, updateDeconflictionSettings } from "./api";
+import { deleteInfluxData, fetchSettings, listHistoricalVehicles, login, updateSettings, updateDeconflictionSettings } from "./api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -49,5 +49,31 @@ describe("authenticated API requests", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 403 }));
     await expect(updateSettings({ rtb_altitude_m: 30 })).rejects.toThrow("settings update failed: 403");
     await expect(updateDeconflictionSettings({ enabled: true })).rejects.toThrow("deconfliction settings update failed: 403");
+  });
+
+  it("loads historical vehicle IDs with the authenticated API session", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ vehicles: ["boat-01"], retention_seconds: 600 }), { status: 200 }),
+    );
+
+    await expect(listHistoricalVehicles()).resolves.toEqual({ vehicles: ["boat-01"], retention_seconds: 600 });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/openmct/vehicles",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("clears InfluxDB data through the authenticated delete endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
+
+    await expect(deleteInfluxData()).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/influxdb/data",
+      expect.objectContaining({
+        credentials: "include",
+        method: "DELETE",
+        body: JSON.stringify({ confirmation: "DELETE" }),
+      }),
+    );
   });
 });

@@ -385,6 +385,32 @@ export async function exportFlightLog(lastHours: number): Promise<Response> {
   return response;
 }
 
+export async function deleteInfluxData(): Promise<void> {
+  const response = await apiFetch("/api/influxdb/data", {
+    method: "DELETE",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ confirmation: "DELETE" }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(payload.error ?? `InfluxDB data deletion failed: ${response.status}`);
+  }
+}
+
+export interface HistoricalVehicleCatalog {
+  vehicles: string[];
+  retention_seconds: number;
+}
+
+export async function listHistoricalVehicles(): Promise<HistoricalVehicleCatalog> {
+  const response = await apiFetch("/api/openmct/vehicles", { headers: getAuthHeaders() });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(payload.error ?? `historical vehicle list failed: ${response.status}`);
+  }
+  return response.json();
+}
+
 // ===== Deconfliction API =====
 
 export interface DeconflictionSettings {
