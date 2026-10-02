@@ -68,6 +68,10 @@ instance/
 # Local authentication database
 data/auth/*.db
 data/auth/*.db-*
+data/vosk_models/
+
+# LIFEGUARD files, there for development purposes, not needed for production
+LIFEGUARD-yp_mob
 
 # Scrapy stuff:
 .scrapy

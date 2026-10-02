@@ -27,7 +27,7 @@ try:
 except ImportError:  # pragma: no cover
     _sar_missions = None  # type: ignore[assignment]
 
-from fastapi import Body, Cookie, FastAPI, Header, Query, WebSocket, WebSocketDisconnect
+from fastapi import Body, Cookie, FastAPI, Header, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from influxdb_client import InfluxDBClient, Point
@@ -47,6 +47,13 @@ from app.yolo_models import (
 from app.settings import get_deconfliction_settings, update_deconfliction_settings
 from app.settings import APPLICATION_SETTING_DEFAULTS, get_application_settings, update_application_settings
 from app.tiles import router as tile_router, TILE_MAX_CACHE_AGE_SECONDS
+from app.voice_commands import VoiceCommandError, parse_voice_command
+from app.voice_recognition import (
+    MAX_AUDIO_BYTES,
+    VoiceRecognitionError,
+    VoiceRecognitionUnavailable,
+    transcribe_audio,
+)
 
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
@@ -1545,6 +1552,71 @@ async def delete_video_stream(vehicle_id: str, authorization: Optional[str] = He
 async def get_settings() -> dict[str, Any]:
     """Return the current server-wide runtime settings."""
     return {**settings, "yp_role_vehicle_id": _yp_role_vehicle_id}
+
+
+@app.post("/api/voice/interpret")
+async def interpret_voice_command(request: Request) -> JSONResponse:
+    """Transcribe and interpret one command in memory; never return or persist the transcript."""
+    user = get_current_user(request.cookies.get("auth_token"))
+    if not user:
+        return JSONResponse({"error": "Authentication required. Please login."}, status_code=401)
+    if not any(
+        _check_command_permission(user, command_type)
+        for command_type in ("takeoff", "search_grid", "waypoint", "rtb", "land_on_boat")
+    ):
+        return JSONResponse({"error": "You do not have permission for voice commands."}, status_code=403)
+
+    try:
+        content_length = int(request.headers.get("content-length", "0"))
+    except ValueError:
+        return JSONResponse({"error": "Invalid audio content length."}, status_code=400)
+    if content_length > MAX_AUDIO_BYTES:
+        return JSONResponse({"error": "Recording is too large. Keep voice commands brief."}, status_code=413)
+    audio_chunks = []
+    audio_size = 0
+    async for chunk in request.stream():
+        audio_size += len(chunk)
+        if audio_size > MAX_AUDIO_BYTES:
+            return JSONResponse({"error": "Recording is too large. Keep voice commands brief."}, status_code=413)
+        audio_chunks.append(chunk)
+    audio = b"".join(audio_chunks)
+
+    try:
+        transcript = await asyncio.to_thread(transcribe_audio, audio)
+    except VoiceRecognitionUnavailable as error:
+        return JSONResponse({"error": str(error)}, status_code=503)
+    except VoiceRecognitionError as error:
+        return JSONResponse({"error": str(error)}, status_code=422)
+    if not transcript:
+        return JSONResponse({"error": "No speech was recognized. Try again."}, status_code=422)
+
+    selected_location = None
+    latitude = request.query_params.get("selected_latitude")
+    longitude = request.query_params.get("selected_longitude")
+    if latitude is not None or longitude is not None:
+        try:
+            selected_location = {"latitude": float(latitude), "longitude": float(longitude)}
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "Selected map point is invalid."}, status_code=400)
+
+    async with state_lock:
+        available_vehicles = [public_vehicle(vehicle) for vehicle in vehicles.values()]
+        yp_vehicle = _select_yp_vehicle_locked()
+        yp_vehicle_id = str(yp_vehicle.get("vehicle_id")) if yp_vehicle else None
+
+    try:
+        preview = parse_voice_command(
+            transcript,
+            available_vehicles,
+            yp_vehicle_id,
+            selected_location,
+            str(settings.get("voice_confirmation_mode", "risky")),
+        )
+    except VoiceCommandError as error:
+        return JSONResponse({"error": str(error)}, status_code=422)
+    if not _check_command_permission(user, preview["command"].get("type")):
+        return JSONResponse({"error": "You do not have permission for this voice command."}, status_code=403)
+    return JSONResponse(preview)
 
 
 @app.get("/api/rtcm/status")

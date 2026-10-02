@@ -1,0 +1,4 @@
+{$YP_HOST:yp.test} {
+	tls internal
+	reverse_proxy web:80
+}

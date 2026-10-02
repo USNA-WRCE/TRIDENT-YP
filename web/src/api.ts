@@ -15,6 +15,7 @@ export interface ServerSettings {
   land_on_boat_alignment_radius_m?: number;
   land_on_boat_auto_disarm?: boolean;
   land_on_boat_touchdown_dwell_s?: number;
+  voice_confirmation_mode?: "risky" | "all" | "none";
   yp_role_vehicle_id?: string | null;
   trail_seconds?: number;
   show_yp_range_rings?: boolean;
@@ -464,6 +465,36 @@ export function sendCommand(ws: WebSocket | null, vehicleId: string, command: Co
       command,
     }),
   );
+}
+
+export interface VoiceCommandPreview {
+  vehicle_id: string;
+  command: Command;
+  summary: string;
+  requires_confirmation: boolean;
+}
+
+export async function interpretVoiceCommand(
+  audio: Blob,
+  selectedLocation: { latitude: number; longitude: number } | null,
+): Promise<VoiceCommandPreview> {
+  const query = new URLSearchParams();
+  if (selectedLocation) {
+    query.set("selected_latitude", String(selectedLocation.latitude));
+    query.set("selected_longitude", String(selectedLocation.longitude));
+  }
+  const queryString = query.toString();
+  const suffix = queryString ? `?${queryString}` : "";
+  const response = await apiFetch(`/api/voice/interpret${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": audio.type || "application/octet-stream" },
+    body: audio,
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(result.error ?? `Voice command failed: ${response.status}`);
+  }
+  return result as VoiceCommandPreview;
 }
 
 export interface MobResult {

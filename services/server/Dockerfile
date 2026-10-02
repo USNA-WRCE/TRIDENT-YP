@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+	&& rm -rf /var/lib/apt/lists/*
 
 COPY services/server/requirements.txt .
 RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt

@@ -37,6 +37,7 @@ import { SITLPanel } from "./components/SITLPanel";
 import { VehicleModal } from "./components/VehicleModal";
 import { VideoViewer } from "./components/VideoViewer";
 import { CameraPanel } from "./components/CameraPanel";
+import { VoiceControl } from "./components/VoiceControl";
 import { HistoryExplorer } from "./components/HistoryExplorer";
 import { FitAllControl, FollowYpCenter, SarPatternOverlay, VehicleLayer, WaypointCrosshair, YpRangeRings, type WaypointMarker } from "./components/map/VehicleLayers";
 import { vehicleMarkerColor } from "./utils/vehicleStyle";
@@ -173,6 +174,8 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [landOnBoatTouchdownDwellS, setLandOnBoatTouchdownDwellS] = useState(1.5);
   const [settingsLoaded, setSettingsLoaded] = useState(DEMO_MODE);
   const [mapActionMenu, setMapActionMenu] = useState<MapActionMenuState | null>(null);
+  const [voiceSelectedLocation, setVoiceSelectedLocation] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [voiceConfirmationMode, setVoiceConfirmationMode] = useState<"risky" | "all" | "none">("risky");
   const [streamVehicleId, setStreamVehicleId] = useState<string | null>(null);
   const [preferredWaypointVehicleId, setPreferredWaypointVehicleId] = useState<string | null>(null);
   const [waypointMarkers, setWaypointMarkers] = useState<Record<string, WaypointMarker>>({});
@@ -515,6 +518,9 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         if (typeof serverSettings.mob_climb_speed_ms === "number") {
           setMobClimbSpeedMs(serverSettings.mob_climb_speed_ms);
         }
+        if (serverSettings.voice_confirmation_mode === "all" || serverSettings.voice_confirmation_mode === "none" || serverSettings.voice_confirmation_mode === "risky") {
+          setVoiceConfirmationMode(serverSettings.voice_confirmation_mode);
+        }
         if (typeof serverSettings.rtk_source_type === "string") {
           setRtkSourceType(serverSettings.rtk_source_type as any);
         }
@@ -596,6 +602,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         mob_corridor_half_width_m: mobCorridorHalfWidthM,
         mob_takeoff_altitude_m: mobTakeoffAltitudeM,
         mob_climb_speed_ms: mobClimbSpeedMs,
+        voice_confirmation_mode: voiceConfirmationMode,
         yp_role_vehicle_id: ypRoleVehicleId,
         rtk_source_type: rtkSourceType,
         rtk_host_or_port: rtkHostOrPort,
@@ -604,7 +611,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }).catch(() => undefined);
     }, 350);
     return () => window.clearTimeout(timeout);
-  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, rtbYpSafeDistanceM, landOnBoatHoverClearanceM, landOnBoatDescentRateMs, landOnBoatPadOffsetM, landOnBoatAlignmentRadiusM, landOnBoatAutoDisarm, landOnBoatTouchdownDwellS, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
+  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, rtbYpSafeDistanceM, landOnBoatHoverClearanceM, landOnBoatDescentRateMs, landOnBoatPadOffsetM, landOnBoatAlignmentRadiusM, landOnBoatAutoDisarm, landOnBoatTouchdownDwellS, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, voiceConfirmationMode, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
 
   useEffect(() => {
     if (DEMO_MODE) return;
@@ -858,7 +865,10 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                     <WindLayer yp={yp} showVectors={showWindOverlay} onToggleVectors={() => setShowWindOverlay((value) => !value)} />
           <MapZoomTracker onZoom={setMapZoom} />
           <MapCommander
-            onMapAction={(lat, lon, point) => setMapActionMenu({ lat, lon, x: point.x, y: point.y })}
+            onMapAction={(lat, lon, point) => {
+              setMapActionMenu({ lat, lon, x: point.x, y: point.y });
+              setVoiceSelectedLocation({ latitude: lat, longitude: lon });
+            }}
           />
           <MapPanTracker onManualPan={() => setFollowYp(false)} onPan={setMapCenter} />
           <FollowYpCenter yp={yp} enabled={followYp} onCenterChange={setMapCenter} />
@@ -1036,6 +1046,14 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           </div>
         </div>
         <div className="topbar-actions">
+          {!DEMO_MODE && currentUser.permissions.some((permission) => ["send_waypoint", "send_rtb", "search_grid", "arm_disarm"].includes(permission)) && (
+            <VoiceControl
+              canDispatch={socketConnected}
+              selectedLocation={voiceSelectedLocation}
+              onClearLocation={() => setVoiceSelectedLocation(null)}
+              onDispatch={(vehicleId, body) => socketConnected && command(vehicleId, body)}
+            />
+          )}
           {currentUser?.permissions.includes("manage_settings") && !VIEW_MODE && (
             <div className="flight-log-control">
               <button
@@ -1250,6 +1268,20 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 disabled={DEMO_MODE}
                 onChange={(event) => setMessageRetentionMinutes(Number(event.target.value))}
               />
+              {currentUser.permissions.includes("manage_settings") && (
+                <label>
+                  Voice command confirmation
+                  <select
+                    value={voiceConfirmationMode}
+                    disabled={DEMO_MODE}
+                    onChange={(event) => setVoiceConfirmationMode(event.target.value as "risky" | "all" | "none")}
+                  >
+                    <option value="risky">Confirm risky actions</option>
+                    <option value="all">Confirm every command</option>
+                    <option value="none">Dispatch without confirmation</option>
+                  </select>
+                </label>
+              )}
               {currentUser.permissions.includes("manage_users") && (
                 <section className="settings-danger-zone" aria-labelledby="influx-delete-title">
                   <div className="settings-danger-heading">

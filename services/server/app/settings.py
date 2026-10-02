@@ -76,6 +76,7 @@ APPLICATION_SETTING_DEFAULTS: dict[str, Any] = {
     "mob_corridor_half_width_m": 50.0,
     "mob_takeoff_altitude_m": 30.0,
     "mob_climb_speed_ms": 8.0,
+    "voice_confirmation_mode": "risky",
     "yp_role_vehicle_id": None,
     "rtk_source_type": "serial",
     "rtk_host_or_port": "/dev/ttyACM0",
@@ -141,6 +142,9 @@ def normalize_application_settings(payload: dict[str, Any]) -> dict[str, Any]:
             value = normalized_cameras
         elif key == "yp_role_vehicle_id":
             value = str(value).strip() if value and str(value).strip() else None
+        elif key == "voice_confirmation_mode":
+            if value not in ("risky", "all", "none"):
+                raise ValueError("voice_confirmation_mode must be risky, all, or none")
         elif key == "rtk_source_type":
             if value not in ("serial", "tcp", "udp", "disabled"):
                 raise ValueError("rtk_source_type must be serial, tcp, udp, or disabled")
