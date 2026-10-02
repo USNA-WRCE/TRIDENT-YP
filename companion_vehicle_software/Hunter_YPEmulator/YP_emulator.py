@@ -110,9 +110,11 @@ async def mavlink_loop(ws: websockets.WebSocketClientProtocol):
     asyncio.create_task(command_loop(ws, master))
 
     last_send = 0.0
+    last_mav_rx = time.time()
     while True:
         msg = master.recv_match(type=["GLOBAL_POSITION_INT", "GPS_RAW_INT", "GPS2_RAW"], blocking=False)
         if msg:
+            last_mav_rx = time.time()
             now = time.time()
             if msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
                 fix_type = getattr(msg, "fix_type", 0)
@@ -130,8 +132,9 @@ async def mavlink_loop(ws: websockets.WebSocketClientProtocol):
                 
                 await send_telemetry(ws, lat, lon, alt, heading, speed)
                 last_send = now
-        
-        await asyncio.sleep(0.01)
+        elif time.time() - last_mav_rx > 5.0:
+            raise ConnectionError("MAVLink connection lost (no telemetry for 5s)")
+                await asyncio.sleep(0.01)
 
 async def main():
     uri = f"{SERVER_WS_URL.rstrip('/')}/{VEHICLE_ID}"

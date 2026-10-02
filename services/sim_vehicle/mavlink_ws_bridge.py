@@ -122,6 +122,7 @@ async def telemetry_loop():
             #
 
             counter = 0
+            last_rx = time.time()
 
             while True:
 
@@ -137,7 +138,11 @@ async def telemetry_loop():
 
                 if msg is None:
                     print("[WARNING] No GLOBAL_POSITION_INT received")
+                    await asyncio.sleep(0.5)
+                    if time.time() - last_rx > 15.0:
+                        raise ConnectionError("MAVLink connection lost")
                     continue
+                last_rx = time.time()
 
                 counter += 1
 

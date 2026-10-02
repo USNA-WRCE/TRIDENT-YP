@@ -496,6 +496,7 @@ async def telemetry_loop() -> None:
             print("[SUCCESS] WebSocket connected!")
             counter = 0
             last_send_time = time.time()
+            last_mav_rx = time.time()
            
             while True:
                 # 1. Listen for incoming WebSocket commands (short timeout to avoid blocking)
@@ -629,6 +630,10 @@ async def telemetry_loop() -> None:
                 if not _sar_mission_lock.locked():
                     msg = master.recv_match(type=["GLOBAL_POSITION_INT", "GPS_RAW_INT", "GPS2_RAW"], blocking=False)
                
+                if msg is not None or _sar_mission_lock.locked():
+                    last_mav_rx = time.time()
+                elif time.time() - last_mav_rx > 5.0:
+                    raise ConnectionError("MAVLink connection lost (no telemetry for 5s)")
                 # 3. Process and send telemetry at the specified SEND_HZ rate
                 now = time.time()
                 telemetry_sample = None

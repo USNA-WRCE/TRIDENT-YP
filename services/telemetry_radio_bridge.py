@@ -549,6 +549,7 @@ async def read_mavlink_telemetry(
     master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, int(1e6 / 2), 0, 0, 0, 0, 0)
     master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0, mavutil.mavlink.MAVLINK_MSG_ID_GPS2_RAW, int(1e6 / 2), 0, 0, 0, 0, 0)
 
+    last_rx = time.time()
     while True:
         msg = await asyncio.to_thread(
             master.recv_match,
@@ -558,7 +559,12 @@ async def read_mavlink_telemetry(
         )
         if msg is None:
             print("[WARN] no GLOBAL_POSITION_INT message received")
+            # A closed socket returns instantly, so throttle and bail out on prolonged silence.
+            await asyncio.sleep(0.5)
+            if time.time() - last_rx > 15.0:
+                raise ConnectionError("MAVLink connection lost")
             continue
+        last_rx = time.time()
 
         if msg.get_type() == "EXTENDED_SYS_STATE":
             _landed_state = msg.landed_state
