@@ -754,6 +754,7 @@ async def _run_mavlink_bridge(
             last_pos_time = 0.0
             last_gps_fix_time = 0.0
             active_ship_relative: Optional[dict[str, Any]] = None
+            last_rx = time.time()
 
             while not _stop.is_set():
                 # Forward any outbound commands queued by the asyncio side
@@ -803,6 +804,7 @@ async def _run_mavlink_bridge(
                 # Pause telemetry reads while a SAR mission holds the connection
                 # (mission executor calls recv_match for ACKs — must not race)
                 if _sar_active.is_set():
+                    last_rx = time.time()
                     time.sleep(0.05)
                     continue
 
@@ -816,8 +818,13 @@ async def _run_mavlink_bridge(
                     timeout=0.1,
                 )
                 if msg is None:
+                    # On a closed socket recv returns instantly, so throttle and detect link loss.
+                    time.sleep(0.1)
+                    if time.time() - last_rx > 5.0:
+                        _link_lost.set()
+                        return
                     continue
-
+                last_rx = time.time()
                 msg_type = msg.get_type()
                 now = time.time()
 
@@ -845,13 +852,20 @@ async def _run_mavlink_bridge(
         # before calling recv_match so the two never race on ACK messages.
         _sar_active = threading.Event()
         _sar_stop_event = threading.Event()
-
+        _link_lost = threading.Event()
         io_thread = threading.Thread(target=_io_thread, args=(master,), daemon=True)
         io_thread.start()
 
         last_battery_pct: Optional[float] = None
 
         while True:
+            if _link_lost.is_set():
+                info["status"] = "error"
+                info["error"] = "MAVLink connection lost"
+                print(f"[SITL] {vehicle_id}: connection lost, stopping bridge")
+                await broadcast_ui({"op": "sitl_bridge_update", "bridge": dict(info)})
+                return
+
             # Route asyncio command queue -> IO thread or SAR mission thread.
             # Cap per-cycle command draining so high-rate RTB-follow updates
             # cannot starve inbound telemetry processing on the same event loop.
