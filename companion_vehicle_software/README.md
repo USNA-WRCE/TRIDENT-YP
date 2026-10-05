@@ -11,6 +11,7 @@ first build a self-contained bundle from the repository root:
 ```sh
 python3 companion_vehicle_software/bundle_bridge.py arducopter /tmp/arducopter_bcs_bridge
 python3 companion_vehicle_software/bundle_bridge.py blueboat /tmp/blueboat_bridge
+python3 companion_vehicle_software/bundle_bridge.py apache /tmp/apache_bridge
 ```
 
 Copy the resulting directory to the Pi. Inside that directory, activate your

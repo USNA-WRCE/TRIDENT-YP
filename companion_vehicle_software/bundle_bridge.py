@@ -12,6 +12,7 @@ from pathlib import Path
 import shutil
 
 BRIDGES = {
+    "apache": "apache_piScripts",
     "arducopter": "arducopter_piScripts",
     "blueboat": "blueboat_piScripts",
 }
@@ -24,7 +25,7 @@ def bundle_bridge(bridge: str, destination: Path) -> Path:
     destination = destination.resolve()
     if destination.is_relative_to(source):
         raise ValueError("The bundle destination must be outside the source directory")
-    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".venv", "venv")
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".venv", "venv", "apachenv")
     shutil.copytree(source, destination, ignore=ignore)
     shutil.copytree(companion_dir.parent / "yp_common", destination / "yp_common", ignore=ignore)
     return destination

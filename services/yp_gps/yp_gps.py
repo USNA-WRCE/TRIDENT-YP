@@ -10,6 +10,8 @@ from typing import Any, Coroutine, Optional
 import serial
 import websockets
 
+from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry
+
 
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://yp-server:8000/ws/vehicle")
 VEHICLE_ID = os.getenv("VEHICLE_ID", "yp")
@@ -95,7 +97,7 @@ async def sim_loop(ws: websockets.WebSocketClientProtocol, state: dict) -> None:
         state["lat"], state["lon"] = destination_point(
             state["lat"], state["lon"], state["heading"], state["speed_mps"] * dt
         )
-        await send_fix(ws, state["lat"], state["lon"], HOME_ALT, state["heading"])
+        await send_fix(ws, state["lat"], state["lon"], HOME_ALT, state["heading"], state["speed_mps"])
         await asyncio.sleep(1.0 / SEND_HZ)
 
 
@@ -105,59 +107,22 @@ async def serial_loop(ws: websockets.WebSocketClientProtocol) -> None:
             line = gps.readline().decode("ascii", errors="ignore").strip()
             parsed = parse_nmea(line)
             if parsed:
-                await send_fix(ws, parsed["latitude"], parsed["longitude"], parsed.get("altitude", 0.0), parsed.get("heading", 0.0))
+                await send_fix(ws, parsed["latitude"], parsed["longitude"], parsed.get("altitude", 0.0), parsed.get("heading", 0.0), parsed.get("speed_mps", 0.0))
             await asyncio.sleep(0)
 
 
-async def send_fix(ws: websockets.WebSocketClientProtocol, lat: float, lon: float, alt: float, heading: float) -> None:
-    sec, nanosec, stamp = ros_stamp()
-    messages = [
-        wrap("heartbeat", "yp_ground_station/msg/Heartbeat", stamp, {"mode": "ship-gps", "armed": False}),
-        wrap(
-            "navsatfix",
-            "sensor_msgs/msg/NavSatFix",
-            stamp,
-            {
-                "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "yp_gps"},
-                "status": {"status": 0, "service": 1},
-                "latitude": lat,
-                "longitude": lon,
-                "altitude": alt,
-                "position_covariance": [0.0] * 9,
-                "position_covariance_type": 0,
-                "heading": heading,
-            },
-        ),
-        wrap(
-            "pose",
-            "geometry_msgs/msg/Pose",
-            stamp,
-            {
-                "position": {"x": 0.0, "y": 0.0, "z": alt},
-                "orientation": yaw_to_quaternion(heading),
-                "heading": heading,
-            },
-        ),
-        wrap(
-            "battery",
-            "sensor_msgs/msg/BatteryState",
-            stamp,
-            {"voltage": 24.0, "current": 0.0, "percentage": 1.0, "present": True},
-        ),
-    ]
-    for msg in messages:
-        await ws.send(json.dumps(msg))
+MOVING_SPEED_MPS = 0.5
 
 
-def wrap(topic_suffix: str, msg_type: str, stamp: float, msg: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": "yp",
-        "topic": f"/vehicles/{VEHICLE_ID}/{topic_suffix}",
-        "type": msg_type,
-        "stamp": stamp,
-        "msg": msg,
-    }
+async def send_fix(ws: websockets.WebSocketClientProtocol, lat: float, lon: float, alt: float, heading: float, speed_mps: float = 0.0) -> None:
+    behavior = "underway" if speed_mps > MOVING_SPEED_MPS else BEHAVIOR_IDLE
+    payload = build_telemetry(
+        VEHICLE_ID, "yp",
+        latitude=lat, longitude=lon, altitude=alt, heading=heading,
+        behavior=behavior, mode="ship-gps", armed=False,
+        battery={"percentage": 1.0, "voltage": 24.0, "current": 0.0},
+    )
+    await ws.send(json.dumps(payload))
 
 
 def parse_nmea(line: str) -> Optional[dict[str, float]]:
@@ -176,6 +141,7 @@ def parse_nmea(line: str) -> Optional[dict[str, float]]:
             "latitude": nmea_coord(parts[3], parts[4]),
             "longitude": nmea_coord(parts[5], parts[6]),
             "heading": float(parts[8] or 0.0),
+            "speed_mps": float(parts[7] or 0.0) * KNOTS_TO_MPS,
         }
     return None
 
@@ -189,17 +155,6 @@ def nmea_coord(raw: str, hemisphere: str) -> float:
     if hemisphere in {"S", "W"}:
         value *= -1
     return value
-
-
-def ros_stamp() -> tuple[int, int, float]:
-    stamp = time.time()
-    sec = int(stamp)
-    return sec, int((stamp - sec) * 1_000_000_000), stamp
-
-
-def yaw_to_quaternion(yaw_deg: float) -> dict[str, float]:
-    half = math.radians(yaw_deg) / 2.0
-    return {"x": 0.0, "y": 0.0, "z": math.sin(half), "w": math.cos(half)}
 
 
 def destination_point(lat: float, lon: float, bearing: float, distance_m: float) -> tuple[float, float]:

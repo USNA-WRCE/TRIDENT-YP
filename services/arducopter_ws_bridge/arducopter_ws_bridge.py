@@ -18,6 +18,20 @@ from yp_common.geometry import (
     distance_m as _distance_m,
     north_east_delta_m as _north_east_delta_m,
 )
+from yp_common.telemetry import (
+    BEHAVIOR_ABSOLUTE_MISSION,
+    BEHAVIOR_IDLE,
+    BEHAVIOR_MOB_SEARCH,
+    BEHAVIOR_SEARCH_GRID,
+    BEHAVIOR_SHIP_RELATIVE,
+    BEHAVIOR_TAKEOFF,
+    EVENT_LAND_ON_BOAT_TOUCHDOWN,
+    BehaviorTracker,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
 
 VEHICLE_ID = os.getenv("VEHICLE_ID", "arducopter-uav")
 VEHICLE_TYPE = os.getenv("VEHICLE_TYPE", "uav")
@@ -82,61 +96,9 @@ _land_step_guided_forced = False
 _landed_state = 0  # MAV_LANDED_STATE_UNDEFINED until EXTENDED_SYS_STATE arrives
 _land_touchdown_since: float | None = None
 _land_touchdown_sent = False
-
-
-def create_navsatfix_message(lat: float, lon: float, alt: float, heading: float | None = None) -> dict:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-
-    payload = {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{VEHICLE_ID}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": {
-            "header": {
-                "stamp": {"sec": sec, "nanosec": nanosec},
-                "frame_id": "map",
-            },
-            "status": {"status": 0, "service": 1},
-            "latitude": lat,
-            "longitude": lon,
-            "altitude": alt,
-            "position_covariance": [0.0] * 9,
-            "position_covariance_type": 0,
-        },
-    }
-
-    if heading is not None:
-        payload["msg"]["heading"] = heading
-
-    return payload
-
-
-def create_gps_fix_message(msg) -> dict:
-    fix_type = getattr(msg, "fix_type", 0)
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    satellites_visible = getattr(msg, "satellites_visible", 255)
-    fix_labels = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed", 7: "Static", 8: "PPP"}
-    return {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{VEHICLE_ID}/gps_fix",
-        "type": f"mavlink/{msg.get_type()}",
-        "stamp": time.time(),
-        "msg": {
-            "fix_type": fix_type,
-            "fix_type_label": fix_labels.get(fix_type, "Unknown"),
-            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-        },
-    }
+behavior_tracker = BehaviorTracker()
+_current_mode: str | None = None
+_armed_state: bool | None = None
 
 
 def _ui_ws_url() -> str:
@@ -349,6 +311,7 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                     guided_requested_at = time.monotonic()
                 elif time.monotonic() - guided_requested_at > 1.0 and master.flightmode != "GUIDED":
                     print("[SHIP-REL] Safety pilot has taken control; halting ship-relative guidance")
+                    behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
                     return
             except Exception:
                 pass
@@ -399,6 +362,7 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
 
     if not hold_last_waypoint:
         print("[SHIP-REL] Mission complete.")
+    behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
 
 def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_guided=True):
     """Send vehicle to a waypoint.
@@ -566,7 +530,7 @@ def execute_land_step(master, command: dict) -> bool:
     return False
 
 async def telemetry_loop() -> None:
-    global _landed_state
+    global _landed_state, _current_mode, _armed_state
     print("\n==============================", flush=True)
     print(" ARDUCOPTER MAVLINK BRIDGE ", flush=True)
     print("==============================\n", flush=True)
@@ -641,16 +605,15 @@ async def telemetry_loop() -> None:
                             if cmd_type not in ("ship_relative_trajectory", "rtcm_data"):
                                 _stop_ship_relative_mission()
 
+                            if cmd_type != "rtcm_data":
+                                behavior_tracker.set(behavior_for_command(cmd_type, server_msg.get("source")))
+
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
                             elif cmd_type == "land_on_boat_step":
                                 if execute_land_step(master, command_data):
-                                    await ws.send(json.dumps({
-                                        "vehicle_id": VEHICLE_ID,
-                                        "type": "yp_ground_station/LandOnBoatTouchdown",
-                                        "msg": {"landed": True},
-                                        "stamp": time.time(),
-                                    }))
+                                    behavior_tracker.set(BEHAVIOR_IDLE)
+                                    await ws.send(json.dumps(build_event(VEHICLE_ID, VEHICLE_TYPE, EVENT_LAND_ON_BOAT_TOUCHDOWN)))
                             elif cmd_type == "waypoint": # simple one-shot goto command (in inertial frame) with lat/lon/alt in the payload
                                 target = command_data.get("target", {})
                                 source = server_msg.get("source")
@@ -772,7 +735,7 @@ async def telemetry_loop() -> None:
                 # consuming COMMAND_ACKs that the mission sequence is waiting for.
                 msg = None
                 if not _sar_mission_lock.locked():
-                    msg = master.recv_match(type=["GLOBAL_POSITION_INT", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW"], blocking=False)
+                    msg = master.recv_match(type=["GLOBAL_POSITION_INT", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW", "HEARTBEAT"], blocking=False)
                 if msg is not None or _sar_mission_lock.locked():
                     last_mav_rx = time.time()
                 elif time.time() - last_mav_rx > 5.0:
@@ -783,8 +746,18 @@ async def telemetry_loop() -> None:
                 telemetry_sample = None
                 if msg is not None and msg.get_type() == "EXTENDED_SYS_STATE":
                     _landed_state = msg.landed_state
+                elif msg is not None and msg.get_type() == "HEARTBEAT":
+                    _armed_state = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    try:
+                        _current_mode = master.flightmode
+                    except Exception:
+                        pass
+                    if not _armed_state:
+                        behavior_tracker.set(BEHAVIOR_IDLE)
+                    else:
+                        behavior_tracker.observe_mode(_current_mode)
                 elif msg is not None and msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
-                    await ws.send(json.dumps(create_gps_fix_message(msg)))
+                    await ws.send(json.dumps(build_telemetry(VEHICLE_ID, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                 elif msg is not None:
                     lat = msg.lat / 1e7
                     lon = msg.lon / 1e7
@@ -803,7 +776,7 @@ async def telemetry_loop() -> None:
 
                     lat, lon, alt, heading = telemetry_sample
 
-                    payload = create_navsatfix_message(lat, lon, alt, heading)
+                    payload = build_telemetry(VEHICLE_ID, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=_current_mode, armed=_armed_state)
                     json_payload = json.dumps(payload)
 
                     await ws.send(json_payload)
@@ -854,6 +827,8 @@ def _run_search_grid(
         except Exception as exc:
             print(f"[SAR] Search grid error: {exc}")
             traceback.print_exc()
+        finally:
+            behavior_tracker.finish(BEHAVIOR_SEARCH_GRID)
 
 
 def _run_mob_search(
@@ -892,6 +867,8 @@ def _run_mob_search(
         except Exception as exc:
             print(f"[SAR] MOB search error: {exc}")
             traceback.print_exc()
+        finally:
+            behavior_tracker.finish(BEHAVIOR_MOB_SEARCH)
 
 
 def _run_takeoff(master, altitude_m: float) -> None:
@@ -901,12 +878,21 @@ def _run_takeoff(master, altitude_m: float) -> None:
             time.sleep(0.3)
             if not sar_missions.arm_vehicle(master):
                 print("[MISSION] Takeoff arm failed")
+                behavior_tracker.finish(BEHAVIOR_TAKEOFF)
                 return
             time.sleep(0.3)
             master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, float("nan"), 0, 0, altitude_m)
             print(f"[MISSION] Takeoff command sent to {altitude_m}m")
+            deadline = time.time() + 60.0
+            while time.time() < deadline and behavior_tracker.get() == BEHAVIOR_TAKEOFF:
+                alt = _snapshot_vehicle_state().get("alt")
+                if alt is not None and alt >= altitude_m - 1.0:
+                    break
+                time.sleep(0.5)
+            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
         except Exception as exc:
             print(f"[MISSION] takeoff error: {exc}")
+            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
 
 
 def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guided_on_complete: bool) -> None:
@@ -920,11 +906,13 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
             )
             if not mission_items:
                 print("[MISSION] mission_plan has no valid waypoints.")
+                behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
                 return
 
             print(f"[MISSION] Uploading mission with {len(mission_items)} waypoints")
             if not sar_missions.upload_mission(master, mission_items):
                 print("[MISSION] Mission upload failed")
+                behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
                 return
 
             if auto_arm_start:

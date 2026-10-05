@@ -6,6 +6,17 @@ import traceback
 from pymavlink import mavutil
 import websockets
 
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    BEHAVIOR_LANDING,
+    BEHAVIOR_RETURN_TO_BOAT,
+    BEHAVIOR_TAKEOFF,
+    BEHAVIOR_WAYPOINT,
+    EVENT_MISSION_COMPLETE,
+    build_event,
+    build_telemetry,
+)
+
 VEHICLE_ID = "uav-mavlink-002"
 WS_URL = f"ws://localhost:8000/ws/vehicle/{VEHICLE_ID}"
 MAVLINK_URL = "udpin:127.0.0.1:14550"
@@ -13,40 +24,12 @@ MAVLINK_URL = "udpin:127.0.0.1:14550"
 # Waypoint offsets in degrees (approximately 100 meters at equator)
 WAYPOINT_OFFSET = 0.001
 
-def create_navsatfix_message(lat, lon, alt):
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-
-    return {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": "uav",
-        "topic": f"/vehicles/{VEHICLE_ID}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": {
-            "header": {
-                "stamp": {
-                    "sec": sec,
-                    "nanosec": nanosec
-                },
-                "frame_id": "map"
-            },
-            "status": {
-                "status": 0,
-                "service": 1
-            },
-            "latitude": lat,
-            "longitude": lon,
-            "altitude": alt,
-            "position_covariance": [
-                0, 0, 0,
-                0, 0, 0,
-                0, 0, 0
-            ],
-            "position_covariance_type": 0
-        }
-    }
+MISSION_PHASE_BEHAVIOR = {
+    "takeoff": BEHAVIOR_TAKEOFF,
+    "waypoints": BEHAVIOR_WAYPOINT,
+    "return_to_launch": BEHAVIOR_RETURN_TO_BOAT,
+    "landing": BEHAVIOR_LANDING,
+}
 
 def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30):
     """Send vehicle to a waypoint and wait for arrival"""
@@ -151,7 +134,15 @@ async def telemetry_stream_and_mission(master):
                     print(f"[POS] {current_lat:.6f}, {current_lon:.6f}, alt={current_alt:.2f}m")
                 
                 # Stream telemetry to server
-                payload = create_navsatfix_message(current_lat, current_lon, current_alt)
+                payload = build_telemetry(
+                    VEHICLE_ID,
+                    "uav",
+                    latitude=current_lat,
+                    longitude=current_lon,
+                    altitude=current_alt,
+                    heading=msg.hdg / 100.0 if msg.hdg != 65535 else None,
+                    behavior=MISSION_PHASE_BEHAVIOR.get(mission_phase, BEHAVIOR_IDLE),
+                )
                 json_payload = json.dumps(payload)
                 
                 try:
@@ -214,6 +205,8 @@ async def telemetry_stream_and_mission(master):
                             0, 0, 0, 0, 0, 0, 0
                         )
                         print("[SUCCESS] Mission complete!")
+                        await ws.send(json.dumps(build_telemetry(VEHICLE_ID, "uav", behavior=BEHAVIOR_IDLE, armed=False)))
+                        await ws.send(json.dumps(build_event(VEHICLE_ID, "uav", EVENT_MISSION_COMPLETE)))
                         break
                 
                 await asyncio.sleep(0.1)

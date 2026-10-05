@@ -4,6 +4,8 @@ import websockets
 import json
 import time
 
+from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry
+
 master = mavutil.mavlink_connection(
     "udpin:0.0.0.0:14550"
 )
@@ -23,18 +25,14 @@ async def bridge():
                 blocking=True
             )
 
-            payload = {
-                "vehicle_id": "blueboat-1",
-                "vehicle_type": "usv",
-                "topic": "/vehicles/blueboat-1/navsatfix",
-                "type": "sensor_msgs/msg/NavSatFix",
-                "stamp": time.time(),
-                "msg": {
-                    "latitude": msg.lat / 1e7,
-                    "longitude": msg.lon / 1e7,
-                    "altitude": msg.relative_alt / 1000.0
-                }
-            }
+            payload = build_telemetry(
+                "blueboat-1",
+                "usv",
+                latitude=msg.lat / 1e7,
+                longitude=msg.lon / 1e7,
+                altitude=msg.relative_alt / 1000.0,
+                behavior=BEHAVIOR_IDLE,
+            )
 
             await ws.send(json.dumps(payload))
 

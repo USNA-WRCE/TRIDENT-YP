@@ -8,6 +8,8 @@ from typing import Any
 import websockets
 from pymavlink import mavutil
 
+from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry, gps_block_from_mavlink
+
 # Configuration
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://192.168.0.25:8000/ws/vehicle")
 VEHICLE_ID = os.getenv("VEHICLE_ID", "yp")
@@ -15,59 +17,16 @@ SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyACM0")
 BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
 SEND_HZ = float(os.getenv("SEND_HZ", "5"))
 
-def ros_stamp() -> tuple[int, int, float]:
-    stamp = time.time()
-    sec = int(stamp)
-    return sec, int((stamp - sec) * 1_000_000_000), stamp
-
-def yaw_to_quaternion(yaw_deg: float) -> dict[str, float]:
-    half = math.radians(yaw_deg) / 2.0
-    return {"x": 0.0, "y": 0.0, "z": math.sin(half), "w": math.cos(half)}
-
-def wrap(topic_suffix: str, msg_type: str, stamp: float, msg: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": "yp",
-        "topic": f"/vehicles/{VEHICLE_ID}/{topic_suffix}",
-        "type": msg_type,
-        "stamp": stamp,
-        "msg": msg,
-    }
+MOVING_SPEED_MPS = 0.5
 
 async def send_telemetry(ws: websockets.WebSocketClientProtocol, lat: float, lon: float, alt: float, heading: float, speed: float):
-    sec, nanosec, stamp = ros_stamp()
-    
-    messages = [
-        wrap("heartbeat", "yp_ground_station/msg/Heartbeat", stamp, {"mode": "ship-gps", "armed": True}),
-        wrap(
-            "navsatfix",
-            "sensor_msgs/msg/NavSatFix",
-            stamp,
-            {
-                "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "yp_gps"},
-                "status": {"status": 0, "service": 1},
-                "latitude": lat,
-                "longitude": lon,
-                "altitude": alt,
-                "position_covariance": [0.0] * 9,
-                "position_covariance_type": 0,
-                "heading": heading,
-                "speed_mps": speed,
-            },
-        ),
-        wrap(
-            "pose",
-            "geometry_msgs/msg/Pose",
-            stamp,
-            {
-                "position": {"x": 0.0, "y": 0.0, "z": alt},
-                "orientation": yaw_to_quaternion(heading),
-                "heading": heading,
-            },
-        )
-    ]
-    for msg in messages:
-        await ws.send(json.dumps(msg))
+    behavior = "underway" if speed > MOVING_SPEED_MPS else BEHAVIOR_IDLE
+    payload = build_telemetry(
+        VEHICLE_ID, "yp",
+        latitude=lat, longitude=lon, altitude=alt, heading=heading,
+        behavior=behavior, mode="ship-gps", armed=True,
+    )
+    await ws.send(json.dumps(payload))
 
 async def command_loop(ws: websockets.WebSocketClientProtocol, master) -> None:
     # Listen for server commands (e.g. RTCM corrections) and forward them to the Cube
@@ -117,12 +76,7 @@ async def mavlink_loop(ws: websockets.WebSocketClientProtocol):
             last_mav_rx = time.time()
             now = time.time()
             if msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
-                fix_type = getattr(msg, "fix_type", 0)
-                eph, epv = getattr(msg, "eph", 65535), getattr(msg, "epv", 65535)
-                h_acc, v_acc = getattr(msg, "h_acc", None), getattr(msg, "v_acc", None)
-                satellites_visible = getattr(msg, "satellites_visible", 255)
-                labels = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed", 7: "Static", 8: "PPP"}
-                await ws.send(json.dumps(wrap("gps_fix", f"mavlink/{msg.get_type()}", now, {"fix_type": fix_type, "fix_type_label": labels.get(fix_type, "Unknown"), "satellites_visible": satellites_visible if satellites_visible != 255 else None, "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None), "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None)})))
+                await ws.send(json.dumps(build_telemetry(VEHICLE_ID, "yp", gps=gps_block_from_mavlink(msg), stamp=now)))
             elif (now - last_send) >= (1.0 / SEND_HZ):
                 lat = msg.lat / 1e7
                 lon = msg.lon / 1e7
@@ -134,7 +88,7 @@ async def mavlink_loop(ws: websockets.WebSocketClientProtocol):
                 last_send = now
         elif time.time() - last_mav_rx > 5.0:
             raise ConnectionError("MAVLink connection lost (no telemetry for 5s)")
-                await asyncio.sleep(0.01)
+        await asyncio.sleep(0.01)
 
 async def main():
     uri = f"{SERVER_WS_URL.rstrip('/')}/{VEHICLE_ID}"

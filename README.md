@@ -28,7 +28,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 
 - `yp-server`: FastAPI service with native vehicle WebSockets, a lightweight rosbridge-compatible WebSocket, REST APIs, on-demand map tile caching, command routing, automatic vehicle deconfliction, InfluxDB logging, and SQLite/JWT account authorization.
 - `web`: React, TypeScript, Leaflet, and Three.js UI with vehicle markers, headings, altitude labels, trails, YP range rings, map layers, commands, mission planning, live messages, login, user management, settings, and video playback.
-- `sim-vehicle`: Configurable simulated UAV, USV, UUV, or UGV. Publishes heartbeat, `NavSatFix`, `Pose`, `BatteryState`, and `MultiDOFJointTrajectory` messages at 5 Hz; supports SAR missions and temporary deconfliction detours.
+- `sim-vehicle`: Configurable simulated UAV, USV, UUV, or UGV. Publishes `telemetry` messages (position, heading, behavior, mode, armed, battery) at 5 Hz and `mission_complete` events; supports SAR missions and temporary deconfliction detours.
 - `sim-umaa`: Loopback UMAA vehicle for testing the ground-station workflow before real DDS topics are available.
 - `yp-gps`: Simulated or serial NMEA YP GPS publisher.
 - `arducopter_ws_bridge`: Hardware WebSocket bridge for real ArduPilot/MAVLink vehicles.
@@ -92,7 +92,7 @@ The top bar provides these navigation modes and tools:
 | Local Waypoint Planner | Build ship-relative waypoint trajectories using the current YP position |
 | Vehicle Connections | Connect network MAVLink endpoints or RFD-900 serial radios |
 | Settings | Display, vessel, deconfliction, and MOB configuration |
-| Messages | Live message drawer with per-topic filtering and retained snapshots |
+| Messages | Live message drawer filtered by vehicle and message kind, with retained snapshots |
 | User Management | Available to accounts with `manage_users` |
 | Logout | End the current session |
 
@@ -128,13 +128,13 @@ The RTK source fields are `rtk_source_type`, `rtk_host_or_port`, `rtk_network_po
 
 ### Flight log export
 
-Users with the `manage_settings` permission can open the disk icon in the top toolbar, choose a duration, and download retained `yp_messages` data. Exports are gzip-compressed JSON Lines (`.jsonl.gz`) files that can be opened with standard tools on Windows, macOS, and Linux. The first decompressed line contains metadata, followed by records with `timestamp`, `vehicle_id`, `vehicle_type`, and `fields`; heartbeat messages are excluded.
+Users with the `manage_settings` permission can open the disk icon in the top toolbar, choose a duration, and download retained `yp_messages` data. Exports are gzip-compressed JSON Lines (`.jsonl.gz`) files that can be opened with standard tools on Windows, macOS, and Linux. The first decompressed line contains metadata, followed by records with `timestamp`, `vehicle_id`, `vehicle_type`, `kind`, and `fields`.
 
 On Linux or macOS, this is a gzip-compressed text file rather than a tar archive. Use `gzip -t flight-log.jsonl.gz` to validate it, then `gzip -dk flight-log.jsonl.gz` to create `flight-log.jsonl` while keeping the compressed file. Do not use `tar -xzf`, which expects a `.tar.gz` archive and can report `missing type keyword in mtree specification` for this file. On Windows, 7-Zip can extract the `.gz` file directly.
 
 Exports do not modify InfluxDB and include only data still retained there. The `message_retention_seconds` setting may remove older records before they can be exported.
 
-By default, `yp-server` also writes a shutdown export when stopped cleanly with Ctrl+C, `docker compose stop`, or `docker compose down`. It saves a gzip-compressed JSON Lines file named `yp-flight-log-<start>-<end>.jsonl.gz` under `data/logs/` (mounted into the container as `/data/logs`). This automatic copy covers the current server run and retained non-heartbeat records. It can be disabled with `LOG_EXPORT_ON_SHUTDOWN=false`; `LOG_EXPORT_DIR` changes the destination. Compose allows 30 seconds for the export to finish during shutdown. A forced kill or unavailable InfluxDB can prevent the file from being written.
+By default, `yp-server` also writes a shutdown export when stopped cleanly with Ctrl+C, `docker compose stop`, or `docker compose down`. It saves a gzip-compressed JSON Lines file named `yp-flight-log-<start>-<end>.jsonl.gz` under `data/logs/` (mounted into the container as `/data/logs`). This automatic copy covers the current server run and retained records. It can be disabled with `LOG_EXPORT_ON_SHUTDOWN=false`; `LOG_EXPORT_DIR` changes the destination. Compose allows 30 seconds for the export to finish during shutdown. A forced kill or unavailable InfluxDB can prevent the file from being written.
 
 ### Historical telemetry analysis
 
@@ -524,7 +524,7 @@ GET /api/deconfliction/conflicts
 
 ### UMAA
 
-The default `sim-umaa` loopback bridge publishes heartbeat, `NavSatFix`, battery, and bridge-status messages, moves toward waypoints, and accepts waypoint, RTB, and SAR commands. Smoke-test it with:
+The default `sim-umaa` loopback bridge publishes `telemetry` (position, battery, mode, behavior) messages and `mission_complete` events, moves toward waypoints, and accepts waypoint, RTB, and SAR commands. Smoke-test it with:
 
 ```bash
 docker compose up --build sim-umaa
@@ -569,22 +569,37 @@ Native vehicle clients connect to:
 ws://<server-host>:8000/ws/vehicle/<vehicle_id>
 ```
 
-Messages use ROS-shaped JSON, for example:
+Messages use a compact unified JSON schema. Position, orientation, status, and the vehicle's current behavior travel in one `telemetry` message; optional blocks are omitted when unknown, and partial messages (for example GPS-only) merge into the vehicle's state:
 
 ```json
 {
+  "op": "telemetry",
   "vehicle_id": "uav-alpha",
   "vehicle_type": "uav",
-  "topic": "/vehicles/uav-alpha/navsatfix",
-  "type": "sensor_msgs/msg/NavSatFix",
   "stamp": 1778952000.25,
-  "msg": { "latitude": 38.982, "longitude": -76.483, "altitude": 45.0 }
+  "position": { "latitude": 38.982, "longitude": -76.483, "altitude": 45.0 },
+  "heading": 112.5,
+  "behavior": "search_grid",
+  "mode": "GUIDED",
+  "armed": true,
+  "battery": { "percentage": 0.82, "voltage": 22.4, "current": 11.0 },
+  "gps": { "fix_type": 6, "fix_type_label": "RTK Fixed", "satellites": 18, "h_acc_m": 0.02, "v_acc_m": 0.03 }
 }
 ```
 
-Commands return over the same socket. The YP rosbridge-like endpoint is `ws://<server-host>:8000/ws/rosbridge` and supports `publish`, `subscribe`, `unsubscribe`, and `command`. The PX4 profile uses a real `rosbridge_server` container before converting ROS messages to the native YP contract.
+`behavior` is a free-text description of what the vehicle is doing. Bridges use `idle`, `waypoint`, `search_grid`, `mob_search`, `return_to_boat`, `landing`, `ship_relative_mission`, `absolute_mission`, `takeoff`, and `manual`. The vehicle modal shows it as **Behavior**, and each bridge status page displays it too. One-shot occurrences are separate messages, and they are not behavior transitions:
 
-Supported ROS-shaped message families include `NavSatFix`, `Pose`, `PoseStamped`, `BatteryState`, `Imu`, `MultiDOFJointTrajectory`, `mavros_msgs/State`, and `mavros_msgs/GlobalPositionTarget`.
+```json
+{ "op": "event", "vehicle_id": "uav-alpha", "stamp": 1778952100.0, "event": "mission_complete" }
+```
+
+Supported events are `mission_complete` and `land_on_boat_touchdown`. Builders and the behavior tracker live in `yp_common/telemetry.py`.
+
+InfluxDB stores these in `yp_messages` with tags `vehicle_id`, `vehicle_type`, and `kind` (`telemetry`, `command`, or `event`). Telemetry fields are `latitude`, `longitude`, `altitude`, `heading`, `behavior`, `mode`, `armed`, `battery_percentage`, `battery_voltage`, `battery_current`, `gps_fix_type`, `gps_satellites`, `gps_h_acc_m`, and `gps_v_acc_m`; these names are what OpenMCT plots. Data written before this schema change keeps its old tags and does not group with new points.
+
+Commands return over the same socket. The YP rosbridge-like endpoint is `ws://<server-host>:8000/ws/rosbridge` and supports `subscribe`, `unsubscribe`, and `command`; subscribers receive `/vehicles/<id>/navsatfix` and `/vehicles/<id>/commands`. Inbound `publish` is no longer accepted. The PX4 profile uses a real `rosbridge_server` container before the bridge aggregates ROS messages into native `telemetry` messages.
+
+Supported ROS-shaped message families include `mavros_msgs/State`, `NavSatFix`, `BatteryState`, and `mavros_msgs/GlobalPositionTarget`, which the MAVROS bridges consume to build `telemetry` messages.
 
 ## Maps, GPS, and configuration
 
@@ -604,7 +619,7 @@ CIRCLE_RIGHT_LON: "-76.479393"
 CIRCLE_CW: "true"
 ```
 
-For real NMEA GPS, use `GPS_MODE: serial`, set `SERIAL_PORT` and `BAUD_RATE`, and pass the device through to the container. The publisher provides YP `NavSatFix`, `Pose`, `BatteryState`, and heartbeat messages.
+For real NMEA GPS, use `GPS_MODE: serial`, set `SERIAL_PORT` and `BAUD_RATE`, and pass the device through to the container. The provider publishes YP `telemetry` messages (position, heading, battery, behavior).
 
 ### Map tiles
 
@@ -668,7 +683,7 @@ Runtime viewing caches only tiles requested by the active viewport. It does not 
 | `px4-yp-bridge` | `SETPOINT_HZ` | `5` | Setpoint rate |
 | `px4-yp-bridge` | `AUTO_ARM_OFFBOARD` | `true` | Arm and request Offboard |
 | `px4-yp-bridge` | `GLOBAL_SETPOINT_FRAME` | `6` | MAVROS coordinate frame |
-| `px4-yp-bridge` | `DISCOVER_MAVROS_TOPICS` | `true` | Discover `/mavros/...` topics |
+| `px4-yp-bridge` | `TELEMETRY_HZ` | `5` | Telemetry send rate |
 
 ## Development
 
