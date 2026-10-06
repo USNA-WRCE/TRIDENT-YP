@@ -2,9 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY services/umaa_bridge/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY --from=yp_common . ./yp_common
 COPY umaa_bridge.py .
 COPY umaa_bridge_wServer.py .
 

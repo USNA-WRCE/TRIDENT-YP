@@ -84,7 +84,6 @@
             openmct.install(openmct.plugins.LocalStorage());
             openmct.install(openmct.plugins.Espresso());
             openmct.install(openmct.plugins.Plot());
-            openmct.install(openmct.plugins.TelemetryTable());
             openmct.install(openmct.plugins.MyItems()); // Enables sidebar tree navigation
 
             // 2. Register UTC Time System
@@ -126,6 +125,12 @@
 
             // Set default time system to UTC
             openmct.time.timeSystem('utc', initialBounds);
+
+            openmct.types.addType('telemetry.telemetryPoint', {
+                name: 'Telemetry Point',
+                description: 'Vehicle telemetry value',
+                cssClass: 'icon-telemetry'
+            });
 
             // 4. Define Vehicle Taxonomy & Register Under "My Items" (mine)
             const STRING_FIELDS = new Set(['behavior', 'mode']);

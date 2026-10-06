@@ -309,6 +309,8 @@ services:
     build:
       context: ./companion_vehicle_software/umaa_piScripts
       network: host
+      additional_contexts:
+        yp_common: ./yp_common
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
       VEHICLE_ID: sim-umaa
