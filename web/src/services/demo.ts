@@ -2,12 +2,16 @@ import { bearingDegrees, destinationPoint, haversineMeters, localToGlobalWaypoin
 import type { Command, Vehicle, VehicleType } from "../types";
 
 export interface DemoMessagePayload {
+  op: "telemetry";
   vehicle_id: string;
   vehicle_type: VehicleType;
-  topic: string;
-  type: string;
   stamp: number;
-  msg: Record<string, unknown>;
+  position: { latitude: number; longitude: number; altitude: number };
+  heading: number;
+  behavior: string;
+  mode: string;
+  armed: boolean;
+  battery: { percentage: number; voltage: number; current: number };
 }
 
 export interface DemoVehicle {
@@ -32,7 +36,6 @@ export interface DemoVehicle {
   shipRelativeHoldLast: boolean;
   mode: string;
   history: Vehicle["history"];
-  messages: Vehicle["messages"];
   localX: number;
   localY: number;
 }
@@ -62,7 +65,7 @@ export function createDemoVehicles(): DemoVehicle[] {
 }
 
 function createDemoVehicle(vehicle_id: string, vehicle_type: VehicleType, lat: number, lon: number, alt: number, heading: number, speed: number, batteryDrainPerSecond: number, battery = 0.86): DemoVehicle {
-  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, shipRelativeFaceShip: false, shipRelativeHoldLast: false, mode: "loiter", history: [], messages: {}, localX: 0, localY: 0 };
+  return { vehicle_id, vehicle_type, lat, lon, alt, heading, speed, battery: vehicle_type === "yp" ? 1 : battery, batteryDrainPerSecond, marker_color: vehicleColor(vehicle_type), manualWaypoint: false, target: randomDemoTarget(lat, lon, alt), missionWaypoints: [], shipRelativeWaypoints: [], shipRelativeIndex: 0, shipRelativeFaceShip: false, shipRelativeHoldLast: false, mode: "loiter", history: [], localX: 0, localY: 0 };
 }
 
 export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number, vehicles: DemoVehicle[]): DemoMessagePayload[] {
@@ -74,7 +77,7 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
     vehicle.localX += Math.sin((vehicle.heading * Math.PI) / 180) * YP_DEMO_SPEED_MPS * dt;
     vehicle.localY += Math.cos((vehicle.heading * Math.PI) / 180) * YP_DEMO_SPEED_MPS * dt;
     vehicle.history = [...(vehicle.history ?? []), { stamp, latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt }].slice(-500);
-    return recordDemoMessages(vehicle, stamp);
+    return [demoTelemetry(vehicle, stamp)];
   }
 
   const yp = vehicles.find((candidate) => candidate.vehicle_type === "yp");
@@ -139,11 +142,11 @@ export function stepDemoVehicle(vehicle: DemoVehicle, dt: number, stamp: number,
   }
   vehicle.battery = Math.max(0.05, vehicle.battery - dt * vehicle.batteryDrainPerSecond);
   vehicle.history = [...(vehicle.history ?? []), { stamp, latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt }].slice(-500);
-  return recordDemoMessages(vehicle, stamp);
+  return [demoTelemetry(vehicle, stamp)];
 }
 
 export function demoVehicleSnapshot(vehicle: DemoVehicle): Vehicle {
-  return { vehicle_id: vehicle.vehicle_id, vehicle_type: vehicle.vehicle_type, connected: true, last_seen: Date.now() / 1000, last_seen_age: 0, position: { latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt }, history: vehicle.history, heading: vehicle.heading, battery: { percentage: vehicle.battery, voltage: 22.2 * vehicle.battery, current: -4 }, messages: vehicle.messages, marker_color: vehicle.marker_color } as Vehicle & { marker_color: string };
+  return { vehicle_id: vehicle.vehicle_id, vehicle_type: vehicle.vehicle_type, connected: true, last_seen: Date.now() / 1000, last_seen_age: 0, position: { latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt }, history: vehicle.history, heading: vehicle.heading, battery: { percentage: vehicle.battery, voltage: 22.2 * vehicle.battery, current: -4 }, behavior: demoBehavior(vehicle), mode: vehicle.mode, armed: true, marker_color: vehicle.marker_color } as Vehicle & { marker_color: string };
 }
 
 export function handleDemoCommand(vehicles: DemoVehicle[], vehicleId: string, command: Command): void {
@@ -180,26 +183,32 @@ export function updateDemoVehicleColor(vehicles: DemoVehicle[], vehicleId: strin
   if (vehicle) vehicle.marker_color = color;
 }
 
-function recordDemoMessages(vehicle: DemoVehicle, stamp: number): DemoMessagePayload[] {
-  const messages = demoMessages(vehicle, stamp);
-  for (const message of messages) vehicle.messages[message.topic] = { type: message.type, stamp, msg: message.msg };
-  return messages;
+function demoBehavior(vehicle: DemoVehicle): string {
+  if (vehicle.vehicle_type === "yp") return "underway";
+  switch (vehicle.mode) {
+    case "waypoint": return "waypoint";
+    case "ship_relative": return "ship_relative_mission";
+    case "mission_plan": return "absolute_mission";
+    case "rtb": return "return_to_boat";
+    case "landing": return "landing";
+    case "search_grid": return "search_grid";
+    default: return "idle";
+  }
 }
 
-function demoMessages(vehicle: DemoVehicle, stamp: number): DemoMessagePayload[] {
-  const topic = (suffix: string) => `/vehicles/${vehicle.vehicle_id}/${suffix}`;
-  const quat = yawToQuaternion(vehicle.heading);
-  return [
-    wrapDemoMessage(vehicle, topic("heartbeat"), "yp_ground_station/msg/Heartbeat", stamp, { mode: vehicle.mode, armed: true }),
-    wrapDemoMessage(vehicle, topic("navsatfix"), "sensor_msgs/msg/NavSatFix", stamp, { latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt, heading: vehicle.heading, status: { status: 0, service: 1 } }),
-    wrapDemoMessage(vehicle, topic("pose"), "geometry_msgs/msg/Pose", stamp, { position: { x: vehicle.localX, y: vehicle.localY, z: vehicle.alt }, orientation: quat, heading: vehicle.heading }),
-    wrapDemoMessage(vehicle, topic("battery"), "sensor_msgs/msg/BatteryState", stamp, { voltage: 22.2 * vehicle.battery, current: -4, percentage: vehicle.battery, present: true }),
-    wrapDemoMessage(vehicle, topic("trajectory"), "trajectory_msgs/msg/MultiDOFJointTrajectory", stamp, { points: [{ transforms: [{ translation: { x: vehicle.localX, y: vehicle.localY, z: vehicle.alt }, rotation: quat }] }] }),
-  ];
-}
-
-function wrapDemoMessage(vehicle: DemoVehicle, topic: string, type: string, stamp: number, msg: Record<string, unknown>): DemoMessagePayload {
-  return { vehicle_id: vehicle.vehicle_id, vehicle_type: vehicle.vehicle_type, topic, type, stamp, msg };
+function demoTelemetry(vehicle: DemoVehicle, stamp: number): DemoMessagePayload {
+  return {
+    op: "telemetry",
+    vehicle_id: vehicle.vehicle_id,
+    vehicle_type: vehicle.vehicle_type,
+    stamp,
+    position: { latitude: vehicle.lat, longitude: vehicle.lon, altitude: vehicle.alt },
+    heading: vehicle.heading,
+    behavior: demoBehavior(vehicle),
+    mode: vehicle.mode,
+    armed: true,
+    battery: { percentage: vehicle.battery, voltage: 22.2 * vehicle.battery, current: -4 },
+  };
 }
 
 function seedForwardDemoWaypoints(vehicles: DemoVehicle[]): void {
@@ -231,7 +240,6 @@ function sternTargetForYp(yp: DemoVehicle, vehicle: DemoVehicle): DemoVehicle["t
   return { latitude: target.latitude, longitude: target.longitude, altitude: vehicle.vehicle_type === "uuv" ? -5 : vehicle.vehicle_type === "uav" ? 35 : 0 };
 }
 function smoothDegrees(current: number, target: number, ratio: number): number { const delta = ((((target - current) % 360) + 540) % 360) - 180; return (current + delta * ratio + 360) % 360; }
-function yawToQuaternion(yawDeg: number): Record<string, number> { const half = (yawDeg * Math.PI) / 360; return { x: 0, y: 0, z: Math.sin(half), w: Math.cos(half) }; }
 
 function vehicleColor(vehicleType: VehicleType): string { return { uav: "#dc2626", uavf: "#b91c1c", usv: "#16a34a", ugv: "#b45309", uuv: "#eab308", yp: "#6b7280" }[vehicleType]; }
 function assignedVehicleColor(vehicleType: VehicleType, index: number): string { return lightenHex(vehicleColor(vehicleType), Math.min(index * 0.18, 0.5)); }

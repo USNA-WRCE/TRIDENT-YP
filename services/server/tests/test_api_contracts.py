@@ -64,13 +64,14 @@ class APIContractTests(DatabaseTestCase):
             self.assertEqual(ui.receive_json()["op"], "snapshot")
             with self.client.websocket_connect("/ws/vehicle/boat-01") as vehicle:
                 vehicle.send_json({
-                    "vehicle_type": "usv", "topic": "/vehicles/boat-01/navsatfix",
-                    "type": "sensor_msgs/msg/NavSatFix",
-                    "msg": {"latitude": 38.9, "longitude": -76.4, "altitude": 1, "heading": 45},
+                    "op": "telemetry", "vehicle_type": "usv", "behavior": "waypoint",
+                    "position": {"latitude": 38.9, "longitude": -76.4, "altitude": 1}, "heading": 45,
                 })
                 update = ui.receive_json()
                 self.assertEqual(update["op"], "vehicle_update")
                 self.assertEqual(update["vehicle"]["position"]["latitude"], 38.9)
+                self.assertEqual(update["vehicle"]["behavior"], "waypoint")
+                self.assertEqual(update["vehicle"]["heading"], 45)
                 self.assertNotIn("history", update["vehicle"])
                 command = {"type": "waypoint", "target": {"latitude": 38.91, "longitude": -76.41, "altitude": 10}}
                 ui.send_json({"op": "command", "vehicle_id": "boat-01", "command": command})
@@ -86,16 +87,36 @@ class APIContractTests(DatabaseTestCase):
         self.assertNotIn("boat-01", main.vehicle_queues)
         self.assertEqual(self.client.get("/api/vehicles/boat-01").status_code, 404)
 
-    def test_rosbridge_publish_updates_subscribers_and_http_vehicle_state(self):
+    def test_gps_only_telemetry_merges_into_vehicle_state(self):
+        with self.client.websocket_connect("/ws/ui") as ui:
+            ui.receive_json()
+            with self.client.websocket_connect("/ws/vehicle/boat-01") as vehicle:
+                vehicle.send_json({"op": "telemetry", "position": {"latitude": 38.9, "longitude": -76.4, "altitude": 0}, "behavior": "idle"})
+                ui.receive_json()
+                vehicle.send_json({"op": "telemetry", "behavior": "idle", "gps": {"fix_type": 6, "fix_type_label": "RTK Fixed", "satellites": 18, "h_acc_m": 0.02}})
+                update = ui.receive_json()["vehicle"]
+        self.assertEqual(update["position"]["latitude"], 38.9)
+        self.assertEqual(update["gps_fix"]["fix_type_label"], "RTK Fixed")
+        self.assertEqual(update["gps_fix"]["satellites_visible"], 18)
+
+    def test_touchdown_event_is_broadcast_to_ui(self):
+        with self.client.websocket_connect("/ws/ui") as ui:
+            ui.receive_json()
+            with self.client.websocket_connect("/ws/vehicle/uav-01") as vehicle:
+                vehicle.send_json({"op": "event", "event": "land_on_boat_touchdown"})
+                self.assertEqual(ui.receive_json(), {"op": "land_on_boat_touchdown", "vehicle_id": "uav-01"})
+
+    def test_rosbridge_subscriber_receives_navsatfix_derived_from_telemetry(self):
         topic = "/vehicles/boat-01/navsatfix"
         with self.client.websocket_connect("/ws/rosbridge") as ros:
             self.assertEqual(ros.receive_json()["op"], "status")
             ros.send_json({"op": "subscribe", "topic": topic})
             self.assertEqual(ros.receive_json()["op"], "status")
-            message = {"latitude": 38.9, "longitude": -76.4, "altitude": 0}
-            ros.send_json({"op": "publish", "topic": topic, "type": "sensor_msgs/msg/NavSatFix", "msg": message})
-            self.assertEqual(ros.receive_json(), {"op": "publish", "topic": topic, "type": "sensor_msgs/msg/NavSatFix", "msg": message})
-            self.assertEqual(self.client.get("/api/vehicles/boat-01").json()["position"], message)
+            with self.client.websocket_connect("/ws/vehicle/boat-01") as vehicle:
+                vehicle.send_json({"op": "telemetry", "position": {"latitude": 38.9, "longitude": -76.4, "altitude": 0}})
+                published = ros.receive_json()
+            self.assertEqual(published["topic"], topic)
+            self.assertEqual(published["msg"]["latitude"], 38.9)
 
     def test_local_planner_requires_mission_permission(self):
         auth.create_user("viewer", "password", "view_only")

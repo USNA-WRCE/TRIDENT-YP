@@ -6,59 +6,13 @@ import traceback
 from pymavlink import mavutil
 import websockets
 
+from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry
+
 VEHICLE_ID = "uav-mavlink-001"
 
 WS_URL = f"ws://localhost:8000/ws/vehicle/{VEHICLE_ID}"
 
 MAVLINK_URL = "udpin:127.0.0.1:14550"
-
-
-def create_navsatfix_message(lat, lon, alt):
-
-    now = time.time()
-
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-
-    return {
-        "vehicle_id": VEHICLE_ID,
-
-        "vehicle_type": "uav",
-
-        "topic": f"/vehicles/{VEHICLE_ID}/navsatfix",
-
-        "type": "sensor_msgs/msg/NavSatFix",
-
-        "stamp": now,
-
-        "msg": {
-            "header": {
-                "stamp": {
-                    "sec": sec,
-                    "nanosec": nanosec
-                },
-                "frame_id": "map"
-            },
-
-            "status": {
-                "status": 0,
-                "service": 1
-            },
-
-            "latitude": lat,
-            "longitude": lon,
-            "altitude": alt,
-
-            "position_covariance": [
-                0, 0, 0,
-                0, 0, 0,
-                0, 0, 0
-            ],
-
-            "position_covariance_type": 0
-        }
-    }
-
 
 
 async def telemetry_loop():
@@ -168,10 +122,14 @@ async def telemetry_loop():
                 # BUILD JSON PAYLOAD
                 #
 
-                payload = create_navsatfix_message(
-                    lat,
-                    lon,
-                    alt
+                payload = build_telemetry(
+                    VEHICLE_ID,
+                    "uav",
+                    latitude=lat,
+                    longitude=lon,
+                    altitude=alt,
+                    heading=msg.hdg / 100.0 if msg.hdg != 65535 else None,
+                    behavior=BEHAVIOR_IDLE,
                 )
 
                 json_payload = json.dumps(payload)

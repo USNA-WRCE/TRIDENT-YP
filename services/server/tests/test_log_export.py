@@ -69,8 +69,7 @@ class FlightLogExportTests(unittest.TestCase):
                 "_time": datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc),
                 "vehicle_id": "boat-01",
                 "vehicle_type": "usv",
-                "topic": "/boat-01/nav",
-                "msg_type": "sensor/Nav",
+                "kind": "telemetry",
                 "latitude": 38.9,
                 "longitude": -76.4,
             }
@@ -84,40 +83,35 @@ class FlightLogExportTests(unittest.TestCase):
         lines = [json.loads(line) for line in gzip.decompress(body).decode().splitlines()]
         self.assertEqual(lines[0]["format"], "yp-ground-station-log")
         self.assertEqual(lines[1]["fields"]["latitude"], 38.9)
-        self.assertNotIn("topic", lines[1])
-        self.assertNotIn("message_type", lines[1])
+        self.assertEqual(lines[1]["kind"], "telemetry")
+        self.assertNotIn("kind", lines[1]["fields"])
         self.assertIn("attachment", response.headers["content-disposition"])
 
-    def test_heartbeat_records_are_excluded_from_export(self):
-        records = [
-            FakeRecord({"_time": datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc), "vehicle_id": "boat-01", "msg_type": "Heartbeat", "topic": "/heartbeat"}),
-            FakeRecord({"_time": datetime(2026, 9, 2, 12, 0, 1, tzinfo=timezone.utc), "vehicle_id": "boat-01", "msg_type": "sensor/Nav", "topic": "/nav", "latitude": 38.9}),
-        ]
-        with patch.object(main, "require_permission", return_value=None), patch.object(
-            main, "query_api", FakeQueryApi(records)
-        ):
-            response = self.export()
-            body = response.content
-
-        lines = [json.loads(line) for line in gzip.decompress(body).decode().splitlines()]
-        self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[1]["fields"]["latitude"], 38.9)
-
-    def test_writer_ignores_heartbeat_payloads(self):
+    def test_writer_builds_tagged_point_with_stable_fields(self):
         while not main._influx_write_queue.empty():
             main._influx_write_queue.get_nowait()
         with patch.object(main, "write_api", object()):
-            main.write_influx(
-                {
-                    "vehicle_id": "boat-01",
-                    "vehicle_type": "usv",
-                    "topic": "/boat-01/heartbeat",
-                    "type": "yp_ground_station/msg/Heartbeat",
-                    "stamp": 1756814400.0,
-                    "msg": {"mode": "loiter"},
-                }
-            )
-        self.assertTrue(main._influx_write_queue.empty())
+            main.write_influx("telemetry", "boat-01", "usv", 1756814400.0, {"latitude": 38.9, "behavior": "waypoint", "mode": None})
+        point = main._influx_write_queue.get_nowait()
+        line = point.to_line_protocol()
+        self.assertIn("kind=telemetry", line)
+        self.assertIn("vehicle_id=boat-01", line)
+        self.assertIn("latitude=38.9", line)
+        self.assertIn('behavior="waypoint"', line)
+        self.assertNotIn("mode=", line)
+
+    def test_telemetry_fields_flatten_to_openmct_names(self):
+        fields = main._telemetry_influx_fields({
+            "position": {"latitude": 1.0, "longitude": 2.0, "altitude": 3.0},
+            "heading": 90.0,
+            "behavior": "idle",
+            "battery": {"percentage": 0.5},
+            "gps": {"fix_type": 3, "satellites": 12},
+        })
+        self.assertEqual(fields["latitude"], 1.0)
+        self.assertEqual(fields["battery_percentage"], 0.5)
+        self.assertEqual(fields["gps_satellites"], 12)
+        self.assertEqual(fields["behavior"], "idle")
 
 
 if __name__ == "__main__":

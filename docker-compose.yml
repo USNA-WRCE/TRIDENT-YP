@@ -132,7 +132,8 @@ services:
 
   yp-gps:
     build:
-      context: ./services/yp_gps
+      context: .
+      dockerfile: services/yp_gps/Dockerfile
       network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
@@ -230,7 +231,8 @@ services:
 
   sim-uav1:
     build:
-      context: ./services/sim_vehicle
+      context: .
+      dockerfile: services/sim_vehicle/Dockerfile
       network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
@@ -248,7 +250,8 @@ services:
 
   sim-uav2:
     build:
-      context: ./services/sim_vehicle
+      context: .
+      dockerfile: services/sim_vehicle/Dockerfile
       network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
@@ -266,7 +269,8 @@ services:
 
   sim-usv:
     build:
-      context: ./services/sim_vehicle
+      context: .
+      dockerfile: services/sim_vehicle/Dockerfile
       network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
@@ -284,7 +288,8 @@ services:
 
   sim-uuv:
     build:
-      context: ./services/sim_vehicle
+      context: .
+      dockerfile: services/sim_vehicle/Dockerfile
       network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
@@ -304,6 +309,8 @@ services:
     build:
       context: ./companion_vehicle_software/umaa_piScripts
       network: host
+      additional_contexts:
+        yp_common: ./yp_common
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
       VEHICLE_ID: sim-umaa
@@ -377,7 +384,8 @@ services:
   px4-yp-bridge:
     profiles: ["px4"]
     build:
-      context: ./services/px4_mavros_bridge
+      context: .
+      dockerfile: services/px4_mavros_bridge/Dockerfile
     environment:
       VEHICLE_ID: px4-uav
       VEHICLE_TYPE: uav
@@ -386,7 +394,6 @@ services:
       SETPOINT_HZ: "5"
       AUTO_ARM_OFFBOARD: "true"
       GLOBAL_SETPOINT_FRAME: "6"
-      DISCOVER_MAVROS_TOPICS: "true"
     depends_on:
       - yp-server
       - rosbridge

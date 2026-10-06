@@ -58,20 +58,25 @@ async def print_telemetry(ws: websockets.WebSocketClientProtocol, duration_s: fl
         if payload.get("vehicle_id") != VEHICLE_ID:
             continue
 
-        topic = payload.get("topic", "")
-        msg = payload.get("msg", {})
-        if topic.endswith("/navsatfix"):
-            lat = msg.get("latitude")
-            lon = msg.get("longitude")
-            alt = msg.get("altitude")
-            heading = msg.get("heading")
-            print(f"NAV lat={lat:.7f} lon={lon:.7f} alt={alt:.2f} heading={heading:.1f}")
-        elif topic.endswith("/battery"):
-            print(f"BATTERY pct={float(msg.get('percentage', 0.0)):.3f}")
-        elif topic.endswith("/heartbeat"):
-            print(f"HEARTBEAT mode={msg.get('mode')} armed={msg.get('armed')}")
-        elif topic.endswith("/status"):
-            print(f"STATUS {msg}")
+        if payload.get("op") == "event":
+            print(f"EVENT {payload.get('event')}")
+            continue
+        if payload.get("op") != "telemetry":
+            continue
+
+        position = payload.get("position")
+        if position:
+            heading = payload.get("heading")
+            heading_text = f"{heading:.1f}" if heading is not None else "n/a"
+            print(
+                f"NAV lat={position['latitude']:.7f} lon={position['longitude']:.7f} "
+                f"alt={position['altitude']:.2f} heading={heading_text}"
+            )
+        battery = payload.get("battery")
+        if battery:
+            print(f"BATTERY pct={float(battery.get('percentage', 0.0)):.3f}")
+        if "mode" in payload or "behavior" in payload:
+            print(f"STATE mode={payload.get('mode')} behavior={payload.get('behavior')} armed={payload.get('armed')}")
 
 
 async def run(args: argparse.Namespace) -> None:

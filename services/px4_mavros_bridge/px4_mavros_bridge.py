@@ -2,11 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import websockets
+
+from yp_common.geometry import distance_m
+from yp_common.telemetry import (
+    BEHAVIOR_ABSOLUTE_MISSION,
+    BEHAVIOR_IDLE,
+    BEHAVIOR_TAKEOFF,
+    BEHAVIOR_WAYPOINT,
+    BehaviorTracker,
+    behavior_for_command,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
 
 
 VEHICLE_ID = os.getenv("VEHICLE_ID", "px4-uav")
@@ -14,21 +28,17 @@ VEHICLE_TYPE = os.getenv("VEHICLE_TYPE", "uav")
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://yp-server:8000/ws/vehicle")
 ROSBRIDGE_URL = os.getenv("ROSBRIDGE_URL", "ws://rosbridge:9090")
 SETPOINT_HZ = float(os.getenv("SETPOINT_HZ", "5"))
+TELEMETRY_HZ = float(os.getenv("TELEMETRY_HZ", "5"))
+WAYPOINT_ARRIVAL_RADIUS_M = float(os.getenv("WAYPOINT_ARRIVAL_RADIUS_M", "10.0"))
 AUTO_ARM_OFFBOARD = os.getenv("AUTO_ARM_OFFBOARD", "true").lower() in {"1", "true", "yes", "on"}
 GLOBAL_SETPOINT_FRAME = int(os.getenv("GLOBAL_SETPOINT_FRAME", "6"))
-DISCOVER_MAVROS_TOPICS = os.getenv("DISCOVER_MAVROS_TOPICS", "true").lower() in {"1", "true", "yes", "on"}
 
 SUBSCRIPTIONS: list[tuple[str, str]] = [
     ("/mavros/state", "mavros_msgs/State"),
-    ("/mavros/extended_state", "mavros_msgs/ExtendedState"),
     ("/mavros/global_position/global", "sensor_msgs/NavSatFix"),
     ("/mavros/global_position/compass_hdg", "std_msgs/Float64"),
     ("/mavros/global_position/rel_alt", "std_msgs/Float64"),
-    ("/mavros/local_position/pose", "geometry_msgs/PoseStamped"),
-    ("/mavros/local_position/velocity_local", "geometry_msgs/TwistStamped"),
     ("/mavros/battery", "sensor_msgs/BatteryState"),
-    ("/mavros/imu/data", "sensor_msgs/Imu"),
-    ("/mavros/home_position/home", "mavros_msgs/HomePosition"),
     ("/mavros/gpsstatus/gps1/raw", "mavros_msgs/GPSRAW"),
 ]
 
@@ -42,7 +52,10 @@ class Bridge:
         self.vehicle_ws: websockets.WebSocketClientProtocol | None = None
         self.active_waypoint: dict[str, float] | None = None
         self.last_heading: float | None = None
-        self.topic_types = dict(SUBSCRIPTIONS)
+        self.latest: dict[str, Any] = {}
+        self.takeoff_altitude_m: float | None = None
+        self.waypoint_goal_is_rtb = False
+        self.behavior_tracker = BehaviorTracker()
 
     async def run_forever(self) -> None:
         while True:
@@ -57,6 +70,7 @@ class Bridge:
                             self.read_rosbridge(),
                             self.read_vehicle_commands(),
                             self.publish_setpoints(),
+                            self.publish_telemetry(),
                         )
             except Exception as exc:
                 print(f"{VEHICLE_ID} bridge reconnecting after error: {exc}")
@@ -69,10 +83,7 @@ class Bridge:
 
     async def setup_rosbridge(self) -> None:
         await self.ros_send({"op": "advertise", "topic": SETPOINT_TOPIC, "type": SETPOINT_TYPE})
-        self.topic_types = dict(SUBSCRIPTIONS)
-        if DISCOVER_MAVROS_TOPICS:
-            self.topic_types.update(await self.discover_mavros_topics())
-        for topic, msg_type in sorted(self.topic_types.items()):
+        for topic, msg_type in SUBSCRIPTIONS:
             await self.ros_send(
                 {
                     "op": "subscribe",
@@ -92,12 +103,67 @@ class Bridge:
                 continue
             if payload.get("op") != "publish":
                 continue
-            topic = str(payload.get("topic", ""))
             msg = payload.get("msg", {})
-            msg_type = ros1_to_ros2_type(self.topic_types.get(topic, "unknown"))
-            await self.forward(topic, msg_type, msg)
-            for alias_topic, alias_type, alias_msg in self.canonical_aliases(topic, msg_type, msg):
-                await self.forward(alias_topic, alias_type, alias_msg)
+            if isinstance(msg, dict):
+                self.ingest(str(payload.get("topic", "")), msg)
+
+    def ingest(self, topic: str, msg: dict[str, Any]) -> None:
+        if topic == "/mavros/state":
+            mode = msg.get("mode")
+            armed = bool(msg.get("armed"))
+            self.latest["mode"] = mode
+            self.latest["armed"] = armed
+            if not armed:
+                self.behavior_tracker.set(BEHAVIOR_IDLE)
+            else:
+                self.behavior_tracker.observe_mode(mode, guided_modes=("OFFBOARD", "GUIDED", "AUTO.TAKEOFF", "AUTO.LAND"), auto_modes=("AUTO.MISSION", "AUTO"))
+        elif topic == "/mavros/global_position/global":
+            self.latest["latitude"] = msg.get("latitude")
+            self.latest["longitude"] = msg.get("longitude")
+            self.latest["amsl"] = msg.get("altitude")
+        elif topic == "/mavros/global_position/rel_alt":
+            if isinstance(msg.get("data"), (int, float)):
+                self.latest["rel_alt"] = float(msg["data"])
+        elif topic == "/mavros/global_position/compass_hdg":
+            heading = msg.get("data")
+            if isinstance(heading, (int, float)):
+                self.last_heading = float(heading) % 360
+                self.latest["heading"] = self.last_heading
+        elif topic == "/mavros/battery":
+            self.latest["battery"] = {key: finite(msg.get(key)) for key in ("percentage", "voltage", "current")}
+        elif topic == "/mavros/gpsstatus/gps1/raw":
+            self.latest["gps"] = gps_block_from_mavlink(SimpleNamespace(**msg))
+        self.update_goal_progress()
+
+    def update_goal_progress(self) -> None:
+        lat, lon, alt = self.latest.get("latitude"), self.latest.get("longitude"), self.latest.get("rel_alt")
+        if lat is None or lon is None:
+            return
+        goal = self.active_waypoint
+        if goal and not self.waypoint_goal_is_rtb and distance_m(lat, lon, goal["latitude"], goal["longitude"]) <= WAYPOINT_ARRIVAL_RADIUS_M:
+            self.behavior_tracker.finish(BEHAVIOR_WAYPOINT)
+        if self.takeoff_altitude_m is not None and alt is not None and alt >= self.takeoff_altitude_m - 1.0:
+            self.takeoff_altitude_m = None
+            self.behavior_tracker.finish(BEHAVIOR_TAKEOFF)
+
+    async def publish_telemetry(self) -> None:
+        while True:
+            latest = self.latest
+            if self.vehicle_ws and latest:
+                await self.vehicle_ws.send(json.dumps(build_telemetry(
+                    VEHICLE_ID,
+                    VEHICLE_TYPE,
+                    latitude=latest.get("latitude"),
+                    longitude=latest.get("longitude"),
+                    altitude=latest.get("rel_alt", latest.get("amsl")),
+                    heading=latest.get("heading"),
+                    behavior=self.behavior_tracker.get(),
+                    mode=latest.get("mode"),
+                    armed=latest.get("armed"),
+                    battery=latest.get("battery"),
+                    gps=latest.get("gps"),
+                )))
+            await asyncio.sleep(1.0 / TELEMETRY_HZ)
 
     async def read_vehicle_commands(self) -> None:
         assert self.vehicle_ws
@@ -109,9 +175,13 @@ class Bridge:
             command = payload.get("command", payload)
             if not isinstance(command, dict):
                 continue
+            if payload.get("op") == "command" and command.get("type") != "rtcm_data":
+                self.behavior_tracker.set(behavior_for_command(command.get("type"), payload.get("source")))
             if command.get("type") == "waypoint":
+                self.waypoint_goal_is_rtb = payload.get("source") == "rtb_follow"
                 await self.handle_waypoint(command)
             elif command.get("type") == "rtb_follow":
+                self.waypoint_goal_is_rtb = True
                 await self.handle_rtb_follow(command)
             elif command.get("type") == "rtb":
                 await self.call_service("/mavros/set_mode", "mavros_msgs/SetMode", {"base_mode": 0, "custom_mode": "AUTO.RTL"})
@@ -125,6 +195,7 @@ class Bridge:
                 await self.call_service("/mavros/cmd/arming", "mavros_msgs/CommandBool", {"value": False})
             elif command.get("type") == "takeoff":
                 altitude_m = float(command.get("altitude_m") or 15.0)
+                self.takeoff_altitude_m = altitude_m
                 await self.call_service("/mavros/cmd/arming", "mavros_msgs/CommandBool", {"value": True})
                 await self.call_service(
                     "/mavros/cmd/takeoff",
@@ -221,6 +292,7 @@ class Bridge:
             )
 
         if not mav_waypoints:
+            self.behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
             return
 
         await self.call_service("/mavros/mission/clear", "mavros_msgs/WaypointClear", {})
@@ -285,91 +357,14 @@ class Bridge:
             }
         )
 
-    async def discover_mavros_topics(self) -> dict[str, str]:
-        try:
-            values = await self.call_rosapi("/rosapi/topics", {})
-            topics = values.get("topics", [])
-            discovered: dict[str, str] = {}
-            for topic in topics:
-                if not isinstance(topic, str) or not topic.startswith("/mavros/"):
-                    continue
-                type_values = await self.call_rosapi("/rosapi/topic_type", {"topic": topic})
-                msg_type = type_values.get("type")
-                if isinstance(msg_type, str) and msg_type:
-                    discovered[topic] = msg_type
-            if discovered:
-                print(f"{VEHICLE_ID} discovered {len(discovered)} MAVROS topics")
-            return discovered
-        except Exception as exc:
-            print(f"{VEHICLE_ID} MAVROS topic discovery skipped: {exc}")
-            return {}
-
-    async def call_rosapi(self, service: str, args: dict[str, Any]) -> dict[str, Any]:
-        if not self.ros_ws:
-            return {}
-        request_id = f"{VEHICLE_ID}-{service}-{time.time()}"
-        await self.ros_ws.send(json.dumps({"op": "call_service", "service": service, "args": args, "id": request_id}))
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            raw = await asyncio.wait_for(self.ros_ws.recv(), timeout=max(0.1, deadline - time.time()))
-            payload = json.loads(raw)
-            if payload.get("op") == "service_response" and payload.get("id") == request_id:
-                values = payload.get("values", {})
-                return values if isinstance(values, dict) else {}
-        return {}
-
-    async def forward(self, topic: str, msg_type: str, msg: Any) -> None:
-        if not self.vehicle_ws:
-            return
-        await self.vehicle_ws.send(
-            json.dumps(
-                {
-                    "vehicle_id": VEHICLE_ID,
-                    "vehicle_type": VEHICLE_TYPE,
-                    "topic": topic_for_vehicle(topic),
-                    "type": msg_type,
-                    "stamp": time.time(),
-                    "msg": msg,
-                }
-            )
-        )
-
-    def canonical_aliases(self, topic: str, msg_type: str, msg: Any) -> list[tuple[str, str, dict[str, Any]]]:
-        if not isinstance(msg, dict):
-            return []
-        if topic == "/mavros/global_position/global":
-            return [("navsatfix", "sensor_msgs/msg/NavSatFix", msg)]
-        if topic == "/mavros/local_position/pose":
-            pose = msg.get("pose")
-            if isinstance(pose, dict):
-                return [("pose", "geometry_msgs/msg/Pose", pose)]
-        if topic == "/mavros/battery":
-            return [("battery", "sensor_msgs/msg/BatteryState", msg)]
-        if topic == "/mavros/global_position/compass_hdg":
-            heading = msg.get("data")
-            if isinstance(heading, (int, float)):
-                self.last_heading = float(heading) % 360
-                return [("heading", "yp_ground_station/msg/Heading", {"heading": self.last_heading})]
-        return []
-
     async def ros_send(self, payload: dict[str, Any]) -> None:
         if not self.ros_ws:
             return
         await self.ros_ws.send(json.dumps(payload))
 
 
-def ros1_to_ros2_type(msg_type: str) -> str:
-    if "/" not in msg_type or "/msg/" in msg_type:
-        return msg_type
-    package, name = msg_type.split("/", 1)
-    return f"{package}/msg/{name}"
-
-
-def topic_for_vehicle(topic: str) -> str:
-    clean = topic.strip("/")
-    if clean.startswith("mavros/"):
-        return f"/vehicles/{VEHICLE_ID}/{clean}"
-    return f"/vehicles/{VEHICLE_ID}/{clean or 'unknown'}"
+def finite(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 
 def global_position_target(target: dict[str, float], yaw_deg: float | None, velocity: dict[str, float] | None = None) -> dict[str, Any]:

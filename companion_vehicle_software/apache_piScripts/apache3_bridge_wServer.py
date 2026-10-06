@@ -16,6 +16,16 @@ import websockets
 import math
 
 import sar_missions
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    BEHAVIOR_RETURN_TO_BOAT,
+    BehaviorTracker,
+    behavior_for_command,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
+
+BEHAVIOR_MANUAL_CONTROL = "manual_control"
 
 CONFIG_PATH = Path("config.json")
 
@@ -68,7 +78,9 @@ system_status = {
     "gps_status": "No Fix",
     "satellites": 0,
     "last_hb_time": 0,
+    "behavior": BEHAVIOR_IDLE,
 }
+behavior_tracker = BehaviorTracker(on_change=lambda behavior: system_status.__setitem__("behavior", behavior))
 
 # --- RC OVERRIDE WATCHDOG VARIABLES ---
 _last_rc_cmd_time = 0.0
@@ -178,6 +190,10 @@ HTML_TEMPLATE = """
                 <div class="diag-label">GPS Status</div>
                 <div class="diag-value" id="gps_status" style="color: #f59e0b;">No Fix</div>
             </div>
+            <div class="diag-item">
+                <div class="diag-label">Behavior</div>
+                <div class="diag-value" id="behavior" style="color: #a78bfa;">idle</div>
+            </div>
         </div>
     </div>
 
@@ -278,6 +294,7 @@ HTML_TEMPLATE = """
                 wsElem.className = 'badge ' + (data.ws_connected ? 'badge-online' : 'badge-offline');
 
                 document.getElementById('flight_mode').innerText = data.flight_mode;
+                document.getElementById('behavior').innerText = data.behavior.replace(/_/g, ' ');
                 
                 const gpsText = data.gps_status + (data.satellites > 0 ? ` (${{data.satellites}} Sats)` : '');
                 document.getElementById('gps_status').innerText = gpsText;
@@ -609,6 +626,8 @@ def _run_single_waypoint(master, lat: float, lon: float):
         if upload_mission_batch(master, [(lat, lon)], append_terminal_loiter=True):
             time.sleep(0.2)
             set_chcnav_mode(master, CUSTOM_MODE_AUTO)
+        else:
+            behavior_tracker.finish(behavior_for_command("waypoint"))
 
 def _run_search_grid(master, waypoints: list[tuple[float, float]]):
     _stop_active_controller_sync()
@@ -616,52 +635,12 @@ def _run_search_grid(master, waypoints: list[tuple[float, float]]):
         if upload_mission_batch(master, waypoints, append_terminal_loiter=True):
             time.sleep(0.2)
             set_chcnav_mode(master, CUSTOM_MODE_AUTO)
+        else:
+            behavior_tracker.finish(behavior_for_command("search_grid"))
 
 def get_gps_fix_label(fix_type: int) -> str:
     fix_map = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
     return fix_map.get(fix_type, f"Fix {fix_type}")
-
-def create_gps_fix_message(vehicle_id: str, msg) -> dict:
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    fix_type = getattr(msg, "fix_type", 0)
-    satellites_visible = getattr(msg, "satellites_visible", 255)
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/gps_fix",
-        "type": "mavlink/GPS_RAW_INT",
-        "stamp": time.time(),
-        "msg": {
-            "fix_type": fix_type,
-            "fix_type_label": get_gps_fix_label(fix_type),
-            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-        },
-    }
-
-def create_navsatfix_message(vehicle_id: str, lat: float, lon: float, heading: float | None = None) -> dict:
-    now = time.time()
-    sec, nanosec = int(now), int((now - int(now)) * 1e9)
-    payload = {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": {
-            "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-            "status": {"status": 0, "service": 1},
-            "latitude": lat, "longitude": lon, "altitude": 0.0,
-            "position_covariance": [0.0] * 9, "position_covariance_type": 0,
-        },
-    }
-    if heading is not None:
-        payload["msg"]["heading"] = heading
-    return payload
 
 def create_video_stream_message(vehicle_id: str, video_url: str) -> dict:
     return {
@@ -709,6 +688,8 @@ async def _rc_override_watchdog_loop():
 
             # 3. Reset watchdog timer to prevent repeated print/cmd spam
             _last_rc_cmd_time = 0.0
+            behavior_tracker.finish(BEHAVIOR_MANUAL_CONTROL)
+            behavior_tracker.finish(BEHAVIOR_RETURN_TO_BOAT)
             print("[WATCHDOG] Control stream timed out! Active controller stopped & neutral commands dispatched.")
 
 # --- MAIN TELEMETRY & COMMAND LOOP ---
@@ -783,6 +764,13 @@ async def telemetry_loop(current_config: dict) -> None:
                         if server_msg.get("op") == "command" and server_msg.get("vehicle_id") == vehicle_id:
                             command_data = server_msg.get("command", {})
                             cmd_type = command_data.get("type")
+
+                            if cmd_type in ("rc_override", "heading_speed"):
+                                behavior_tracker.set(BEHAVIOR_MANUAL_CONTROL)
+                            elif cmd_type in ("rtb", "set_mode"):
+                                behavior_tracker.set(BEHAVIOR_IDLE)
+                            elif cmd_type != "rtcm_data":
+                                behavior_tracker.set(behavior_for_command(cmd_type, server_msg.get("source")))
 
                             # --- BEHAVIOR 1: Direct Raw RC Override JSON Command ---
                             if cmd_type == "rc_override":
@@ -872,12 +860,13 @@ async def telemetry_loop(current_config: dict) -> None:
                     custom_mode_val = getattr(msg, "custom_mode", 0)
                     mode_names = {0: "MANUAL", 4: "HOLD", 10: "AUTO", 11: "RTL", 12: "LOITER", 15: "GUIDED"}
                     system_status["flight_mode"] = mode_names.get(custom_mode_val, f"MODE_{custom_mode_val}")
+                    behavior_tracker.observe_mode(system_status["flight_mode"], guided_modes=("AUTO", "GUIDED", "MANUAL"))
                 elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
                     system_status["gps_status"] = get_gps_fix_label(getattr(msg, "fix_type", 0))
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(create_gps_fix_message(vehicle_id, msg)))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                 elif msg_type == "GLOBAL_POSITION_INT":
                     lat, lon = msg.lat / 1e7, msg.lon / 1e7
@@ -896,7 +885,8 @@ async def telemetry_loop(current_config: dict) -> None:
             if ws is not None:
                 try:
                     if telemetry_sample is not None and (now - last_send_time) >= (1.0 / send_hz):
-                        await ws.send(json.dumps(create_navsatfix_message(vehicle_id, *telemetry_sample)))
+                        lat, lon, heading = telemetry_sample
+                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=0.0, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"])))
                         last_send_time = now
 
                     if now - last_video_send_time >= 60.0:

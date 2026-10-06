@@ -7,12 +7,6 @@ export interface Position {
   stamp?: number;
 }
 
-export interface VehicleMessage {
-  type: string;
-  stamp: number;
-  msg: Record<string, unknown>;
-}
-
 export interface RelativeWaypoint {
   x: number;
   y: number;
@@ -54,7 +48,9 @@ export interface Vehicle {
     vertical_accuracy_m?: number | null;
     stamp?: number;
   };
-  messages: Record<string, VehicleMessage>;
+  behavior?: string;
+  mode?: string;
+  armed?: boolean;
 }
 
 export interface Command {

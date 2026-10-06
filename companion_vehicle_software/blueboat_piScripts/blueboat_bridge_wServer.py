@@ -22,6 +22,20 @@ from yp_common.geometry import (
     distance_m as _distance_m,
     north_east_delta_m as _north_east_delta_m,
 )
+from yp_common.telemetry import (
+    BEHAVIOR_ABSOLUTE_MISSION,
+    BEHAVIOR_IDLE,
+    BEHAVIOR_MOB_SEARCH,
+    BEHAVIOR_SEARCH_GRID,
+    BEHAVIOR_SHIP_RELATIVE,
+    BEHAVIOR_TAKEOFF,
+    EVENT_LAND_ON_BOAT_TOUCHDOWN,
+    BehaviorTracker,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
 
 CONFIG_PATH = Path("config.json")
 
@@ -65,6 +79,7 @@ system_status = {
     "ws_connected": False,
     "ws_status": "Connecting...",
     "flight_mode": "UNKNOWN",
+    "behavior": BEHAVIOR_IDLE,
     "gps_status": "No Fix",
     "satellites": 0,
     "last_hb_time": 0,
@@ -81,6 +96,7 @@ SAR_STREAMING_MODE = os.getenv("SAR_STREAMING_MODE", "true").lower() != "false"
 SAR_ARRIVAL_RADIUS_M = float(os.getenv("SAR_ARRIVAL_RADIUS_M", "10.0"))
 
 _sar_mission_lock = threading.Lock()
+behavior_tracker = BehaviorTracker(on_change=lambda behavior: system_status.__setitem__("behavior", behavior))
 _sar_stop_event = threading.Event()
 _sar_telemetry_lock = threading.Lock()
 _sar_latest_nav = {"lat": None, "lon": None, "alt": None, "heading": None, "stamp": 0.0}
@@ -171,6 +187,10 @@ HTML_TEMPLATE = """
                 <div class="diag-value" id="flight_mode" style="color: #38bdf8;">UNKNOWN</div>
             </div>
             <div class="diag-item">
+                <div class="diag-label">Behavior</div>
+                <div class="diag-value" id="behavior" style="color: #a78bfa;">idle</div>
+            </div>
+            <div class="diag-item">
                 <div class="diag-label">GPS Status</div>
                 <div class="diag-value" id="gps_status" style="color: #f59e0b;">No Fix</div>
             </div>
@@ -239,6 +259,7 @@ HTML_TEMPLATE = """
                 wsElem.className = 'badge ' + (data.ws_connected ? 'badge-online' : 'badge-offline');
 
                 document.getElementById('flight_mode').innerText = data.flight_mode;
+                document.getElementById('behavior').innerText = data.behavior.replace(/_/g, ' ');
                 
                 const gpsText = data.gps_status + (data.satellites > 0 ? ` (${{data.satellites}} Sats)` : '');
                 document.getElementById('gps_status').innerText = gpsText;
@@ -377,49 +398,6 @@ async def start_web_server():
 def get_gps_fix_label(fix_type: int) -> str:
     fix_map = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
     return fix_map.get(fix_type, f"Fix {fix_type}")
-
-def create_gps_fix_message(vehicle_id: str, msg) -> dict:
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    fix_type = getattr(msg, "fix_type", 0)
-    satellites_visible = getattr(msg, "satellites_visible", 255)
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/gps_fix",
-        "type": "mavlink/GPS_RAW_INT",
-        "stamp": time.time(),
-        "msg": {
-            "fix_type": fix_type,
-            "fix_type_label": get_gps_fix_label(fix_type),
-            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-        },
-    }
-
-def create_navsatfix_message(vehicle_id: str, lat: float, lon: float, alt: float, heading: float | None = None) -> dict:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-    payload = {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": {
-            "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-            "status": {"status": 0, "service": 1},
-            "latitude": lat, "longitude": lon, "altitude": alt,
-            "position_covariance": [0.0] * 9, "position_covariance_type": 0,
-        },
-    }
-    if heading is not None:
-        payload["msg"]["heading"] = heading
-    return payload
 
 def create_video_stream_message(vehicle_id: str, video_url: str) -> dict:
     return {
@@ -564,6 +542,7 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                     break
             time.sleep(update_period_s)
         if stop_event.is_set(): return
+    behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
 
 def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_guided=True):
     if VEHICLE_TYPE in ["usv", "ugv"]: target_alt = 0.0
@@ -705,6 +684,7 @@ def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m
         try:
             sar_missions.execute_search_grid_streaming(master, lat, lon, grid_size_m, swath_m, altitude_m, include_takeoff=SAR_INCLUDE_TAKEOFF, takeoff_altitude_m=SAR_TAKEOFF_ALT_M, climb_speed_ms=SAR_CLIMB_SPEED_MS, arrival_radius_m=SAR_ARRIVAL_RADIUS_M, stop_event=_sar_stop_event, telemetry_callback=_capture_sar_telemetry)
         except Exception as exc: pass
+        finally: behavior_tracker.finish(BEHAVIOR_SEARCH_GRID)
 
 def _run_mob_search(master, track_points: list, corridor_half_width_m: float, swath_m: float, altitude_m: float, takeoff_altitude_m: float, climb_speed_ms: float) -> None:
     if VEHICLE_TYPE in ["usv", "ugv"]: altitude_m, takeoff_altitude_m = 0.0, 0.0
@@ -713,6 +693,7 @@ def _run_mob_search(master, track_points: list, corridor_half_width_m: float, sw
         try:
             sar_missions.execute_mob_search_streaming(master, track_points, corridor_half_width_m=corridor_half_width_m, swath_m=swath_m, altitude_m=altitude_m, takeoff_altitude_m=takeoff_altitude_m, climb_speed_ms=climb_speed_ms, include_takeoff=SAR_INCLUDE_TAKEOFF, arrival_radius_m=SAR_ARRIVAL_RADIUS_M, stop_event=_sar_stop_event, telemetry_callback=_capture_sar_telemetry)
         except Exception as exc: pass
+        finally: behavior_tracker.finish(BEHAVIOR_MOB_SEARCH)
 
 def _run_takeoff(master, altitude_m: float) -> None:
     with _sar_mission_lock:
@@ -721,12 +702,21 @@ def _run_takeoff(master, altitude_m: float) -> None:
             time.sleep(0.3)
             if not sar_missions.arm_vehicle(master):
                 print("[MISSION] Takeoff arm failed")
+                behavior_tracker.finish(BEHAVIOR_TAKEOFF)
                 return
             time.sleep(0.3)
             master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, float("nan"), 0, 0, altitude_m)
             print(f"[MISSION] Takeoff command sent to {altitude_m}m")
+            deadline = time.time() + 60.0
+            while time.time() < deadline and behavior_tracker.get() == BEHAVIOR_TAKEOFF:
+                alt = _snapshot_vehicle_state().get("alt")
+                if alt is not None and alt >= altitude_m - 1.0:
+                    break
+                time.sleep(0.5)
+            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
         except Exception as exc:
             print(f"[MISSION] takeoff error: {exc}")
+            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
 
 def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guided_on_complete: bool) -> None:
     with _sar_mission_lock:
@@ -739,9 +729,12 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
             )
             if not mission_items:
                 print("[MISSION] mission_plan has no valid waypoints.")
+                behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
                 return
 
-            if not sar_missions.upload_mission(master, mission_items): return
+            if not sar_missions.upload_mission(master, mission_items):
+                behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
+                return
             if auto_arm_start:
                 # Arm in GUIDED first: ArduPilot refuses to arm from a disarmed AUTO mode.
                 sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
@@ -890,16 +883,15 @@ async def telemetry_loop(current_config: dict) -> None:
                             if cmd_type not in ("ship_relative_trajectory", "rtcm_data"):
                                 _stop_ship_relative_mission()
 
+                            if cmd_type != "rtcm_data":
+                                behavior_tracker.set(behavior_for_command(cmd_type, server_msg.get("source")))
+
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
                             elif cmd_type == "land_on_boat_step":
                                 if execute_land_step(master, command_data):
-                                    await ws.send(json.dumps({
-                                        "vehicle_id": vehicle_id,
-                                        "type": "yp_ground_station/LandOnBoatTouchdown",
-                                        "msg": {"landed": True},
-                                        "stamp": time.time(),
-                                    }))
+                                    behavior_tracker.set(BEHAVIOR_IDLE)
+                                    await ws.send(json.dumps(build_event(vehicle_id, VEHICLE_TYPE, EVENT_LAND_ON_BOAT_TOUCHDOWN)))
                             elif cmd_type == "waypoint" and None not in (command_data.get("target", {}).get("latitude"), command_data.get("target", {}).get("longitude"), command_data.get("target", {}).get("altitude")):
                                 goto_waypoint(master, command_data["target"]["latitude"], command_data["target"]["longitude"], command_data["target"]["altitude"], force_guided=(True if server_msg.get("source") != "rtb_follow" else _rtb_waypoint_should_force_guided()))
                             elif cmd_type == "search_grid" and None not in (command_data.get("lat"), command_data.get("lon")):
@@ -963,12 +955,16 @@ async def telemetry_loop(current_config: dict) -> None:
                     try:
                         system_status["flight_mode"] = master.flightmode
                     except Exception: pass
+                    if not armed:
+                        behavior_tracker.set(BEHAVIOR_IDLE)
+                    else:
+                        behavior_tracker.observe_mode(system_status["flight_mode"])
                 elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
                     system_status["gps_status"] = get_gps_fix_label(getattr(msg, "fix_type", 0))
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(create_gps_fix_message(vehicle_id, msg)))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                 elif msg_type == "GLOBAL_POSITION_INT":
                     lat, lon, alt = msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1000.0
@@ -986,7 +982,8 @@ async def telemetry_loop(current_config: dict) -> None:
             if ws is not None:
                 try:
                     if telemetry_sample is not None and (now - last_send_time) >= (1.0 / send_hz):
-                        await ws.send(json.dumps(create_navsatfix_message(vehicle_id, *telemetry_sample)))
+                        lat, lon, alt, heading = telemetry_sample
+                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"], armed=_armed_state)))
                         last_send_time = now
 
                     if now - last_video_send_time >= 60.0:

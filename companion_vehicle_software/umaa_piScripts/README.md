@@ -4,7 +4,7 @@ This companion package is a starter harness for vehicles that speak UMAA over RT
 
 What it does:
 - Connects to the YP websocket contract at `/ws/vehicle/{vehicle_id}`.
-- Forwards UMAA-style telemetry as YP vehicle messages.
+- Forwards UMAA-style telemetry as unified YP `telemetry` messages (position, heading, behavior, mode, armed, battery) and `mission_complete` events.
 - Accepts YP commands and passes them into a pluggable UMAA adapter.
 
 Current adapters:

@@ -64,6 +64,15 @@ from app.voice_synthesis import (
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
 from yp_common.geometry import bearing_degrees as _bearing_degrees
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    EVENT_LAND_ON_BOAT_TOUCHDOWN,
+    GPS_FIX_LABELS as GPS_FIX_TYPE_LABELS,
+    behavior_for_command as _behavior_for_command,
+    build_event,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
 
 
 INFLUX_URL = os.getenv("INFLUX_URL", "http://influxdb:8086")
@@ -117,7 +126,6 @@ rtcm_status: dict[str, Any] = {
     "bytes_total": 0,
     "error": None,
 }
-_last_gps_fix_log_at: dict[str, float] = {}
 
 
 app = FastAPI(title="YP Ground Station", version="0.1.0")
@@ -183,6 +191,7 @@ _sitl_land_touchdown_since: dict[str, float] = {} # vehicle_id -> monotonic time
 _sitl_land_touchdown_sent: dict[str, bool] = {} # vehicle_id -> True once auto-disarm has fired for the current attempt
 _sitl_nav_lock = threading.Lock()
 _sitl_nav_states: dict[str, dict[str, float]] = {}
+_sitl_behavior: dict[str, str] = {} # vehicle_id -> behavior reported for server-hosted SITL bridges (hardware bridges report their own)
 
 # MAVLink MAV_TYPE -> (vehicle_type, human-readable frame name)
 _MAV_TYPE_MAP: dict[int, tuple[str, str]] = {
@@ -949,65 +958,33 @@ async def _run_mavlink_bridge(
                 elif msg_type == "LAND_TOUCHDOWN":
                     # The IO thread confirmed real ground contact and disarmed
                     # locally; stop our guidance loop and tell the UI.
-                    await ingest_vehicle_message({
-                        "vehicle_id": vehicle_id,
-                        "vehicle_type": info["vehicle_type"],
-                        "topic": f"/vehicles/{vehicle_id}/land_on_boat",
-                        "type": "yp_ground_station/LandOnBoatTouchdown",
-                        "stamp": now,
-                        "msg": {"landed": True},
-                    })
+                    _sitl_behavior[vehicle_id] = BEHAVIOR_IDLE
+                    await ingest_vehicle_message(build_event(
+                        vehicle_id, info["vehicle_type"], EVENT_LAND_ON_BOAT_TOUCHDOWN, stamp=now,
+                    ))
 
                 elif msg_type == "GLOBAL_POSITION_INT":
-                    lat = msg.lat / 1e7
-                    lon = msg.lon / 1e7
-                    alt = msg.relative_alt / 1000.0
                     hdg = getattr(msg, "hdg", None)
-                    heading = (hdg / 100.0) if hdg is not None and hdg != 65535 else None
-
-                    nav_msg: dict[str, Any] = {
-                        "header": {
-                            "stamp": {"sec": int(now), "nanosec": int((now % 1) * 1e9)},
-                            "frame_id": "map",
-                        },
-                        "status": {"status": 0, "service": 1},
-                        "latitude": lat,
-                        "longitude": lon,
-                        "altitude": alt,
-                        "position_covariance": [0.0] * 9,
-                        "position_covariance_type": 0,
-                    }
-                    if heading is not None:
-                        nav_msg["heading"] = heading
-
-                    await ingest_vehicle_message({
-                        "vehicle_id": vehicle_id,
-                        "vehicle_type": info["vehicle_type"],
-                        "topic": f"/vehicles/{vehicle_id}/navsatfix",
-                        "type": "sensor_msgs/msg/NavSatFix",
-                        "stamp": now,
-                        "msg": nav_msg,
-                    })
-
-                    if last_battery_pct is not None:
-                        await ingest_vehicle_message({
-                            "vehicle_id": vehicle_id,
-                            "vehicle_type": info["vehicle_type"],
-                            "topic": f"/vehicles/{vehicle_id}/battery",
-                            "type": "sensor_msgs/msg/BatteryState",
-                            "stamp": now,
-                            "msg": {"percentage": last_battery_pct},
-                        })
+                    await ingest_vehicle_message(build_telemetry(
+                        vehicle_id,
+                        info["vehicle_type"],
+                        latitude=msg.lat / 1e7,
+                        longitude=msg.lon / 1e7,
+                        altitude=msg.relative_alt / 1000.0,
+                        heading=(hdg / 100.0) if hdg is not None and hdg != 65535 else None,
+                        behavior=_sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE),
+                        battery={"percentage": last_battery_pct} if last_battery_pct is not None else None,
+                        stamp=now,
+                    ))
 
                 elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
-                    await ingest_vehicle_message({
-                        "vehicle_id": vehicle_id,
-                        "vehicle_type": info["vehicle_type"],
-                        "topic": f"/vehicles/{vehicle_id}/gps_fix",
-                        "type": f"mavlink/{msg_type}",
-                        "stamp": now,
-                        "msg": _gps_raw_int_to_dict(msg, source=msg_type),
-                    })
+                    await ingest_vehicle_message(build_telemetry(
+                        vehicle_id,
+                        info["vehicle_type"],
+                        behavior=_sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE),
+                        gps=gps_block_from_mavlink(msg),
+                        stamp=now,
+                    ))
 
             # Yield to event loop; shorter sleep when actively draining data
             await asyncio.sleep(0.0 if processed else 0.02)
@@ -1699,21 +1676,15 @@ def _influx_log_record(record: Any) -> dict[str, Any]:
     fields = {
         key: value
         for key, value in values.items()
-        if key not in {"result", "table", "_start", "_stop", "_time", "_measurement", "vehicle_id", "vehicle_type", "topic", "msg_type"}
+        if key not in {"result", "table", "_start", "_stop", "_time", "_measurement", "vehicle_id", "vehicle_type", "kind"}
     }
     return {
         "timestamp": _format_log_time(record.get_time()),
         "vehicle_id": values.get("vehicle_id", "unknown"),
         "vehicle_type": values.get("vehicle_type", "unknown"),
+        "kind": values.get("kind", "telemetry"),
         "fields": fields,
     }
-
-
-def _is_heartbeat_record(record: Any) -> bool:
-    """Return whether an Influx record represents a heartbeat message."""
-    message_type = str(record.values.get("msg_type", ""))
-    topic = str(record.values.get("topic", ""))
-    return message_type.lower().endswith("heartbeat") or topic.lower().rstrip("/").endswith("/heartbeat")
 
 
 def _query_log_records(start: datetime, end: datetime) -> Any:
@@ -1725,7 +1696,7 @@ def _query_log_records(start: datetime, end: datetime) -> Any:
     flux = f'''from(bucket: "{INFLUX_BUCKET}")
   |> range(start: time(v: "{start_value}"), stop: time(v: "{end_value}"))
   |> filter(fn: (r) => r._measurement == "yp_messages")
-  |> pivot(rowKey: ["_time", "vehicle_id", "vehicle_type", "topic", "msg_type"], columnKey: ["_field"], valueColumn: "_value")'''
+  |> pivot(rowKey: ["_time", "vehicle_id", "vehicle_type", "kind"], columnKey: ["_field"], valueColumn: "_value")'''
     return query_api.query_stream(query=flux, org=INFLUX_ORG)
 
 
@@ -1744,7 +1715,7 @@ def _write_shutdown_log_export() -> None:
         return
 
     try:
-        records = (record for record in _query_log_records(start_time, end_time) if not _is_heartbeat_record(record))
+        records = _query_log_records(start_time, end_time)
         first_record = next(records)
     except StopIteration:
         print("Shutdown log export: no retained flight log data to save")
@@ -1791,7 +1762,7 @@ async def export_log(
         return authorization_error
     try:
         start_time, end_time = _log_range(start, end, last_hours)
-        records = (record for record in _query_log_records(start_time, end_time) if not _is_heartbeat_record(record))
+        records = _query_log_records(start_time, end_time)
         first_record = next(records)
     except ValueError as error:
         return JSONResponse({"error": str(error)}, status_code=400)
@@ -2380,7 +2351,10 @@ async def get_openmct_history(
       |> range(start: time(v: "{start_iso}"), stop: time(v: "{end_iso}"))
       |> filter(fn: (r) => r._measurement == {measurement_value})
       |> filter(fn: (r) => r.vehicle_id == {vehicle_value})
+      |> filter(fn: (r) => r.kind == "telemetry")
       |> filter(fn: (r) => r._field == {field_value})
+      |> group()
+      |> sort(columns: ["_time"])
     '''
 
     try:
@@ -2413,9 +2387,6 @@ async def rosbridge_ws(websocket: WebSocket) -> None:
                 await websocket.send_json({"op": "status", "level": "info", "msg": f"subscribed {topic}"})
             elif op == "unsubscribe" and topic:
                 ros_connections[websocket].discard(topic)
-            elif op == "publish" and topic:
-                msg = ros_publish_to_vehicle_message(payload)
-                await ingest_vehicle_message(msg)
             elif op == "command":
                 await route_command(payload.get("vehicle_id"), payload.get("command", {}), source="rosbridge")
     except WebSocketDisconnect:
@@ -2540,40 +2511,25 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
     """Update vehicle state from an incoming telemetry message and fan it out to clients."""
     received_at = time.time()
     now = float(payload.get("stamp") or received_at)
-    vehicle_id = str(payload.get("vehicle_id") or topic_vehicle_id(payload.get("topic", "")) or "unknown")
+    vehicle_id = str(payload.get("vehicle_id") or "unknown")
     # Natural type from the message payload; stored so clearing the YP role can revert it.
     natural_type = normalize_vehicle_type(payload.get("vehicle_type") or infer_vehicle_type(vehicle_id))
     # Apply YP role override: designate this vehicle as the mother vessel.
     vehicle_type = "yp" if _yp_role_vehicle_id and vehicle_id == _yp_role_vehicle_id else natural_type
-    topic = str(payload.get("topic") or f"/vehicles/{vehicle_id}/unknown")
-    msg_type = str(payload.get("type") or payload.get("msg_type") or "unknown")
-    msg = payload.get("msg", {})
+    op = payload.get("op")
 
-    if "GPS_RAW_INT" in msg_type or "GPS2_RAW" in msg_type:
-        last_logged_at = _last_gps_fix_log_at.get(vehicle_id, 0.0)
-        if received_at - last_logged_at >= 10.0:
-            _last_gps_fix_log_at[vehicle_id] = received_at
-            print(f"[GPS] Received {msg_type} from {vehicle_id} at {received_at:.3f} (payload stamp {now:.3f})")
+    if op == "event":
+        await _handle_vehicle_event(vehicle_id, vehicle_type, str(payload.get("event") or ""), now)
+        return
 
-    if msg_type == "yp_ground_station/MissionComplete":
-        shared_mission_completion_targets.pop(vehicle_id, None)
-        if shared_mission_plans.pop(vehicle_id, None) is not None:
-            await broadcast_ui({"op": "mission_plan_cleared", "vehicle_id": vehicle_id})
+    nav = _parse_position(payload.get("position"))
+    heading = _parse_heading(payload.get("heading"))
+    behavior = payload.get("behavior")
+    gps = payload.get("gps") if isinstance(payload.get("gps"), dict) else None
+    battery = payload.get("battery") if isinstance(payload.get("battery"), dict) else None
+    is_telemetry = op == "telemetry"
 
-    if msg_type == "yp_ground_station/LandOnBoatTouchdown":
-        # The bridge confirmed real ground contact (onboard landing detector)
-        # and already disarmed locally; just stop our guidance loop and tell the UI.
-        await _stop_land_on_boat(vehicle_id)
-        await broadcast_ui({"op": "land_on_boat_touchdown", "vehicle_id": vehicle_id})
-
-    update: dict[str, Any] = {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": vehicle_type,
-        "topic": topic,
-        "type": msg_type,
-        "stamp": now,
-        "msg": msg,
-    }
+    update: dict[str, Any] = {**payload, "vehicle_id": vehicle_id, "vehicle_type": vehicle_type, "stamp": now}
     mission_completed = False
 
     async with state_lock:
@@ -2584,7 +2540,6 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
                 "vehicle_type": vehicle_type,
                 "connected": True,
                 "last_seen": now,
-                "messages": {},
                 "history": deque(maxlen=HISTORY_MAX_POINTS),
             },
         )
@@ -2593,15 +2548,17 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
         vehicle["connected"] = True
         vehicle["last_seen"] = now
         vehicle["last_seen_age"] = 0
-        vehicle["messages"][topic] = {"type": msg_type, "stamp": now, "msg": msg}
 
-        # Extract dynamic video streams from the payload ---
         if "video" in payload:
             vehicle["video"] = payload["video"]
-        elif "video" in msg:
-            vehicle["video"] = msg["video"]
 
-        nav = extract_navsatfix(topic, msg_type, msg)
+        if isinstance(behavior, str) and behavior:
+            vehicle["behavior"] = behavior
+        if isinstance(payload.get("mode"), str):
+            vehicle["mode"] = payload["mode"]
+        if isinstance(payload.get("armed"), bool):
+            vehicle["armed"] = payload["armed"]
+
         if nav:
             vehicle["position"] = nav
             vehicle["history"].append({"stamp": now, **nav})
@@ -2622,13 +2579,6 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
                         nav,
                     )
 
-        pose = extract_pose(topic, msg_type, msg)
-        if pose:
-            vehicle["pose"] = pose
-            if "heading" not in vehicle and pose.get("yaw_deg") is not None:
-                vehicle["heading"] = pose["yaw_deg"]
-
-        heading = extract_heading(msg)
         if heading is not None:
             vehicle["heading"] = heading
 
@@ -2655,11 +2605,14 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
                     "stamp": now,
                 }
 
-        battery = extract_battery(topic, msg_type, msg)
         if battery:
-            vehicle["battery"] = battery
+            vehicle["battery"] = {
+                "percentage": battery.get("percentage"),
+                "voltage": battery.get("voltage"),
+                "current": battery.get("current"),
+            }
 
-        gps_fix = extract_gps_fix(topic, msg_type, msg)
+        gps_fix = _gps_block_to_fix(gps) if gps else None
         if gps_fix:
             previous_gps_fix = vehicle.get("gps_fix") or {}
             if (
@@ -2672,14 +2625,89 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
         # Strip history from the per-message update — it grows to thousands of entries
         # and would otherwise be serialised and sent to the UI 75+ times per second.
         # The initial /ws/ui snapshot sends the full history; clients accumulate
-        # subsequent positions locally from the NavSatFix messages.
+        # subsequent positions locally from telemetry messages.
         slim_snapshot = {k: v for k, v in vehicle_snapshot.items() if k != "history"}
 
     if mission_completed:
         await broadcast_ui({"op": "mission_plan_cleared", "vehicle_id": vehicle_id})
-    write_influx(update)
+    if not is_telemetry:
+        # Non-telemetry bridge messages (e.g. video_stream_update) only refresh vehicle state.
+        await broadcast_ui({"op": "vehicle_update", "vehicle": slim_snapshot})
+        return
+    write_influx("telemetry", vehicle_id, vehicle_type, now, _telemetry_influx_fields(update), throttle_key="telemetry" if nav else "telemetry_aux")
     await broadcast_ui({"op": "vehicle_update", "vehicle": slim_snapshot, "message": update})
-    await broadcast_ros(topic, msg, msg_type)
+    if nav:
+        await broadcast_ros(f"/vehicles/{vehicle_id}/navsatfix", {**nav, **({"heading": heading} if heading is not None else {})}, "sensor_msgs/msg/NavSatFix")
+
+
+async def _handle_vehicle_event(vehicle_id: str, vehicle_type: str, event: str, stamp: float) -> None:
+    """React to a one-shot bridge event and record it for history."""
+    if event == "mission_complete":
+        shared_mission_completion_targets.pop(vehicle_id, None)
+        if shared_mission_plans.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "mission_plan_cleared", "vehicle_id": vehicle_id})
+    elif event == "land_on_boat_touchdown":
+        # The bridge confirmed real ground contact (onboard landing detector)
+        # and already disarmed locally; just stop our guidance loop and tell the UI.
+        await _stop_land_on_boat(vehicle_id)
+        await broadcast_ui({"op": "land_on_boat_touchdown", "vehicle_id": vehicle_id})
+    write_influx("event", vehicle_id, vehicle_type, stamp, {"event": event})
+
+
+def _parse_position(value: Any) -> Optional[dict[str, float]]:
+    """Validate a telemetry `position` block into latitude/longitude/altitude floats."""
+    if not isinstance(value, dict) or "latitude" not in value or "longitude" not in value:
+        return None
+    try:
+        return {
+            "latitude": float(value["latitude"]),
+            "longitude": float(value["longitude"]),
+            "altitude": float(value.get("altitude") or 0.0),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_heading(value: Any) -> Optional[float]:
+    """Normalize a heading to 0-360 degrees, or None if absent/invalid."""
+    if value is None:
+        return None
+    try:
+        return float(value) % 360
+    except (TypeError, ValueError):
+        return None
+
+
+def _gps_block_to_fix(gps: dict[str, Any]) -> dict[str, Any]:
+    """Map the telemetry `gps` block onto the client-facing `gps_fix` shape."""
+    return {
+        "fix_type": int(gps.get("fix_type") or 0),
+        "fix_type_label": gps.get("fix_type_label") or GPS_FIX_TYPE_LABELS.get(int(gps.get("fix_type") or 0), "Unknown"),
+        "satellites_visible": gps.get("satellites"),
+        "horizontal_accuracy_m": gps.get("h_acc_m"),
+        "vertical_accuracy_m": gps.get("v_acc_m"),
+    }
+
+
+def _telemetry_influx_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Flatten a telemetry message into stable InfluxDB field names used by OpenMCT."""
+    fields: dict[str, Any] = {}
+    position = payload.get("position") or {}
+    for key in ("latitude", "longitude", "altitude"):
+        fields[key] = position.get(key)
+    fields["heading"] = payload.get("heading")
+    fields["behavior"] = payload.get("behavior")
+    fields["mode"] = payload.get("mode")
+    fields["armed"] = payload.get("armed")
+    battery = payload.get("battery") or {}
+    for key in ("percentage", "voltage", "current"):
+        fields[f"battery_{key}"] = battery.get(key)
+    gps = payload.get("gps") or {}
+    fields["gps_fix_type"] = gps.get("fix_type")
+    fields["gps_satellites"] = gps.get("satellites")
+    fields["gps_h_acc_m"] = gps.get("h_acc_m")
+    fields["gps_v_acc_m"] = gps.get("v_acc_m")
+    return fields
 
 
 def _compute_sar_waypoints(command: dict[str, Any]) -> list[list[float]]:
@@ -2852,6 +2880,10 @@ async def _dispatch_vehicle_command(
     write_log: bool,
 ) -> dict[str, Any]:
     """Queue a command for delivery to a vehicle, optionally logging and acking it."""
+    if vehicle_id in sitl_bridges:
+        behavior = _behavior_for_command(command.get("type"), source)
+        if behavior:
+            _sitl_behavior[vehicle_id] = behavior
     payload = {
         "op": "command",
         "vehicle_id": vehicle_id,
@@ -2868,14 +2900,11 @@ async def _dispatch_vehicle_command(
 
     if write_log:
         write_influx(
-            {
-                "vehicle_id": vehicle_id,
-                "vehicle_type": infer_vehicle_type(vehicle_id),
-                "topic": f"/vehicles/{vehicle_id}/commands",
-                "type": "yp_ground_station/Command",
-                "stamp": payload["stamp"],
-                "msg": command,
-            }
+            "command",
+            vehicle_id,
+            infer_vehicle_type(vehicle_id),
+            payload["stamp"],
+            {**command, "command_type": command.get("type")},
         )
         await broadcast_ros(f"/vehicles/{vehicle_id}/commands", command, "yp_ground_station/Command")
 
@@ -2898,14 +2927,11 @@ async def _emit_command_ack(vehicle_id: str, command: dict[str, Any], source: st
         "delivered": vehicle_id in vehicle_queues,
     }
     write_influx(
-        {
-            "vehicle_id": vehicle_id,
-            "vehicle_type": infer_vehicle_type(vehicle_id),
-            "topic": f"/vehicles/{vehicle_id}/commands",
-            "type": "yp_ground_station/Command",
-            "stamp": payload["stamp"],
-            "msg": command,
-        }
+        "command",
+        vehicle_id,
+        infer_vehicle_type(vehicle_id),
+        payload["stamp"],
+        {**command, "command_type": command.get("type")},
     )
     await broadcast_ui(payload)
     await broadcast_ros(f"/vehicles/{vehicle_id}/commands", command, "yp_ground_station/Command")
@@ -3494,24 +3520,28 @@ def _do_influx_write(point: Any) -> None:
         print(f"Influx write failed: {exc}")
 
 
-def write_influx(payload: dict[str, Any]) -> None:
-    """Build an InfluxDB point from a message payload and enqueue it for writing."""
+def write_influx(
+    kind: str,
+    vehicle_id: str,
+    vehicle_type: str,
+    stamp: float,
+    fields: dict[str, Any],
+    throttle_key: Optional[str] = None,
+) -> None:
+    """Build an InfluxDB point (kind: telemetry|command|event) and enqueue it for writing."""
     if not write_api:
         return
-    if _is_heartbeat_payload(payload):
-        return
-    if not should_write_influx(payload):
+    if throttle_key and not should_write_influx(vehicle_id, throttle_key):
         return
     try:
         point = (
             Point("yp_messages")
-            .tag("vehicle_id", str(payload.get("vehicle_id", "unknown")))
-            .tag("vehicle_type", str(payload.get("vehicle_type", "unknown")))
-            .tag("topic", str(payload.get("topic", "unknown")))
-            .tag("msg_type", str(payload.get("type", "unknown")))
-            .time(int(float(payload.get("stamp") or time.time()) * 1_000_000_000))
+            .tag("vehicle_id", vehicle_id)
+            .tag("vehicle_type", vehicle_type)
+            .tag("kind", kind)
+            .time(int(float(stamp or time.time()) * 1_000_000_000))
         )
-        add_fields(point, payload.get("msg", {}))
+        add_fields(point, {k: v for k, v in fields.items() if v is not None})
     except Exception as exc:
         print(f"Influx point build failed: {exc}")
         return
@@ -3522,21 +3552,12 @@ def write_influx(payload: dict[str, Any]) -> None:
         pass  # drop under back-pressure rather than stall
 
 
-def _is_heartbeat_payload(payload: dict[str, Any]) -> bool:
-    """Return whether an incoming payload is a heartbeat message."""
-    message_type = str(payload.get("type", ""))
-    topic = str(payload.get("topic", ""))
-    return message_type.lower().endswith("heartbeat") or topic.lower().rstrip("/").endswith("/heartbeat")
-
-
-def should_write_influx(payload: dict[str, Any]) -> bool:
-    """Return whether this (vehicle, message type) pair is due for another Influx write."""
+def should_write_influx(vehicle_id: str, throttle_key: str) -> bool:
+    """Return whether this (vehicle, stream) pair is due for another Influx write."""
     max_hz = float(settings.get("influx_max_write_hz") or 0)
     if max_hz <= 0:
         return True
-    vehicle_id = str(payload.get("vehicle_id", "unknown"))
-    msg_type = str(payload.get("type", "unknown"))
-    key = (vehicle_id, msg_type)
+    key = (vehicle_id, throttle_key)
     now = time.time()
     last_write = last_influx_write_at.get(key)
     if last_write is not None and now - last_write < 1.0 / max_hz:
@@ -3593,20 +3614,6 @@ def add_fields(point: Point, value: Any, prefix: str = "") -> None:
             point.field(prefix or "value", text)
 
 
-def ros_publish_to_vehicle_message(payload: dict[str, Any]) -> dict[str, Any]:
-    """Convert a rosbridge publish payload into the internal vehicle-message shape."""
-    topic = str(payload.get("topic", ""))
-    vehicle_id = topic_vehicle_id(topic) or str(payload.get("vehicle_id") or "ros-vehicle")
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": normalize_vehicle_type(payload.get("vehicle_type") or infer_vehicle_type(vehicle_id)),
-        "topic": topic,
-        "type": payload.get("type", "unknown"),
-        "stamp": time.time(),
-        "msg": payload.get("msg", {}),
-    }
-
-
 def public_vehicle(vehicle: dict[str, Any]) -> dict[str, Any]:
     """Return the client-facing snapshot of a vehicle, stripping private keys."""
     # Exclude private/internal keys (prefixed with "_") from the public representation.
@@ -3623,14 +3630,6 @@ def public_vehicle(vehicle: dict[str, Any]) -> dict[str, Any]:
     return snapshot
 
 
-def topic_vehicle_id(topic: str) -> Optional[str]:
-    """Extract the vehicle id from a \"/vehicles/{id}/...\" topic string."""
-    parts = [part for part in topic.split("/") if part]
-    if len(parts) >= 2 and parts[0] == "vehicles":
-        return parts[1]
-    return None
-
-
 def infer_vehicle_type(vehicle_id: str) -> str:
     """Guess a vehicle's type from a keyword substring in its id, defaulting to \"uav\"."""
     lower = vehicle_id.lower()
@@ -3644,99 +3643,6 @@ def normalize_vehicle_type(value: Any) -> str:
     """Coerce a value to a known vehicle type string, defaulting to \"uav\"."""
     text = str(value or "uav").lower()
     return text if text in {"uav", "usv", "ugv", "uuv", "yp"} else "uav"
-
-
-def extract_navsatfix(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, float]]:
-    """Extract lat/lon/alt from a NavSatFix-shaped message, or None if not applicable."""
-    if not isinstance(msg, dict):
-        return None
-    if "NavSatFix" not in msg_type and not topic.endswith("navsatfix"):
-        return None
-    if "latitude" not in msg or "longitude" not in msg:
-        return None
-    return {
-        "latitude": float(msg["latitude"]),
-        "longitude": float(msg["longitude"]),
-        "altitude": float(msg.get("altitude", 0.0)),
-    }
-
-
-def extract_pose(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, Any]]:
-    """Extract position/orientation/yaw from a Pose-shaped message, or None if not applicable."""
-    if not isinstance(msg, dict):
-        return None
-    if "Pose" not in msg_type and not topic.endswith("pose"):
-        return None
-    orientation = msg.get("orientation", {})
-    yaw_deg = quaternion_to_yaw_deg(orientation) if isinstance(orientation, dict) else None
-    return {"position": msg.get("position", {}), "orientation": orientation, "yaw_deg": yaw_deg}
-
-
-def extract_battery(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, Any]]:
-    """Extract percentage/voltage/current from a BatteryState-shaped message, or None if not applicable."""
-    if not isinstance(msg, dict):
-        return None
-    if "BatteryState" not in msg_type and not topic.endswith("battery"):
-        return None
-    return {
-        "percentage": msg.get("percentage"),
-        "voltage": msg.get("voltage"),
-        "current": msg.get("current"),
-    }
-
-
-# MAV_GPS_FIX_TYPE labels, used to surface RTK correction quality to the UI.
-GPS_FIX_TYPE_LABELS = {
-    0: "No GPS",
-    1: "No Fix",
-    2: "2D Fix",
-    3: "3D Fix",
-    4: "DGPS",
-    5: "RTK Float",
-    6: "RTK Fixed",
-    7: "Static",
-    8: "PPP",
-}
-
-
-def _gps_raw_int_to_dict(msg: Any, source: str = "GPS_RAW_INT") -> dict[str, Any]:
-    """Convert a pymavlink GPS_RAW_INT/GPS2_RAW message into a plain dictionary."""
-    fix_type = int(getattr(msg, "fix_type", 0))
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    satellites_visible = int(getattr(msg, "satellites_visible", 255))
-    # h_acc/v_acc (mm) are more precise than eph/epv (cm) and present on most modern dialects.
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    horizontal_accuracy_m = (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None)
-    vertical_accuracy_m = (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None)
-    return {
-        "source": source,
-        "fix_type": fix_type,
-        "fix_type_label": GPS_FIX_TYPE_LABELS.get(fix_type, "Unknown"),
-        "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-        "horizontal_accuracy_m": horizontal_accuracy_m,
-        "vertical_accuracy_m": vertical_accuracy_m,
-    }
-
-
-def extract_gps_fix(topic: str, msg_type: str, msg: Any) -> Optional[dict[str, Any]]:
-    """Extract fix type/accuracy from a GPS_RAW_INT-shaped message, or None if not applicable."""
-    if not isinstance(msg, dict):
-        return None
-    if "GPS_RAW_INT" not in msg_type and "GPS2_RAW" not in msg_type and not topic.endswith("gps_fix"):
-        return None
-    return dict(msg)
-
-
-
-def extract_heading(msg: Any) -> Optional[float]:
-    """Extract a normalized 0-360 degree heading from a message, or None if absent."""
-    if not isinstance(msg, dict):
-        return None
-    if "heading" in msg:
-        return float(msg["heading"]) % 360
-    return None
 
 
 def quaternion_to_yaw_deg(q: dict[str, Any]) -> Optional[float]:

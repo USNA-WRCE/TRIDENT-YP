@@ -3,12 +3,12 @@ import { Activity, Anchor, Brush, CircleDashed, Maximize2, PlaneTakeoff, Power, 
 
 import type { Vehicle, VehicleType } from "../types";
 import { calculateRelativePosition } from "../utils/geo";
+import { isSarBehavior } from "../utils/behavior";
 import styles from "./VehicleModal.module.css";
 
 type VehicleModalProps = {
   vehicle: Vehicle;
   shipVehicle?: Vehicle;
-  sarMissionActive?: boolean;
   canCommand?: boolean;
   landOnBoatReady?: boolean;
   onClose: () => void;
@@ -68,7 +68,6 @@ function isGpsFixStale(stamp: number | undefined): boolean {
 export function VehicleModal({
   vehicle,
   shipVehicle,
-  sarMissionActive = false,
   canCommand = true,
   landOnBoatReady = false,
   onClose,
@@ -84,6 +83,7 @@ export function VehicleModal({
   onTakeoff,
 }: VehicleModalProps) {
   const position = vehicle.position;
+  const sarMissionActive = isSarBehavior(vehicle.behavior);
   const [showColorPalette, setShowColorPalette] = useState(false);
   const [showModeSelector, setShowModeSelector] = useState(false);
   const [showTakeoffPanel, setShowTakeoffPanel] = useState(false);
@@ -141,7 +141,7 @@ export function VehicleModal({
         <button className="icon-button" title="Close" onPointerDown={(event) => event.stopPropagation()} onClick={onClose}><X size={20} /></button>
       </div>
       <div className={styles.metrics}>
-        <Metric label="Latitude" value={position?.latitude.toFixed(6) ?? "--"} /><Metric label="Longitude" value={position?.longitude.toFixed(6) ?? "--"} /><Metric label="Altitude" value={`${(position?.altitude ?? 0).toFixed(1)} m`} /><Metric label="Heading" value={`${(vehicle.heading ?? 0).toFixed(0)} deg`} /><Metric label="Battery" value={vehicle.battery?.percentage == null ? "--" : `${Math.round(vehicle.battery.percentage * 100)}%`} /><Metric label="SAR Mission" value={sarMissionActive ? "Running" : "Idle"} />
+        <Metric label="Latitude" value={position?.latitude.toFixed(6) ?? "--"} /><Metric label="Longitude" value={position?.longitude.toFixed(6) ?? "--"} /><Metric label="Altitude" value={`${(position?.altitude ?? 0).toFixed(1)} m`} /><Metric label="Heading" value={`${(vehicle.heading ?? 0).toFixed(0)} deg`} /><Metric label="Battery" value={vehicle.battery?.percentage == null ? "--" : `${Math.round(vehicle.battery.percentage * 100)}%`} /><Metric label="Behavior" value={vehicle.behavior ? vehicle.behavior.replace(/_/g, " ") : "--"} />
         {vehicle.gps_fix && (() => {
           const stale = isGpsFixStale(vehicle.gps_fix!.stamp);
           const tone = stale ? undefined : gpsFixQuality(vehicle.gps_fix!.fix_type);
