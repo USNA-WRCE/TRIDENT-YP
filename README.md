@@ -46,7 +46,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 | `services/server/` | FastAPI backend and authorization/database code |
 | `yp_common/` | Shared SAR geometry and MAVLink mission serialization/upload |
 | `services/sim_vehicle/` | Lightweight simulated vehicles |
-| `services/umaa_bridge/` | UMAA loopback and RTI adapter |
+| `companion_vehicle_software/umaa_piScripts/` | UMAA loopback and RTI adapter |
 | `services/arducopter_ws_bridge/` | ArduPilot WebSocket bridge |
 | `services/yolo_detector/` | Optional YOLO camera detection service |
 | `services/px4_*` and `services/mavros/` | Optional PX4/MAVROS path |
@@ -267,7 +267,8 @@ The other standalone bridge utilities are:
 - `services/server/app/main.py`: FastAPI SITL bridge with waypoint, RTB, SAR, mission-upload, and flight-mode support.
 - `services/px4_mavros_bridge/px4_mavros_bridge.py`: ROS/MAVROS to YP bridge with PX4 mode mapping.
 - `companion_vehicle_software/px4_piScripts/px4_bridge_wServer.py`: Companion-computer PX4/MAVLink bridge with a local configuration/status web page and automatic `.ulg` log download on disarm. Configure its `SERVER_WS_URL`, `VEHICLE_ID`, MAVLink endpoint, and baud rate for the vehicle/network; its default values are examples, not portable deployment settings. It installs dependencies from `companion_vehicle_software/px4_piScripts/requirements.txt` and serves its local page on port `8081` by default.
-- `services/umaa_bridge/umaa_bridge.py`: RTI Connext DDS bridge for UMAA vehicles.
+- `companion_vehicle_software/umaa_piScripts/umaa_bridge.py`: UMAA loopback and RTI bridge harness.
+- `companion_vehicle_software/umaa_piScripts/umaa_bridge_wServer.py`: UMAA bridge with local configuration, restart controls, and diagnostics on port `8082`.
 - `companion_vehicle_software/blueboat_piScripts/simplified_bridge.py`: Minimal MAVLink-to-YP telemetry bridge example.
 
 The ArduPilot and BlueBoat `*_wServer.py` companion bridges automatically request the most recently closed DataFlash log when the vehicle disarms. They save `.bin` files on the companion host and list/serve them from the bridge's local web interface; this is separate from the server's InfluxDB JSONL export. Keep the companion host's `flight_logs/` directory and downloaded files managed according to the vehicle's storage policy.
@@ -528,7 +529,7 @@ The default `sim-umaa` loopback bridge publishes heartbeat, `NavSatFix`, battery
 
 ```bash
 docker compose up --build sim-umaa
-python services/umaa_bridge/sim_umaa_smoke_test.py
+python companion_vehicle_software/umaa_piScripts/sim_umaa_smoke_test.py
 ```
 
 The real RTI shell is enabled with:
@@ -537,7 +538,7 @@ The real RTI shell is enabled with:
 docker compose --profile umaa-real up --build umaa-bridge
 ```
 
-Fill in the vehicle-specific RTI topic map and generated DDS types. See [services/umaa_bridge/README.md](services/umaa_bridge/README.md) for loopback tuning and RTI variables.
+The local configuration and diagnostics page is available at `http://localhost:8082`; Compose persists its settings under `data/umaa/`. The RTI participant and generated DDS type mappings remain explicit integration placeholders, so configuring topic names alone does not create a real vehicle connection. See [companion_vehicle_software/umaa_piScripts/README.md](companion_vehicle_software/umaa_piScripts/README.md) for loopback tuning and RTI variables.
 
 Loopback tuning variables are `LOOPBACK_SPEED_MPS`, `LOOPBACK_TURN_RATE_DPS`, `LOOPBACK_ARRIVAL_RADIUS_M`, `LOOPBACK_BATTERY_DRAIN_PER_M`, and `LOOPBACK_BATTERY_DRAIN_PER_S`. RTI wiring variables include `RTI_DOMAIN_ID`, `RTI_QOS_FILE`, `RTI_SOURCE_GUID`, `RTI_COMMAND_TOPIC`, `RTI_ACK_TOPIC`, `RTI_STATUS_TOPIC`, `RTI_NAVSATFIX_TOPIC`, `RTI_BATTERY_TOPIC`, `RTI_HEARTBEAT_TOPIC`, `RTI_PUBLISHER_NAME`, and `RTI_SUBSCRIBER_NAME`.
 

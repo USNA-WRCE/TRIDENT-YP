@@ -11,6 +11,7 @@ first build a self-contained bundle from the repository root:
 ```sh
 python3 companion_vehicle_software/bundle_bridge.py arducopter /tmp/arducopter_bcs_bridge
 python3 companion_vehicle_software/bundle_bridge.py blueboat /tmp/blueboat_bridge
+python3 companion_vehicle_software/bundle_bridge.py umaa /tmp/umaa_bridge
 ```
 
 Copy the resulting directory to the Pi. Inside that directory, activate your
@@ -24,3 +25,14 @@ without the shared package is no longer sufficient. Make code changes in the
 repository and rebuild the bundle to keep deployments consistent. Bundling
 requires a new destination directory so an existing Pi configuration is never
 overwritten by accident.
+
+The UMAA bundle includes the loopback bridge and its diagnostics entrypoint.
+Installing its Python requirements is sufficient for loopback operation; a real
+RTI deployment also needs the RTI Connext SDK and vehicle-generated DDS types.
+
+The UMAA package is in `umaa_piScripts/`. Its `umaa_bridge.py` entrypoint runs
+the YP WebSocket bridge, while `umaa_bridge_wServer.py` adds a local
+configuration, restart, and diagnostics page on port `8082`. The default
+Compose simulation uses the loopback backend; the optional RTI profile remains
+a scaffold until the vehicle's DDS types and command/telemetry mappings are
+implemented.

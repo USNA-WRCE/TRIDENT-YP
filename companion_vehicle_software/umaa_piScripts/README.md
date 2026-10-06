@@ -1,6 +1,6 @@
 # UMAA Bridge Starter
 
-This service is a starter harness for vehicles that speak UMAA over RTI Connext DDS.
+This companion package is a starter harness for vehicles that speak UMAA over RTI Connext DDS.
 
 What it does:
 - Connects to the YP websocket contract at `/ws/vehicle/{vehicle_id}`.
@@ -14,7 +14,15 @@ Current adapters:
 How to use it:
 1. Set `VEHICLE_ID`, `VEHICLE_TYPE`, and `SERVER_WS_URL`.
 2. Leave `UMAA_BACKEND=loopback` to smoke-test the bridge.
-3. Switch `UMAA_BACKEND=rti` after you wire the DDS topics for your vehicle profile.
+3. Select `UMAA_BACKEND=rti` only after implementing the vehicle-specific DDS participant, type support, and command/report mappings. Entering topic names alone does not enable the hardware path.
+
+Run `python umaa_bridge_wServer.py` to start the bridge with its local
+configuration and diagnostics page at `http://localhost:8082` (`WEB_PORT`
+overrides the port). Configuration is saved to `umaa_config.json` by default;
+`UMAA_CONFIG_PATH` changes that location. Saving settings restarts the bridge
+connection. The page reports YP connectivity, adapter state, recent
+telemetry/commands, and errors. Run `python umaa_bridge.py` without the local
+HTTP server.
 
 Recommended workflow for UMAA:
 1. Run the sim bridge first with `docker compose up sim-umaa`.
@@ -22,7 +30,7 @@ Recommended workflow for UMAA:
 3. When the real vehicle arrives, switch to `docker compose --profile umaa-real up umaa-bridge` and fill in the RTI topic names.
 
 Smoke test client:
-- `python services/umaa_bridge/sim_umaa_smoke_test.py`
+- `python companion_vehicle_software/umaa_piScripts/sim_umaa_smoke_test.py`
 - It connects to `sim-umaa`, sends a waypoint 25 m east, prints telemetry for a few seconds, then sends RTB.
 - Override `--waypoint-distance-m`, `--waypoint-bearing-deg`, or `--rtb-wait-s` if you want a longer or shorter run.
 
@@ -46,4 +54,4 @@ RTI wiring knobs:
 - `RTI_PUBLISHER_NAME`
 - `RTI_SUBSCRIBER_NAME`
 
-The DDS side is intentionally isolated in `RtiConnextUmaaAdapter` so the topic map for a specific UMAA vehicle can be added without touching the websocket contract or the UI.
+The DDS side is intentionally isolated in `RtiConnextUmaaAdapter` so the topic map for a specific UMAA vehicle can be added without touching the websocket contract or the UI. The RTI adapter is not yet a working hardware connection; see `IMPLEMENTATION_BASELINE.md` for the current implementation gaps.

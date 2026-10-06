@@ -14,6 +14,7 @@ import shutil
 BRIDGES = {
     "arducopter": "arducopter_piScripts",
     "blueboat": "blueboat_piScripts",
+    "umaa": "umaa_piScripts",
 }
 
 

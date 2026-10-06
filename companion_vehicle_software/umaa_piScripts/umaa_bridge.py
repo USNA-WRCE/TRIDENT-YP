@@ -44,6 +44,72 @@ RTI_HEARTBEAT_TOPIC = os.getenv("RTI_HEARTBEAT_TOPIC", "")
 RTI_PUBLISHER_NAME = os.getenv("RTI_PUBLISHER_NAME", "")
 RTI_SUBSCRIBER_NAME = os.getenv("RTI_SUBSCRIBER_NAME", "")
 
+CONFIG_CASTERS: dict[str, Any] = {
+    "SERVER_WS_URL": str,
+    "VEHICLE_ID": str,
+    "VEHICLE_TYPE": str,
+    "SEND_HZ": float,
+    "UMAA_BACKEND": str,
+    "RTI_DOMAIN_ID": int,
+    "RTI_QOS_FILE": str,
+    "RTI_SOURCE_GUID": str,
+    "RTI_COMMAND_TOPIC": str,
+    "RTI_ACK_TOPIC": str,
+    "RTI_STATUS_TOPIC": str,
+    "RTI_EXEC_STATUS_TOPIC": str,
+    "RTI_NAVSATFIX_TOPIC": str,
+    "RTI_BATTERY_TOPIC": str,
+    "RTI_HEARTBEAT_TOPIC": str,
+    "RTI_PUBLISHER_NAME": str,
+    "RTI_SUBSCRIBER_NAME": str,
+}
+
+runtime_status: dict[str, Any] = {
+    "status": "starting",
+    "adapter_status": "starting",
+    "server_connected": False,
+    "last_telemetry_at": None,
+    "last_command_at": None,
+    "last_command_error": None,
+    "last_error": None,
+}
+
+
+def current_configuration() -> dict[str, Any]:
+    return {name: globals()[name] for name in CONFIG_CASTERS}
+
+
+def validate_configuration(values: dict[str, Any]) -> dict[str, Any]:
+    configuration = current_configuration()
+    for name, value in values.items():
+        if name not in CONFIG_CASTERS:
+            raise ValueError(f"Unsupported configuration field: {name}")
+        try:
+            configuration[name] = CONFIG_CASTERS[name](value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid value for {name}: {value}") from exc
+
+    configuration["UMAA_BACKEND"] = configuration["UMAA_BACKEND"].lower()
+    if configuration["UMAA_BACKEND"] not in {"loopback", "rti", "rticonnext", "dds"}:
+        raise ValueError("UMAA_BACKEND must be loopback or rti")
+    if not configuration["SERVER_WS_URL"].strip():
+        raise ValueError("SERVER_WS_URL is required")
+    if not configuration["VEHICLE_ID"].strip():
+        raise ValueError("VEHICLE_ID is required")
+    if not configuration["VEHICLE_TYPE"].strip():
+        raise ValueError("VEHICLE_TYPE is required")
+    if not math.isfinite(configuration["SEND_HZ"]) or configuration["SEND_HZ"] <= 0:
+        raise ValueError("SEND_HZ must be a finite number greater than zero")
+    if configuration["RTI_DOMAIN_ID"] < 0:
+        raise ValueError("RTI_DOMAIN_ID cannot be negative")
+    return configuration
+
+
+def apply_configuration(values: dict[str, Any]) -> dict[str, Any]:
+    configuration = validate_configuration(values)
+    globals().update(configuration)
+    return configuration
+
 
 @dataclass(slots=True)
 class TelemetryEvent:
@@ -374,12 +440,10 @@ class RtiConnextUmaaAdapter(UmaaAdapter):
         }
 
     async def start(self) -> None:
-        self._running = True
-        print(
-            "[DDS] RTI backend configured for domain "
-            f"{RTI_DOMAIN_ID} with QoS file={RTI_QOS_FILE or '<default>'}"
+        raise NotImplementedError(
+            "RTI DDS participant/readers/writers are not implemented. Replace this placeholder with "
+            "the vehicle profile's generated UMAA type support, QoS loading, and configured topic bindings."
         )
-        self._reader_task = asyncio.create_task(self._reader_loop(), name=f"umaa-dds-reader-{VEHICLE_ID}")
 
     async def stop(self) -> None:
         self._running = False
@@ -400,17 +464,16 @@ class RtiConnextUmaaAdapter(UmaaAdapter):
         return events
 
     async def send_command(self, command: dict[str, Any], source: str | None = None) -> None:
-        print(f"[DDS] command source={source} topic={self._topic_map['command']} payload={command}")
         raise NotImplementedError(
-            "Wire this adapter to the UMAA command provider/consumer types from rticonnextdds-usecases-umaa. "
-            "This starter now validates the required topic configuration and provides the mapping surface."
+            "YP-to-UMAA command mapping is not implemented. Map command.type and its target/waypoints "
+            "to the vehicle's generated command type, publish it on the command topic, and correlate its acknowledgement."
         )
 
     async def _reader_loop(self) -> None:
-        # Replace this with the specific UMAA readers for your vehicle.
-        # The bridge harness expects TelemetryEvent instances to be enqueued here.
-        while self._running:
-            await asyncio.sleep(1.0)
+        raise NotImplementedError(
+            "UMAA telemetry readers are not implemented. Deserialize the vehicle's status, navigation, "
+            "battery, and heartbeat reports and enqueue mapped TelemetryEvent instances."
+        )
 
 
 def build_adapter() -> UmaaAdapter:
@@ -424,21 +487,33 @@ async def send_vehicle_payload(ws: websockets.WebSocketClientProtocol, event: Te
 
 
 async def run_bridge() -> None:
-    adapter = build_adapter()
-    await adapter.start()
-
-    uri = f"{SERVER_WS_URL.rstrip('/')}/{VEHICLE_ID}"
-    print(f"[INFO] UMAA bridge backend={UMAA_BACKEND} vehicle={VEHICLE_ID}")
-    print(f"[INFO] WebSocket URL: {uri}")
-
+    adapter: UmaaAdapter | None = None
+    runtime_status.update(
+        status="starting",
+        adapter_status="starting",
+        server_connected=False,
+        last_command_error=None,
+        last_error=None,
+    )
     try:
+        adapter = build_adapter()
+        await adapter.start()
+        runtime_status["adapter_status"] = "ready"
+        runtime_status["status"] = "connecting"
+
+        uri = f"{SERVER_WS_URL.rstrip('/')}/{VEHICLE_ID}"
+        print(f"[INFO] UMAA bridge backend={UMAA_BACKEND} vehicle={VEHICLE_ID}")
+        print(f"[INFO] WebSocket URL: {uri}")
+
         while True:
             try:
                 async with websockets.connect(uri, ping_interval=10, ping_timeout=10) as ws:
                     print(f"[INFO] Connected to YP server as {VEHICLE_ID}")
+                    runtime_status.update(status="connected", server_connected=True, last_error=None)
                     while True:
                         for event in await adapter.drain_events():
                             await send_vehicle_payload(ws, event)
+                            runtime_status["last_telemetry_at"] = time.time()
 
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0 / max(SEND_HZ, 1.0))
@@ -454,12 +529,21 @@ async def run_bridge() -> None:
                         if not isinstance(command, dict):
                             continue
 
-                        await adapter.send_command(command, source=str(payload.get("source") or "ui"))
+                        try:
+                            await adapter.send_command(command, source=str(payload.get("source") or "ui"))
+                        except NotImplementedError as exc:
+                            runtime_status["last_command_error"] = str(exc)
+                            print(f"[ERROR] UMAA command not handled: {exc}")
+                            continue
+                        runtime_status["last_command_at"] = time.time()
             except Exception as exc:
+                runtime_status.update(status="reconnecting", server_connected=False, last_error=str(exc))
                 print(f"[WARN] UMAA bridge reconnecting after error: {exc}")
                 await asyncio.sleep(2.0)
     finally:
-        await adapter.stop()
+        runtime_status.update(status="stopped", adapter_status="stopped", server_connected=False)
+        if adapter is not None:
+            await adapter.stop()
 
 
 if __name__ == "__main__":
