@@ -28,6 +28,23 @@ from yp_common.geometry import (
     north_east_delta_m as _north_east_delta_m,
 )
 
+from yp_common.telemetry import (
+    BEHAVIOR_ABSOLUTE_MISSION,
+    BEHAVIOR_IDLE,
+    BEHAVIOR_MOB_SEARCH,
+    BEHAVIOR_RETURN_TO_BOAT,
+    BEHAVIOR_SEARCH_GRID,
+    BEHAVIOR_SHIP_RELATIVE,
+    BEHAVIOR_TAKEOFF,
+    BEHAVIOR_WAYPOINT,
+    EVENT_LAND_ON_BOAT_TOUCHDOWN,
+    BehaviorTracker,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
+
 CONFIG_PATH = Path("config.json")
 
 def _resolve_webrtc_ip() -> str:
@@ -73,7 +90,9 @@ system_status = {
     "satellites": 0,
     "last_hb_time": 0,
     "last_gps_fix_forwarded_at": 0.0,
+    "behavior": BEHAVIOR_IDLE,
 }
+behavior_tracker = BehaviorTracker(on_change=lambda behavior: system_status.__setitem__("behavior", behavior))
 
 # SAR & Global Variables
 VEHICLE_TYPE = os.getenv("VEHICLE_TYPE", "uav")
@@ -178,6 +197,10 @@ HTML_TEMPLATE = """
                 <div class="diag-label">GPS Status</div>
                 <div class="diag-value" id="gps_status" style="color: #f59e0b;">No Fix</div>
             </div>
+            <div class="diag-item">
+                <div class="diag-label">Behavior</div>
+                <div class="diag-value" id="behavior" style="color: #a78bfa;">idle</div>
+            </div>
         </div>
     </div>
 
@@ -249,6 +272,7 @@ HTML_TEMPLATE = """
                 wsElem.className = 'badge ' + (data.ws_connected ? 'badge-online' : 'badge-offline');
 
                 document.getElementById('flight_mode').innerText = data.flight_mode;
+                document.getElementById('behavior').innerText = data.behavior.replace(/_/g, ' ');
                 
                 const gpsText = data.gps_status + (data.satellites > 0 ? ` (${{data.satellites}} Sats)` : '');
                 document.getElementById('gps_status').innerText = gpsText;
@@ -386,49 +410,6 @@ async def start_web_server():
 def get_gps_fix_label(fix_type: int) -> str:
     fix_map = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
     return fix_map.get(fix_type, f"Fix {fix_type}")
-
-def create_gps_fix_message(vehicle_id: str, msg) -> dict:
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    fix_type = getattr(msg, "fix_type", 0)
-    satellites_visible = getattr(msg, "satellites_visible", 255)
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/gps_fix",
-        "type": "mavlink/GPS_RAW_INT",
-        "stamp": time.time(),
-        "msg": {
-            "fix_type": fix_type,
-            "fix_type_label": get_gps_fix_label(fix_type),
-            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-        },
-    }
-
-def create_navsatfix_message(vehicle_id: str, lat: float, lon: float, alt: float, heading: float | None = None) -> dict:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-    payload = {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{vehicle_id}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": {
-            "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-            "status": {"status": 0, "service": 1},
-            "latitude": lat, "longitude": lon, "altitude": alt,
-            "position_covariance": [0.0] * 9, "position_covariance_type": 0,
-        },
-    }
-    if heading is not None:
-        payload["msg"]["heading"] = heading
-    return payload
 
 def create_video_stream_message(vehicle_id: str, webrtc_ip: str) -> dict:
     return {
@@ -699,6 +680,12 @@ def _launch_ship_relative_mission(master, command_data: dict) -> None:
     _ship_relative_thread.start()
 
 def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool = False, loop_count: int = 1, hold_last_waypoint: bool = False) -> None:
+    try:
+        _run_ship_relative_mission_inner(master, ship_vehicle_id, local_waypoints, arrival_radius_m, update_hz, stop_event, face_ship, loop_count, hold_last_waypoint)
+    finally:
+        behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
+
+def _run_ship_relative_mission_inner(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool, loop_count: int, hold_last_waypoint: bool) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
     offboard_confirmed = False
     prestream_started = time.monotonic()
@@ -823,7 +810,11 @@ def _execute_takeoff_raw(master, altitude_m: float) -> None:
 def _run_single_waypoint(master, lat, lon, alt):
     with _sar_mission_lock:
         _sar_stop_event.clear()
-        _stream_waypoints_offboard(master, [[lat, lon, alt]], SAR_ARRIVAL_RADIUS_M)
+        try:
+            _stream_waypoints_offboard(master, [[lat, lon, alt]], SAR_ARRIVAL_RADIUS_M)
+        finally:
+            behavior_tracker.finish(BEHAVIOR_WAYPOINT)
+            behavior_tracker.finish(BEHAVIOR_RETURN_TO_BOAT)
 
 def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m: float, altitude_m: float) -> None:
     if VEHICLE_TYPE in ["usv", "ugv"]: altitude_m = 0.0
@@ -838,6 +829,8 @@ def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m
             _stream_waypoints_offboard(master, waypoints, SAR_ARRIVAL_RADIUS_M)
         except Exception as exc: 
             print(f"SAR Error: {exc}")
+        finally:
+            behavior_tracker.finish(BEHAVIOR_SEARCH_GRID)
 
 def _run_mob_search(master, track_points: list, corridor_half_width_m: float, swath_m: float, altitude_m: float, takeoff_altitude_m: float, climb_speed_ms: float) -> None:
     if VEHICLE_TYPE in ["usv", "ugv"]: altitude_m, takeoff_altitude_m = 0.0, 0.0
@@ -863,6 +856,8 @@ def _run_mob_search(master, track_points: list, corridor_half_width_m: float, sw
             _stream_waypoints_offboard(master, waypoints, SAR_ARRIVAL_RADIUS_M)
         except Exception as exc: 
             print(f"SAR Error: {exc}")
+        finally:
+            behavior_tracker.finish(BEHAVIOR_MOB_SEARCH)
 
 def _run_takeoff(master, altitude_m: float) -> None:
     with _sar_mission_lock:
@@ -870,9 +865,12 @@ def _run_takeoff(master, altitude_m: float) -> None:
             _execute_takeoff_raw(master, altitude_m)
         except Exception as exc:
             print(f"[MISSION] takeoff error: {exc}")
+        finally:
+            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
 
 def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guided_on_complete: bool) -> None:
     """PX4 specific custom mission uploader to bypass ArduPilot formatting."""
+    mission_started = False
     with _sar_mission_lock:
         _pause_telemetry.set()
         try:
@@ -908,6 +906,7 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
             
             ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=2.0)
             if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                mission_started = True
                 print("[MISSION] PX4 mission uploaded successfully")
                 if auto_arm_start:
                     master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
@@ -919,6 +918,8 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
             print(f"[MISSION] Upload error: {exc}")
         finally:
             _pause_telemetry.clear()
+            if not mission_started:
+                behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
 
 def _download_latest_dataflash_log(master, vehicle_id: str) -> None:
     with _sar_mission_lock:
@@ -1047,16 +1048,15 @@ async def telemetry_loop(current_config: dict) -> None:
                             if cmd_type not in ("ship_relative_trajectory", "rtcm_data"):
                                 _stop_ship_relative_mission()
 
+                            if cmd_type != "rtcm_data":
+                                behavior_tracker.set(behavior_for_command(cmd_type, server_msg.get("source")))
+
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
                             elif cmd_type == "land_on_boat_step":
                                 if execute_land_step(master, command_data):
-                                    await ws.send(json.dumps({
-                                        "vehicle_id": vehicle_id,
-                                        "type": "yp_ground_station/LandOnBoatTouchdown",
-                                        "msg": {"landed": True},
-                                        "stamp": time.time(),
-                                    }))
+                                    behavior_tracker.set(BEHAVIOR_IDLE)
+                                    await ws.send(json.dumps(build_event(vehicle_id, VEHICLE_TYPE, EVENT_LAND_ON_BOAT_TOUCHDOWN)))
                             elif cmd_type == "waypoint" and None not in (command_data.get("target", {}).get("latitude"), command_data.get("target", {}).get("longitude"), command_data.get("target", {}).get("altitude")):
                                 # PX4 requires offboard computer to continuously send waypoint setpoints at atleast 2 Hz
                                 # goto_waypoint(master, command_data["target"]["latitude"], command_data["target"]["longitude"], command_data["target"]["altitude"], force_offboard=(True if server_msg.get("source") != "rtb_follow" else _rtb_waypoint_should_force_offboard()))
@@ -1122,6 +1122,10 @@ async def telemetry_loop(current_config: dict) -> None:
                     try:
                         system_status["flight_mode"] = get_px4_mode(msg.custom_mode)
                     except Exception: pass
+                    if not armed:
+                        behavior_tracker.set(BEHAVIOR_IDLE)
+                    else:
+                        behavior_tracker.observe_mode(system_status["flight_mode"], guided_modes=("OFFBOARD", "AUTO.TAKEOFF", "AUTO.LAND"), auto_modes=("AUTO.MISSION", "AUTO"))
                 elif msg_type == "COMMAND_ACK":
                     if msg.command in (
                         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
@@ -1139,7 +1143,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(create_gps_fix_message(vehicle_id, msg)))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                     if now - system_status["last_gps_fix_forwarded_at"] >= 10.0:
                         system_status["last_gps_fix_forwarded_at"] = now
@@ -1159,7 +1163,8 @@ async def telemetry_loop(current_config: dict) -> None:
             if ws is not None:
                 try:
                     if telemetry_sample is not None and (now - last_send_time) >= (1.0 / send_hz):
-                        await ws.send(json.dumps(create_navsatfix_message(vehicle_id, *telemetry_sample)))
+                        lat, lon, alt, heading = telemetry_sample
+                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"], armed=_armed_state)))
                         last_send_time = now
 
                     if now - last_video_send_time >= 60.0:

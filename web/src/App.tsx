@@ -55,6 +55,8 @@ const WaypointPlanner = lazy(() => import("./components/WaypointPlanner").then((
 
 const USNA_CENTER: [number, number] = [38.9822, -76.4819];
 const MAX_MESSAGE_LOG = 700;
+// rtb/land_on_boat are excluded: they snap the crosshair to the YP themselves.
+const BEHAVIOR_COMMANDS_CLEARING_WAYPOINT = new Set(["trajectory", "search_grid", "ship_relative_trajectory", "mission_plan", "mob"]);
 const DEMO_MODE = import.meta.env.VITE_STATIC_DEMO === "true" || window.location.pathname.startsWith("/demo") || window.location.search.includes("demo=true");
 /** View-only mode: live data but commands blocked for real (non-sim) vehicles. */
 const VIEW_MODE = !DEMO_MODE && (window.location.pathname.startsWith("/view") || window.location.search.includes("view=true"));
@@ -234,7 +236,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [sarPatterns, setSarPatterns] = useState<Record<string, { patternType: string; waypoints: [number, number][] }>>({});
   const [missionPlans, setMissionPlans] = useState<Record<string, [number, number][]>>({});
   const [shipRelativePlans, setShipRelativePlans] = useState<Record<string, { shipVehicleId: string; localWaypoints: RelativeWaypoint[] }>>({});
-  const [sarMissionActiveByVehicle, setSarMissionActiveByVehicle] = useState<Record<string, boolean>>({});
   const [rtbFollowState, setRtbFollowState] = useState<Record<string, boolean>>({});
   const spokenFeedback = useSpokenFeedback();
   const spokenFeedbackRef = useRef(spokenFeedback.speak);
@@ -253,7 +254,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         const snapshotVehicles = payload.vehicles as Vehicle[];
         spokenConnectionStatesRef.current = Object.fromEntries(snapshotVehicles.map((vehicle) => [vehicle.vehicle_id, vehicle.connected]));
         setVehicles(Object.fromEntries(snapshotVehicles.map((vehicle) => [vehicle.vehicle_id, withLocalVehicleColor(vehicle, localVehicleColorsRef.current)])));
-        setMessageLog(snapshotMessages(snapshotVehicles).slice(0, MAX_MESSAGE_LOG));
+        setMessageLog([]);
         setWaypointMarkers(Object.fromEntries((payload.waypoints as WaypointMarker[] | undefined ?? []).map((waypoint) => [waypoint.vehicle_id, waypoint])));
         setSarPatterns(Object.fromEntries(Object.entries(payload.sar_patterns as Record<string, { pattern_type: string; waypoints: [number, number][] }> | undefined ?? {}).map(([vehicleId, pattern]) => [vehicleId, { patternType: pattern.pattern_type, waypoints: pattern.waypoints }])));
         setMissionPlans(payload.mission_plans as Record<string, [number, number][]> ?? {});
@@ -292,10 +293,10 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         setVehicles((current) => {
           const prev = current[incoming.vehicle_id];
           const prevHistory: Position[] = prev?.history ?? [];
-          const msgType: string = (payload.message as { type?: string } | undefined)?.type ?? "";
+          const telemetry = payload.message as { position?: unknown; stamp?: number } | undefined;
           const pos = incoming.position;
-          const stamp: number | undefined = (payload.message as { stamp?: number } | undefined)?.stamp;
-          const newHistory: Position[] = msgType.includes("NavSatFix") && pos
+          const stamp: number | undefined = telemetry?.stamp;
+          const newHistory: Position[] = telemetry?.position && pos
             ? [...prevHistory, { latitude: pos.latitude, longitude: pos.longitude, altitude: pos.altitude, stamp }].slice(-500)
             : prevHistory;
           return { ...current, [incoming.vehicle_id]: { ...incoming, history: newHistory } };
@@ -308,7 +309,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         if (acknowledgement) spokenFeedbackRef.current(acknowledgement);
         const ackVehicleId = payload.vehicle_id as string | undefined;
         const ackCommandType = (payload.command as { type?: string } | undefined)?.type;
-        if (ackVehicleId && ackCommandType) updateSarMissionState(ackVehicleId, ackCommandType);
+        if (ackVehicleId && ackCommandType) onCommandIssued(ackVehicleId, ackCommandType, false);
       }
       if (payload.op === "sitl_bridge_update") {
         const bridge = payload.bridge as SITLBridge;
@@ -324,9 +325,9 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       if (payload.op === "vehicle_removed") {
         const removedId = payload.vehicle_id as string;
         setVehicles((current) => { const next = { ...current }; delete next[removedId]; return next; });
-        setSarMissionActiveByVehicle((current) => { const next = { ...current }; delete next[removedId]; return next; });
         setSitlBridges((current) => { const next = { ...current }; delete next[removedId]; return next; });
         setRtbFollowState((current) => { const next = { ...current }; delete next[removedId]; return next; });
+        setWaypointMarkers((current) => { const next = { ...current }; delete next[removedId]; return next; });
       }
       if (payload.op === "sar_pattern") {
         setSarPatterns((current) => ({ ...current, [payload.vehicle_id as string]: { patternType: payload.pattern_type as string, waypoints: payload.waypoints as [number, number][] } }));
@@ -362,17 +363,17 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           delete next[disconnectedId];
           return next;
         });
-        setSarMissionActiveByVehicle((current) => {
-          const next = { ...current };
-          delete next[disconnectedId];
-          return next;
-        });
         setSitlBridges((current) => {
           const next = { ...current };
           delete next[disconnectedId];
           return next;
         });
         setRtbFollowState((current) => {
+          const next = { ...current };
+          delete next[disconnectedId];
+          return next;
+        });
+        setWaypointMarkers((current) => {
           const next = { ...current };
           delete next[disconnectedId];
           return next;
@@ -426,16 +427,15 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   
   const [activeTab, setActiveTab] = useState<"map" | "mission" | "planner" | "history">("map");
 
-  const updateSarMissionState = (vehicleId: string, commandType: string) => {
-    setSarMissionActiveByVehicle((current) => {
-      const next = { ...current };
-      if (commandType === "search_grid" || commandType === "mob") {
-        next[vehicleId] = true;
-      } else if (commandType === "cancel_sar" || commandType === "rtb" || commandType === "waypoint") {
-        next[vehicleId] = false;
-      }
-      return next;
-    });
+  const onCommandIssued = (vehicleId: string, commandType: string, clearWaypoint = true) => {
+    if (clearWaypoint && BEHAVIOR_COMMANDS_CLEARING_WAYPOINT.has(commandType)) {
+      setWaypointMarkers((current) => {
+        if (!(vehicleId in current)) return current;
+        const next = { ...current };
+        delete next[vehicleId];
+        return next;
+      });
+    }
   };
 
   useEffect(() => {
@@ -739,7 +739,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
     if (VIEW_MODE && !isSimVehicle(vehicleId)) {
       return false;
     }
-    updateSarMissionState(vehicleId, body.type);
+    onCommandIssued(vehicleId, body.type);
     if (DEMO_MODE) {
       handleDemoCommand(demoSimsRef.current, vehicleId, body);
       return true;
@@ -783,8 +783,8 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         receivedAt: Date.now(),
         vehicle_id: vehicleId,
         vehicle_type: "uav",
-        topic: `/vehicles/${vehicleId}/commands`,
-        type: "yp_ground_station/MOBTriggered",
+        topic: `${vehicleId}/command`,
+        type: "mob_triggered",
         stamp: Date.now() / 1000,
         msg: result.ok
           ? { status: "dispatched", vehicle_id: vehicleId }
@@ -794,7 +794,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       setMessageLog((current) => [mobMessage, ...current].slice(0, MAX_MESSAGE_LOG));
 
       if (result.ok) {
-        updateSarMissionState(vehicleId, "mob");
+        onCommandIssued(vehicleId, "mob");
         setMobModalOpen(false);
       } else {
         const message = result.error ?? "Dispatch failed";
@@ -1741,7 +1741,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           // Lookup the live vehicle data, fallback to the snapshot if it briefly disconnects
           vehicle={vehicles[selected.vehicle_id] || selected}
           shipVehicle={yp}
-          sarMissionActive={Boolean(sarMissionActiveByVehicle[selected.vehicle_id])}
           canCommand={!VIEW_MODE || isSimVehicle(selected.vehicle_id)}
           landOnBoatReady={Boolean(rtbFollowState[selected.vehicle_id])}
           onClose={() => setSelected(null)}
@@ -1923,41 +1922,28 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   );
 }
 
-function streamMessageFromPayload(payload: DemoMessagePayload | {
+type TelemetryLikePayload = Record<string, unknown> & {
   vehicle_id?: string;
   vehicle_type?: VehicleType;
-  topic?: string;
-  type?: string;
   stamp?: number;
-  msg?: Record<string, unknown>;
-}): StreamMessage {
-  const receivedAt = Date.now();
-  return {
-    id: `${payload.topic ?? "message"}-${payload.stamp ?? receivedAt}-${receivedAt}`,
-    receivedAt,
-    vehicle_id: payload.vehicle_id ?? topicParts(payload.topic ?? "")[1] ?? "unknown",
-    vehicle_type: payload.vehicle_type ?? "uav",
-    topic: payload.topic ?? "/unknown",
-    type: payload.type ?? "unknown",
-    stamp: payload.stamp ?? receivedAt / 1000,
-    msg: payload.msg ?? {},
-  };
-}
+  op?: string;
+};
 
-function snapshotMessages(vehicles: Vehicle[]): StreamMessage[] {
+function streamMessageFromPayload(payload: TelemetryLikePayload | DemoMessagePayload): StreamMessage {
   const receivedAt = Date.now();
-  return vehicles.flatMap((vehicle) =>
-    Object.entries(vehicle.messages ?? {}).map(([topic, message]) => ({
-      id: `${topic}-${message.stamp}-snapshot-${receivedAt}`,
-      receivedAt,
-      vehicle_id: vehicle.vehicle_id,
-      vehicle_type: vehicle.vehicle_type,
-      topic,
-      type: message.type,
-      stamp: message.stamp,
-      msg: message.msg,
-    })),
-  ).sort((a, b) => b.stamp - a.stamp);
+  const { op, vehicle_id, vehicle_type, stamp, ...msg } = payload as TelemetryLikePayload;
+  const kind = op ?? "telemetry";
+  const vehicleId = vehicle_id ?? "unknown";
+  return {
+    id: `${vehicleId}/${kind}-${stamp ?? receivedAt}-${receivedAt}`,
+    receivedAt,
+    vehicle_id: vehicleId,
+    vehicle_type: vehicle_type ?? "uav",
+    topic: `${vehicleId}/${kind}`,
+    type: kind,
+    stamp: stamp ?? receivedAt / 1000,
+    msg,
+  };
 }
 
 function streamMessageFromCommandAck(payload: {
@@ -1970,12 +1956,12 @@ function streamMessageFromCommandAck(payload: {
   const receivedAt = Date.now();
   const vehicleId = payload.vehicle_id ?? "unknown";
   return {
-    id: `/vehicles/${vehicleId}/commands-${payload.stamp ?? receivedAt}-${receivedAt}`,
+    id: `${vehicleId}/command-${payload.stamp ?? receivedAt}-${receivedAt}`,
     receivedAt,
     vehicle_id: vehicleId,
     vehicle_type: "uav",
-    topic: `/vehicles/${vehicleId}/commands`,
-    type: "yp_ground_station/CommandAck",
+    topic: `${vehicleId}/command`,
+    type: "command_ack",
     stamp: payload.stamp ?? receivedAt / 1000,
     msg: {
       delivered: payload.delivered,

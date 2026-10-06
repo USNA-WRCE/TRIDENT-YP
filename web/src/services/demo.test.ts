@@ -3,15 +3,16 @@ import { createDemoVehicles, demoVehicleSnapshot, handleDemoCommand, stepDemoVeh
 import { haversineMeters } from "../utils/geo";
 
 describe("hardware-free telemetry and commands", () => {
-  it("publishes the same five telemetry topics per vehicle with a bounded trail", () => {
+  it("publishes one telemetry payload per vehicle step with a bounded trail", () => {
     const vehicles = createDemoVehicles();
     expect(new Set(vehicles.map((vehicle) => vehicle.vehicle_id)).size).toBe(vehicles.length);
     for (let tick = 0; tick < 510; tick++) {
       for (const vehicle of vehicles) {
         const messages = stepDemoVehicle(vehicle, 0.2, tick / 5, vehicles);
-        expect(messages.map((message) => message.topic.split("/").pop())).toEqual([
-          "heartbeat", "navsatfix", "pose", "battery", "trajectory",
-        ]);
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toMatchObject({ op: "telemetry", vehicle_id: vehicle.vehicle_id });
+        expect(messages[0].position.latitude).toBeCloseTo(vehicle.lat);
+        expect(typeof messages[0].behavior).toBe("string");
       }
     }
     for (const vehicle of vehicles) {
@@ -19,7 +20,8 @@ describe("hardware-free telemetry and commands", () => {
       expect(snapshot.connected).toBe(true);
       expect(snapshot.history).toHaveLength(500);
       expect(snapshot.position?.latitude).toBeCloseTo(vehicle.lat);
-      expect(Object.keys(snapshot.messages)).toHaveLength(5);
+      expect(snapshot.behavior).toBeTruthy();
+      expect(snapshot).not.toHaveProperty("messages");
     }
   });
 

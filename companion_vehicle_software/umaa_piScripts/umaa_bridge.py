@@ -11,6 +11,16 @@ from typing import Any
 
 import websockets
 
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    BEHAVIOR_RETURN_TO_BOAT,
+    BEHAVIOR_SHIP_RELATIVE,
+    EVENT_MISSION_COMPLETE,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+)
+
 
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://yp-server:8000/ws/vehicle")
 VEHICLE_ID = os.getenv("VEHICLE_ID", "sim-umaa")
@@ -115,20 +125,33 @@ def apply_configuration(values: dict[str, Any]) -> dict[str, Any]:
 class TelemetryEvent:
     vehicle_id: str
     vehicle_type: str
-    topic: str
-    msg_type: str
-    msg: dict[str, Any]
+    latitude: float | None = None
+    longitude: float | None = None
+    altitude: float | None = None
+    heading: float | None = None
+    behavior: str | None = None
+    mode: str | None = None
+    armed: bool | None = None
+    battery: dict[str, Any] | None = None
+    event: str | None = None  # set for one-shot events such as mission_complete
     stamp: float = field(default_factory=time.time)
 
     def to_payload(self) -> dict[str, Any]:
-        return {
-            "vehicle_id": self.vehicle_id,
-            "vehicle_type": self.vehicle_type,
-            "topic": self.topic,
-            "type": self.msg_type,
-            "stamp": self.stamp,
-            "msg": self.msg,
-        }
+        if self.event:
+            return build_event(self.vehicle_id, self.vehicle_type, self.event, stamp=self.stamp)
+        return build_telemetry(
+            self.vehicle_id,
+            self.vehicle_type,
+            latitude=self.latitude,
+            longitude=self.longitude,
+            altitude=self.altitude,
+            heading=self.heading,
+            behavior=self.behavior,
+            mode=self.mode,
+            armed=self.armed,
+            battery=self.battery,
+            stamp=self.stamp,
+        )
 
 
 class UmaaAdapter(ABC):
@@ -162,11 +185,12 @@ class LoopbackUmaaAdapter(UmaaAdapter):
         self._target: dict[str, float] | None = None
         self._mission_queue: list[dict[str, float]] = []
         self._mode = "idle"
+        self._behavior = BEHAVIOR_IDLE
+        self._mission_active = False
 
     async def start(self) -> None:
         self._running = True
         self._last_tick = time.time()
-        await self._queue_baseline()
 
     async def stop(self) -> None:
         self._running = False
@@ -219,7 +243,11 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                     self._mode = "mission"
                 else:
                     self._mode = "holding"
+                    self._behavior = BEHAVIOR_IDLE
                     self._target = None
+                    if self._mission_active:
+                        self._mission_active = False
+                        self._events.put_nowait(TelemetryEvent(VEHICLE_ID, VEHICLE_TYPE, event=EVENT_MISSION_COMPLETE))
             else:
                 step_m = min(distance_m, LOOPBACK_SPEED_MPS * dt)
                 bearing_deg = math.degrees(math.atan2(
@@ -257,10 +285,7 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                 break
 
         if self._running and not events:
-            await self._queue_heartbeat()
-            await self._queue_navsatfix()
-            await self._queue_battery()
-            await self._queue_bridge_status()
+            await self._queue_telemetry()
             while True:
                 try:
                     events.append(self._events.get_nowait())
@@ -280,6 +305,8 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                 "altitude": float(target.get("altitude", LOOPBACK_ALT)),
             }
             self._mode = "guiding"
+            self._mission_active = False
+            self._behavior = behavior_for_command(cmd_type, source) or BEHAVIOR_IDLE
         elif cmd_type == "rtb":
             self._mission_queue = []
             self._target = {
@@ -288,10 +315,14 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                 "altitude": LOOPBACK_ALT,
             }
             self._mode = "returning"
+            self._mission_active = False
+            self._behavior = BEHAVIOR_RETURN_TO_BOAT
         elif cmd_type == "cancel_sar":
             self._mission_queue = []
             self._target = None
             self._mode = "holding"
+            self._mission_active = False
+            self._behavior = BEHAVIOR_IDLE
         elif cmd_type == "mission_plan":
             waypoints = command.get("waypoints") or []
             parsed: list[dict[str, float]] = []
@@ -313,10 +344,14 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                 self._target = parsed[0]
                 self._mission_queue = parsed[1:]
                 self._mode = "mission"
+                self._mission_active = True
+                self._behavior = behavior_for_command(cmd_type) or BEHAVIOR_IDLE
         elif cmd_type in {"search_grid", "mob", "trajectory", "ship_relative_trajectory"}:
             self._mission_queue = []
             self._target = None
             self._mode = cmd_type
+            self._mission_active = False
+            self._behavior = behavior_for_command(cmd_type) or BEHAVIOR_SHIP_RELATIVE
         elif cmd_type == "set_mode":
             mode = command.get("mode")
             if mode:
@@ -325,76 +360,19 @@ class LoopbackUmaaAdapter(UmaaAdapter):
                 print(f"[LOOPBACK] set_mode requested: {mode}")
         print(f"[LOOPBACK] command source={source} payload={command}")
 
-    async def _queue_baseline(self) -> None:
+    async def _queue_telemetry(self) -> None:
         await self._events.put(
             TelemetryEvent(
                 vehicle_id=VEHICLE_ID,
                 vehicle_type=VEHICLE_TYPE,
-                topic=f"/vehicles/{VEHICLE_ID}/status",
-                msg_type="yp_ground_station/msg/BridgeStatus",
-                msg={"backend": "loopback", "status": "connected", "mode": self._mode},
-            )
-        )
-
-    async def _queue_heartbeat(self) -> None:
-        await self._events.put(
-            TelemetryEvent(
-                vehicle_id=VEHICLE_ID,
-                vehicle_type=VEHICLE_TYPE,
-                topic=f"/vehicles/{VEHICLE_ID}/heartbeat",
-                msg_type="yp_ground_station/msg/Heartbeat",
-                msg={"mode": self._mode, "armed": self._target is not None},
-            )
-        )
-
-    async def _queue_navsatfix(self) -> None:
-        stamp = time.time()
-        sec = int(stamp)
-        nanosec = int((stamp - sec) * 1_000_000_000)
-        await self._events.put(
-            TelemetryEvent(
-                vehicle_id=VEHICLE_ID,
-                vehicle_type=VEHICLE_TYPE,
-                topic=f"/vehicles/{VEHICLE_ID}/navsatfix",
-                msg_type="sensor_msgs/msg/NavSatFix",
-                msg={
-                    "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-                    "status": {"status": 0, "service": 1},
-                    "latitude": self._lat,
-                    "longitude": self._lon,
-                    "altitude": self._alt,
-                    "position_covariance": [0.0] * 9,
-                    "position_covariance_type": 0,
-                    "heading": self._heading,
-                },
-            )
-        )
-
-    async def _queue_battery(self) -> None:
-        await self._events.put(
-            TelemetryEvent(
-                vehicle_id=VEHICLE_ID,
-                vehicle_type=VEHICLE_TYPE,
-                topic=f"/vehicles/{VEHICLE_ID}/battery",
-                msg_type="sensor_msgs/msg/BatteryState",
-                msg={"percentage": self._battery, "voltage": 24.0, "current": 0.0},
-            )
-        )
-
-    async def _queue_bridge_status(self) -> None:
-        await self._events.put(
-            TelemetryEvent(
-                vehicle_id=VEHICLE_ID,
-                vehicle_type=VEHICLE_TYPE,
-                topic=f"/vehicles/{VEHICLE_ID}/status",
-                msg_type="yp_ground_station/msg/BridgeStatus",
-                msg={
-                    "backend": "loopback",
-                    "status": "connected" if self._battery > 0 else "low_battery",
-                    "mode": self._mode,
-                    "target_active": self._target is not None,
-                    "battery": round(self._battery, 4),
-                },
+                latitude=self._lat,
+                longitude=self._lon,
+                altitude=self._alt,
+                heading=self._heading,
+                behavior=self._behavior,
+                mode=self._mode,
+                armed=self._target is not None,
+                battery={"percentage": self._battery, "voltage": 24.0, "current": 0.0},
             )
         )
 

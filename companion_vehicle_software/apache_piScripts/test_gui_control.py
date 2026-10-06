@@ -62,11 +62,9 @@ def listen_telemetry_worker():
             ws.settimeout(0.5)
             msg = ws.recv()
             data = json.loads(msg)
-            topic = data.get("topic", "")
-            if "navsatfix" in topic:
-                m = data.get("msg", {})
-                lat, lon, hdg = m.get("latitude"), m.get("longitude"), m.get("heading")
-                print(f"\r[TELEMETRY] Lat: {lat:.7f} | Lon: {lon:.7f} | Hdg: {hdg}°   ", end="", flush=True)
+            if data.get("op") == "telemetry" and data.get("position"):
+                p = data["position"]
+                print(f"\r[TELEMETRY] Lat: {p['latitude']:.7f} | Lon: {p['longitude']:.7f} | Hdg: {data.get('heading')}° | Behavior: {data.get('behavior')}   ", end="", flush=True)
         except Exception:
             pass
 

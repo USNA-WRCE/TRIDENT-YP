@@ -49,6 +49,22 @@ except ImportError as exc:
         "websockets is required. Install with `pip install websockets`."
     ) from exc
 
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    EVENT_LAND_ON_BOAT_TOUCHDOWN,
+    BehaviorTracker,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+    gps_block_from_mavlink,
+)
+
+VEHICLE_TYPE = "uav"
+TRACKED_COMMANDS = {"waypoint", "rtb_follow", "land_on_boat_step", "takeoff", "mission_plan", "disarm"}
+behavior_tracker = BehaviorTracker()
+_armed_state = False
+_takeoff_target_alt: Optional[float] = None
+
 DEFAULT_BAUD = 57600
 DEFAULT_SEND_HZ = 10.0
 DEFAULT_WS_URL = "ws://localhost:8000/ws/vehicle"
@@ -99,66 +115,6 @@ async def detect_mavlink_port(
                 print(f"No MAVLink heartbeat on {port.device}")
 
     return None
-
-
-def create_navsatfix_message(
-    vehicle_id: str,
-    lat: float,
-    lon: float,
-    alt: float,
-    heading: Optional[float] = None,
-) -> dict[str, object]:
-    now = time.time()
-    sec = int(now)
-    nanosec = int((now - sec) * 1e9)
-
-    msg: dict[str, object] = {
-        "header": {
-            "stamp": {"sec": sec, "nanosec": nanosec},
-            "frame_id": "map",
-        },
-        "status": {"status": 0, "service": 1},
-        "latitude": lat,
-        "longitude": lon,
-        "altitude": alt,
-        "position_covariance": [0.0] * 9,
-        "position_covariance_type": 0,
-    }
-    if heading is not None:
-        msg["heading"] = heading
-
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": "uav",
-        "topic": f"/vehicles/{vehicle_id}/navsatfix",
-        "type": "sensor_msgs/msg/NavSatFix",
-        "stamp": now,
-        "msg": msg,
-    }
-
-
-def create_gps_fix_message(vehicle_id: str, msg) -> dict[str, object]:
-    fix_type = getattr(msg, "fix_type", 0)
-    eph = getattr(msg, "eph", 65535)
-    epv = getattr(msg, "epv", 65535)
-    h_acc = getattr(msg, "h_acc", None)
-    v_acc = getattr(msg, "v_acc", None)
-    satellites_visible = getattr(msg, "satellites_visible", 255)
-    fix_labels = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed", 7: "Static", 8: "PPP"}
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": "uav",
-        "topic": f"/vehicles/{vehicle_id}/gps_fix",
-        "type": f"mavlink/{msg.get_type()}",
-        "stamp": time.time(),
-        "msg": {
-            "fix_type": fix_type,
-            "fix_type_label": fix_labels.get(fix_type, "Unknown"),
-            "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-            "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-            "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-        },
-    }
 
 
 def build_mavlink_connection(port: str, baud: int) -> mavutil.mavlink_connection:
@@ -520,14 +476,16 @@ async def handle_server_messages(
             continue
 
         print(f"[WEBSOCKET] received command: {command}")
+        global _takeoff_target_alt
+        cmd_type = command.get("type")
+        if cmd_type in TRACKED_COMMANDS:
+            behavior_tracker.set(behavior_for_command(cmd_type, payload.get("source")))
+            if cmd_type == "takeoff":
+                _takeoff_target_alt = float(command.get("altitude_m") or 15.0)
         touched_down = await asyncio.to_thread(send_radio_command, master, command, payload.get("source"))
         if touched_down:
-            await websocket.send(json.dumps({
-                "vehicle_id": vehicle_id,
-                "type": "yp_ground_station/LandOnBoatTouchdown",
-                "msg": {"landed": True},
-                "stamp": time.time(),
-            }))
+            behavior_tracker.set(BEHAVIOR_IDLE)
+            await websocket.send(json.dumps(build_event(vehicle_id, VEHICLE_TYPE, EVENT_LAND_ON_BOAT_TOUCHDOWN)))
 
 
 async def read_mavlink_telemetry(
@@ -535,7 +493,7 @@ async def read_mavlink_telemetry(
     master: mavutil.mavlink_connection,
     vehicle_id: str,
 ) -> None:
-    global _landed_state
+    global _landed_state, _armed_state, _takeoff_target_alt
     print("[INFO] requesting telemetry stream from vehicle")
     master.mav.request_data_stream_send(
         master.target_system,
@@ -553,7 +511,7 @@ async def read_mavlink_telemetry(
     while True:
         msg = await asyncio.to_thread(
             master.recv_match,
-            type=["GLOBAL_POSITION_INT", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW"],
+            type=["GLOBAL_POSITION_INT", "EXTENDED_SYS_STATE", "GPS_RAW_INT", "GPS2_RAW", "HEARTBEAT"],
             blocking=True,
             timeout=5,
         )
@@ -569,8 +527,16 @@ async def read_mavlink_telemetry(
         if msg.get_type() == "EXTENDED_SYS_STATE":
             _landed_state = msg.landed_state
             continue
+        if msg.get_type() == "HEARTBEAT":
+            if msg.get_srcSystem() == master.target_system and msg.get_srcComponent() == master.target_component:
+                _armed_state = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                if _armed_state:
+                    behavior_tracker.observe_mode(master.flightmode)
+                else:
+                    behavior_tracker.set(BEHAVIOR_IDLE)
+            continue
         if msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
-            await websocket.send(json.dumps(create_gps_fix_message(vehicle_id, msg)))
+            await websocket.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, gps=gps_block_from_mavlink(msg))))
             continue
 
         lat = msg.lat / 1e7
@@ -580,10 +546,18 @@ async def read_mavlink_telemetry(
         if heading is not None:
             heading = heading / 100.0
 
-        payload = create_navsatfix_message(vehicle_id, lat, lon, alt, heading)
+        if _takeoff_target_alt is not None and alt >= _takeoff_target_alt * 0.9:
+            behavior_tracker.finish("takeoff")
+            _takeoff_target_alt = None
+
+        payload = build_telemetry(
+            vehicle_id, VEHICLE_TYPE,
+            latitude=lat, longitude=lon, altitude=alt, heading=heading,
+            behavior=behavior_tracker.get(), mode=master.flightmode, armed=_armed_state,
+        )
         try:
             await websocket.send(json.dumps(payload))
-            print("[INFO] sent navsatfix telemetry")
+            print("[INFO] sent telemetry")
         except Exception as exc:
             print(f"[ERROR] failed to send telemetry: {exc}")
             raise

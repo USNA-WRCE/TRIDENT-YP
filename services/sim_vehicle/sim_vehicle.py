@@ -11,6 +11,16 @@ from typing import Any
 
 import websockets
 
+from yp_common.telemetry import (
+    BEHAVIOR_IDLE,
+    BEHAVIOR_RETURN_TO_BOAT,
+    BEHAVIOR_SHIP_RELATIVE,
+    EVENT_MISSION_COMPLETE,
+    behavior_for_command,
+    build_event,
+    build_telemetry,
+)
+
 
 SERVER_WS_URL = os.getenv("SERVER_WS_URL", "ws://yp-server:8000/ws/vehicle")
 VEHICLE_TYPE = os.getenv("VEHICLE_TYPE", "uav").lower()
@@ -35,6 +45,7 @@ class VehicleSim:
         self.battery = random.uniform(0.72, 1.0)
         self.target = self.random_target()
         self.mode = "loiter"
+        self.behavior = BEHAVIOR_IDLE
         self.local_x = 0.0
         self.local_y = 0.0
         self.last_step = time.time()
@@ -55,10 +66,12 @@ class VehicleSim:
         command_type = command_body.get("type")
         if command_type == "rtb":
             self.mode = "rtb"
+            self.behavior = BEHAVIOR_RETURN_TO_BOAT
             self.mission_waypoints = []
             self.target = {"latitude": HOME_LAT, "longitude": HOME_LON, "altitude": HOME_ALT}
         elif command_type == "rtb_follow":
             self.mode = "rtb_follow"
+            self.behavior = behavior_for_command(command_type) or self.behavior
             self.mission_waypoints = []
             target = command_body.get("target", {})
             self.target = {
@@ -70,6 +83,7 @@ class VehicleSim:
             self.rtb_follow_speed_mps = max(0.0, float(command_body.get("speed_mps", SPEED_MPS)))
         elif command_type == "land_on_boat_step":
             self.mode = "land_on_boat"
+            self.behavior = behavior_for_command(command_type) or self.behavior
             self.mission_waypoints = []
             target = command_body.get("target", {})
             self.target = {
@@ -83,6 +97,7 @@ class VehicleSim:
             self.rtb_follow_speed_mps = math.hypot(vn, ve)
         elif command_type == "waypoint":
             self.mode = "waypoint"
+            self.behavior = behavior_for_command(command_type, command_body.get("source")) or self.behavior
             self.mission_waypoints = []
             self.rtb_follow_heading = None
             self.rtb_follow_speed_mps = None
@@ -94,8 +109,14 @@ class VehicleSim:
             }
         elif command_type == "trajectory":
             self.mode = "trajectory"
+            self.behavior = BEHAVIOR_SHIP_RELATIVE
             self.rtb_follow_heading = None
             self.rtb_follow_speed_mps = None
+        elif command_type == "cancel_sar":
+            self.mission_waypoints = []
+            self.mode = "loiter"
+            self.behavior = BEHAVIOR_IDLE
+            self.target = self.random_target()
         elif command_type in ("search_grid", "mob"):
             self.rtb_follow_heading = None
             self.rtb_follow_speed_mps = None
@@ -107,6 +128,7 @@ class VehicleSim:
                     for wp in sim_wps
                 ]
                 self.mode = "sar_mission"
+                self.behavior = behavior_for_command(command_type) or self.behavior
                 self.target = self.mission_waypoints.pop(0)
         elif command_type == "mission_plan":
             self.rtb_follow_heading = None
@@ -131,6 +153,7 @@ class VehicleSim:
                 self.mission_complete_pending = False
                 self.mission_waypoints = parsed
                 self.mode = "mission_plan"
+                self.behavior = behavior_for_command(command_type) or self.behavior
                 self.target = self.mission_waypoints.pop(0)
 
     def step(self) -> None:
@@ -142,6 +165,7 @@ class VehicleSim:
         if distance < max(4.0, SPEED_MPS * dt * 2.0):
             if self.mode == "rtb":
                 self.mode = "hold"
+                self.behavior = BEHAVIOR_IDLE
             elif self.mode in ("rtb_follow", "land_on_boat"):
                 pass
             elif self.mode in ("sar_mission", "mission_plan"):
@@ -151,10 +175,12 @@ class VehicleSim:
                     if self.mode == "mission_plan":
                         self.mission_complete_pending = True
                     self.mode = "loiter"
+                    self.behavior = BEHAVIOR_IDLE
                     self.target = self.random_target()
             else:
                 self.target = self.random_target()
                 self.mode = "loiter"
+                self.behavior = BEHAVIOR_IDLE
             return
 
         if self.mode in ("rtb_follow", "land_on_boat") and self.rtb_follow_heading is not None:
@@ -195,100 +221,24 @@ class VehicleSim:
         self.battery = max(0.0, self.battery - dt * 0.000035)
 
     def messages(self) -> list[dict[str, Any]]:
-        sec, nanosec, stamp_float = ros_stamp()
-        frame = f"{VEHICLE_ID}/base_link"
-        quat = yaw_to_quaternion(self.heading)
-        target_transform = {
-            "translation": {"x": self.local_x, "y": self.local_y, "z": self.alt},
-            "rotation": quat,
-        }
         messages = [
-            wrap("heartbeat", "yp_ground_station/msg/Heartbeat", stamp_float, {"mode": self.mode, "armed": True}),
-            wrap(
-                "navsatfix",
-                "sensor_msgs/msg/NavSatFix",
-                stamp_float,
-                {
-                    "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-                    "status": {"status": 0, "service": 1},
-                    "latitude": self.lat,
-                    "longitude": self.lon,
-                    "altitude": self.alt,
-                    "position_covariance": [0.0] * 9,
-                    "position_covariance_type": 0,
-                    "heading": self.heading,
-                },
-            ),
-            wrap(
-                "pose",
-                "geometry_msgs/msg/Pose",
-                stamp_float,
-                {
-                    "position": {"x": self.local_x, "y": self.local_y, "z": self.alt},
-                    "orientation": quat,
-                    "heading": self.heading,
-                },
-            ),
-            wrap(
-                "battery",
-                "sensor_msgs/msg/BatteryState",
-                stamp_float,
-                {
-                    "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": frame},
-                    "voltage": 22.2 * self.battery,
-                    "current": -4.0,
-                    "charge": float("nan"),
-                    "capacity": float("nan"),
-                    "design_capacity": float("nan"),
-                    "percentage": self.battery,
-                    "power_supply_status": 2,
-                    "power_supply_health": 1,
-                    "power_supply_technology": 3,
-                    "present": True,
-                    "cell_voltage": [],
-                    "cell_temperature": [],
-                    "location": "",
-                    "serial_number": VEHICLE_ID,
-                },
-            ),
-            wrap(
-                "trajectory",
-                "trajectory_msgs/msg/MultiDOFJointTrajectory",
-                stamp_float,
-                {
-                    "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "map"},
-                    "joint_names": [frame],
-                    "points": [
-                        {
-                            "transforms": [target_transform],
-                            "velocities": [
-                                {
-                                    "linear": {"x": SPEED_MPS, "y": 0.0, "z": 0.0},
-                                    "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
-                                }
-                            ],
-                            "accelerations": [],
-                            "time_from_start": {"sec": 2, "nanosec": 0},
-                        }
-                    ],
-                },
-            ),
+            build_telemetry(
+                VEHICLE_ID,
+                VEHICLE_TYPE,
+                latitude=self.lat,
+                longitude=self.lon,
+                altitude=self.alt,
+                heading=self.heading,
+                behavior=self.behavior,
+                mode=self.mode,
+                armed=True,
+                battery={"percentage": self.battery, "voltage": 22.2 * self.battery, "current": -4.0},
+            )
         ]
         if self.mission_complete_pending:
             self.mission_complete_pending = False
-            messages.append(wrap("mission", "yp_ground_station/MissionComplete", stamp_float, {"status": "complete"}))
+            messages.append(build_event(VEHICLE_ID, VEHICLE_TYPE, EVENT_MISSION_COMPLETE))
         return messages
-
-
-def wrap(topic_suffix: str, msg_type: str, stamp: float, msg: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "vehicle_id": VEHICLE_ID,
-        "vehicle_type": VEHICLE_TYPE,
-        "topic": f"/vehicles/{VEHICLE_ID}/{topic_suffix}",
-        "type": msg_type,
-        "stamp": stamp,
-        "msg": scrub_nan(msg),
-    }
 
 
 async def main() -> None:
@@ -319,17 +269,6 @@ async def receive_commands(ws: websockets.WebSocketClientProtocol, sim: VehicleS
             sim.handle_command(json.loads(raw))
         except Exception as exc:
             print(f"command parse failed: {exc}")
-
-
-def ros_stamp() -> tuple[int, int, float]:
-    stamp = time.time()
-    sec = int(stamp)
-    return sec, int((stamp - sec) * 1_000_000_000), stamp
-
-
-def yaw_to_quaternion(yaw_deg: float) -> dict[str, float]:
-    half = math.radians(yaw_deg) / 2.0
-    return {"x": 0.0, "y": 0.0, "z": math.sin(half), "w": math.cos(half)}
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -365,16 +304,6 @@ def destination_point(lat: float, lon: float, bearing: float, distance_m: float)
 def smooth_angle(current: float, target: float, amount: float) -> float:
     delta = (target - current + 540) % 360 - 180
     return (current + delta * amount) % 360
-
-
-def scrub_nan(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: scrub_nan(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [scrub_nan(v) for v in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
 
 
 if __name__ == "__main__":

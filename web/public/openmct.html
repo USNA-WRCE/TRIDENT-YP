@@ -64,9 +64,11 @@
                         return {
                             vehicleId: record.vehicle_id,
                             utc: Date.parse(record.timestamp),
-                            fields: record.fields || {}
+                            fields: record.fields || {},
+                            kind: record.kind
                         };
-                    }).filter(record => record.vehicleId === vehicleId && Number.isFinite(record.utc));
+                    }).filter(record => record.vehicleId === vehicleId && Number.isFinite(record.utc)
+                        && (record.kind === undefined || record.kind === 'telemetry'));
                     if (backupRecords.length === 0) throw new Error('The backup has no records for this vehicle.');
                 } catch (error) {
                     const errBox = document.getElementById('error-overlay');
@@ -82,6 +84,7 @@
             openmct.install(openmct.plugins.LocalStorage());
             openmct.install(openmct.plugins.Espresso());
             openmct.install(openmct.plugins.Plot());
+            openmct.install(openmct.plugins.TelemetryTable());
             openmct.install(openmct.plugins.MyItems()); // Enables sidebar tree navigation
 
             // 2. Register UTC Time System
@@ -125,19 +128,29 @@
             openmct.time.timeSystem('utc', initialBounds);
 
             // 4. Define Vehicle Taxonomy & Register Under "My Items" (mine)
+            const STRING_FIELDS = new Set(['behavior', 'mode']);
             const liveTelemetryFields = [
                 { key: 'latitude', name: 'Latitude', unit: 'deg' },
                 { key: 'longitude', name: 'Longitude', unit: 'deg' },
                 { key: 'altitude', name: 'Altitude', unit: 'm' },
-                { key: 'battery_percentage', name: 'Battery', unit: '%' }
+                { key: 'heading', name: 'Heading', unit: 'deg' },
+                { key: 'battery_percentage', name: 'Battery Percentage', unit: '' },
+                { key: 'battery_voltage', name: 'Battery Voltage', unit: 'V' },
+                { key: 'gps_satellites', name: 'GPS Satellites', unit: '' },
+                { key: 'gps_fix_type', name: 'GPS Fix Type', unit: '' },
+                { key: 'gps_h_acc_m', name: 'GPS Horizontal Accuracy', unit: 'm' },
+                { key: 'behavior', name: 'Behavior', unit: '', string: true }
             ];
+            const isTelemetryValue = (key, value) => STRING_FIELDS.has(key)
+                ? typeof value === 'string'
+                : typeof value === 'number' && Number.isFinite(value);
             const backupFieldKeys = backupRecords
                 ? [...new Set(backupRecords.flatMap(record => Object.entries(record.fields)
-                    .filter(([, value]) => typeof value === 'number' && Number.isFinite(value))
+                    .filter(([key, value]) => isTelemetryValue(key, value))
                     .map(([key]) => key)))]
                 : [];
             const telemetryFields = backupRecords
-                ? backupFieldKeys.map(key => ({ key, name: key.replace(/_/g, ' '), unit: '' }))
+                ? backupFieldKeys.map(key => ({ key, name: key.replace(/_/g, ' '), unit: '', string: STRING_FIELDS.has(key) }))
                 : liveTelemetryFields;
 
             const vehicleFolderKey = `vehicle_folder_${vehicleId}`;
@@ -171,7 +184,9 @@
                             type: 'telemetry.telemetryPoint',
                             telemetry: {
                                 values: [
-                                    { key: 'value', name: 'Value', units: field.unit, format: 'float', hints: { range: 1 } },
+                                    field.string
+                                        ? { key: 'value', name: 'Value', format: 'string' }
+                                        : { key: 'value', name: 'Value', units: field.unit, format: 'float', hints: { range: 1 } },
                                     { key: 'utc', name: 'Timestamp', format: 'utc', hints: { domain: 1 } }
                                 ]
                             },
@@ -193,7 +208,7 @@
                     if (backupRecords) {
                         return Promise.resolve(backupRecords
                             .filter(record => record.utc >= options.start && record.utc < options.end
-                                && typeof record.fields[field] === 'number')
+                                && isTelemetryValue(field, record.fields[field]))
                             .map(record => ({ utc: record.utc, value: record.fields[field] })));
                     }
                     const url = `/api/openmct/history/${encodeURIComponent(vehicleId)}/yp_messages/${field}?start=${options.start}&end=${options.end}`;
@@ -219,14 +234,23 @@
                             const data = JSON.parse(event.data);
                             if (data.op === 'vehicle_update' && data.vehicle && data.vehicle.vehicle_id === vehicleId) {
                                 const fieldKey = domainObject.identifier.key;
-                                let val = null;
-                                if (fieldKey === 'latitude' || fieldKey === 'longitude' || fieldKey === 'altitude') {
-                                    val = data.vehicle.position ? data.vehicle.position[fieldKey] : null;
-                                } else if (fieldKey === 'battery_percentage') {
-                                    val = data.vehicle.battery ? data.vehicle.battery.percentage : null;
-                                }
+                                const v = data.vehicle;
+                                const gps = v.gps_fix || {};
+                                const liveValues = {
+                                    latitude: v.position && v.position.latitude,
+                                    longitude: v.position && v.position.longitude,
+                                    altitude: v.position && v.position.altitude,
+                                    heading: v.heading,
+                                    behavior: v.behavior,
+                                    battery_percentage: v.battery && v.battery.percentage,
+                                    battery_voltage: v.battery && v.battery.voltage,
+                                    gps_satellites: gps.satellites_visible,
+                                    gps_fix_type: gps.fix_type,
+                                    gps_h_acc_m: gps.horizontal_accuracy_m
+                                };
+                                const val = liveValues[fieldKey];
 
-                                if (val !== null && typeof val === 'number') {
+                                if (val !== null && val !== undefined && isTelemetryValue(fieldKey, val)) {
                                     callback({
                                         utc: Date.now(),
                                         value: val

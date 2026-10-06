@@ -37,16 +37,13 @@ def listen_telemetry(ws, duration_s: float = 2.0):
         try:
             msg = ws.recv()
             data = json.loads(msg)
-            topic = data.get("topic", "unknown")
-            if "navsatfix" in topic:
-                lat = data.get("msg", {}).get("latitude")
-                lon = data.get("msg", {}).get("longitude")
-                hdg = data.get("msg", {}).get("heading")
-                print(f"  -> [TELEMETRY] NavSatFix: Lat={lat}, Lon={lon}, Heading={hdg}°")
-            elif "gps_fix" in topic:
-                fix_label = data.get("msg", {}).get("fix_type_label")
-                sats = data.get("msg", {}).get("satellites_visible")
-                print(f"  -> [TELEMETRY] GPS Fix: {fix_label} ({sats} Sats)")
+            if data.get("op") == "telemetry":
+                position = data.get("position")
+                if position:
+                    print(f"  -> [TELEMETRY] Lat={position.get('latitude')}, Lon={position.get('longitude')}, Alt={position.get('altitude')}, Heading={data.get('heading')}°, Behavior={data.get('behavior')}")
+                gps = data.get("gps")
+                if gps:
+                    print(f"  -> [TELEMETRY] GPS Fix: {gps.get('fix_type_label')} ({gps.get('satellites')} Sats)")
         except Exception:
             pass  # Socket timeout, keep looping until duration expires
 

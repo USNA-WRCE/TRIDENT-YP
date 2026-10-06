@@ -69,6 +69,7 @@ class OpenMctHistoryTests(unittest.TestCase):
         }])
         self.assertIn('r._measurement == "yp_messages"', query_api.query_text)
         self.assertIn('r.vehicle_id == "boat-01"', query_api.query_text)
+        self.assertIn('r.kind == "telemetry"', query_api.query_text)
         self.assertIn('r._field == "latitude"', query_api.query_text)
 
     def test_history_rejects_unsupported_measurements_and_reversed_ranges(self):

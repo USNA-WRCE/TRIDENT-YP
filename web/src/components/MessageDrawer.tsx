@@ -82,7 +82,7 @@ function topicOptions(messages: StreamMessage[], filters: string[], depth: numbe
   for (const message of messages) { const parts = topicParts(message.topic); if (filters.slice(0, depth).every((filter, index) => filter === "all" || parts[index] === filter) && parts[depth]) values.add(parts[depth]); }
   return Array.from(values).sort((a, b) => a.localeCompare(b));
 }
-function filterLabel(depth: number): string { return ["Topic root", "Vehicle ID", "Message topic", "Subtopic"][depth] ?? `Level ${depth + 1}`; }
+function filterLabel(depth: number): string { return ["Vehicle ID", "Message kind"][depth] ?? `Level ${depth + 1}`; }
 function jsonSyntaxHighlight(value: unknown): ReactNode {
   const json = JSON.stringify(value, null, 2);
   const parts = json.split(/("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*(?:\s*:)?|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g);

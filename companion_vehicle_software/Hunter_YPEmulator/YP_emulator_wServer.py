@@ -11,6 +11,8 @@ from aiohttp import web
 import websockets
 from pymavlink import mavutil
 
+from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry, gps_block_from_mavlink
+
 CONFIG_PATH = Path("config.json")
 
 # Default Fallback Configuration
@@ -46,6 +48,7 @@ system_status = {
     "ws_connected": False,
     "ws_status": "Connecting...",
     "flight_mode": "UNKNOWN",
+    "behavior": BEHAVIOR_IDLE,
     "gps_status": "No Fix",
     "satellites": 0,
     "last_hb_time": 0,
@@ -118,6 +121,10 @@ HTML_TEMPLATE = """
                 <div class="diag-value" id="flight_mode" style="color: #38bdf8;">UNKNOWN</div>
             </div>
             <div class="diag-item">
+                <div class="diag-label">Behavior</div>
+                <div class="diag-value" id="behavior" style="color: #a78bfa;">idle</div>
+            </div>
+            <div class="diag-item">
                 <div class="diag-label">GPS Status</div>
                 <div class="diag-value" id="gps_status" style="color: #f59e0b;">No Fix</div>
             </div>
@@ -172,6 +179,7 @@ HTML_TEMPLATE = """
                 wsElem.className = 'badge ' + (data.ws_connected ? 'badge-online' : 'badge-offline');
 
                 document.getElementById('flight_mode').innerText = data.flight_mode;
+                document.getElementById('behavior').innerText = data.behavior.replace(/_/g, ' ');
                 
                 const gpsText = data.gps_status + (data.satellites > 0 ? ` (${{data.satellites}} Sats)` : '');
                 document.getElementById('gps_status').innerText = gpsText;
@@ -293,25 +301,6 @@ async def start_web_server():
 
 # --- Helpers ---
 
-def ros_stamp() -> tuple[int, int, float]:
-    stamp = time.time()
-    sec = int(stamp)
-    return sec, int((stamp - sec) * 1_000_000_000), stamp
-
-def yaw_to_quaternion(yaw_deg: float) -> dict[str, float]:
-    half = math.radians(yaw_deg) / 2.0
-    return {"x": 0.0, "y": 0.0, "z": math.sin(half), "w": math.cos(half)}
-
-def wrap(vehicle_id: str, topic_suffix: str, msg_type: str, stamp: float, msg: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "vehicle_id": vehicle_id,
-        "vehicle_type": "yp",
-        "topic": f"/vehicles/{vehicle_id}/{topic_suffix}",
-        "type": msg_type,
-        "stamp": stamp,
-        "msg": msg,
-    }
-
 def get_gps_fix_label(fix_type: int) -> str:
     fix_map = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
     return fix_map.get(fix_type, f"Fix {fix_type}")
@@ -408,34 +397,20 @@ async def _disarm_and_download_log(vehicle_id: str) -> None:
 
 # --- Decoupled Connection Tasks ---
 
+MOVING_SPEED_MPS = 0.5
+
 def queue_telemetry(vehicle_id: str, lat: float, lon: float, alt: float, heading: float, speed: float):
-    sec, nanosec, stamp = ros_stamp()
-    messages = [
-        wrap(vehicle_id, "heartbeat", "yp_ground_station/msg/Heartbeat", stamp, {"mode": system_status["flight_mode"], "armed": True}),
-        wrap(
-            vehicle_id, "navsatfix", "sensor_msgs/msg/NavSatFix", stamp,
-            {
-                "header": {"stamp": {"sec": sec, "nanosec": nanosec}, "frame_id": "yp_gps"},
-                "status": {"status": 0, "service": 1},
-                "latitude": lat, "longitude": lon, "altitude": alt,
-                "position_covariance": [0.0] * 9, "position_covariance_type": 0,
-                "heading": heading, "speed_mps": speed,
-            },
-        ),
-        wrap(
-            vehicle_id, "pose", "geometry_msgs/msg/Pose", stamp,
-            {
-                "position": {"x": 0.0, "y": 0.0, "z": alt},
-                "orientation": yaw_to_quaternion(heading),
-                "heading": heading,
-            },
-        ),
-    ]
-    for msg in messages:
-        try:
-            telemetry_queue.put_nowait(msg)
-        except asyncio.QueueFull:
-            pass # Drop oldest messages if WebSocket is down and queue is full
+    behavior = "underway" if speed > MOVING_SPEED_MPS else BEHAVIOR_IDLE
+    system_status["behavior"] = behavior
+    msg = build_telemetry(
+        vehicle_id, "yp",
+        latitude=lat, longitude=lon, altitude=alt, heading=heading,
+        behavior=behavior, mode=system_status["flight_mode"], armed=True,
+    )
+    try:
+        telemetry_queue.put_nowait(msg)
+    except asyncio.QueueFull:
+        pass # Drop messages if WebSocket is down and queue is full
 
 async def _ws_send_loop(ws):
     # Continuously pull from the telemetry queue and send
@@ -595,24 +570,11 @@ async def mavlink_loop(current_config: dict):
 
                     elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
                         fix_type = getattr(msg, "fix_type", 0)
-                        eph = getattr(msg, "eph", 65535)
-                        epv = getattr(msg, "epv", 65535)
-                        h_acc = getattr(msg, "h_acc", None)
-                        v_acc = getattr(msg, "v_acc", None)
                         satellites_visible = getattr(msg, "satellites_visible", 255)
                         system_status["gps_status"] = get_gps_fix_label(fix_type)
                         system_status["satellites"] = satellites_visible
                         try:
-                            telemetry_queue.put_nowait(wrap(
-                                v_id, "gps_fix", "mavlink/GPS_RAW_INT", time.time(),
-                                {
-                                    "fix_type": fix_type,
-                                    "fix_type_label": get_gps_fix_label(fix_type),
-                                    "satellites_visible": satellites_visible if satellites_visible != 255 else None,
-                                    "horizontal_accuracy_m": (h_acc / 1000.0) if h_acc else ((eph / 100.0) if eph != 65535 else None),
-                                    "vertical_accuracy_m": (v_acc / 1000.0) if v_acc else ((epv / 100.0) if epv != 65535 else None),
-                                },
-                            ))
+                            telemetry_queue.put_nowait(build_telemetry(v_id, "yp", gps=gps_block_from_mavlink(msg)))
                         except asyncio.QueueFull:
                             pass
 

@@ -30,7 +30,7 @@ test("Pages demo opens without a server and renders telemetry and both planners"
   await expect(page.locator(".leaflet-marker-pane img[alt=uav]")).toHaveCount(2);
 
   await page.getByTitle("Messages", { exact: true }).click();
-  await expect(page.getByText("/vehicles/demo-uav-1/navsatfix", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("demo-uav-1/telemetry", { exact: true }).first()).toBeVisible();
   await page.getByTitle("Close messages", { exact: true }).click();
   await page.getByTitle("Settings", { exact: true }).click();
   await expect(page.getByText("RTK Correction", { exact: true })).toBeVisible();
