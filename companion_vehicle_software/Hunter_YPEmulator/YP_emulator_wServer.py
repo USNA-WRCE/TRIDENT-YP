@@ -11,6 +11,10 @@ from aiohttp import web
 import websockets
 from pymavlink import mavutil
 
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from yp_common.telemetry import BEHAVIOR_IDLE, build_telemetry, gps_block_from_mavlink
 
 CONFIG_PATH = Path("config.json")
