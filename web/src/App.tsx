@@ -303,6 +303,16 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         });
         if (payload.message) setMessageLog((current) => [streamMessageFromPayload(payload.message as Parameters<typeof streamMessageFromPayload>[0]), ...current].slice(0, MAX_MESSAGE_LOG));
       }
+      if (payload.op === "event") {
+        setMessageLog((current) => [streamMessageFromPayload(payload as TelemetryLikePayload), ...current].slice(0, MAX_MESSAGE_LOG));
+        const event = payload.event as string | undefined;
+        const vehicleId = payload.vehicle_id as string | undefined;
+        if (event === "land_on_boat_touchdown" && vehicleId) {
+          spokenFeedbackRef.current(`Vehicle ${vehicleId} has landed on the YP vessel.`);
+        } else if (event === "mission_complete" && vehicleId) {
+          spokenFeedbackRef.current(`Mission complete for vehicle ${vehicleId}.`);
+        }
+      }
       if (payload.op === "command_ack") {
         setMessageLog((current) => [streamMessageFromCommandAck(payload), ...current].slice(0, MAX_MESSAGE_LOG));
         const acknowledgement = commandAckSpeech(payload);

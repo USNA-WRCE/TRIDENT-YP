@@ -706,8 +706,8 @@ def _run_mob_search(master, track_points: list, corridor_half_width_m: float, sw
         finally: behavior_tracker.finish(BEHAVIOR_MOB_SEARCH)
 
 def _run_takeoff(master, altitude_m: float) -> None:
-    with _sar_mission_lock:
-        try:
+    try:
+        with _sar_mission_lock:
             sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
             time.sleep(0.3)
             if not sar_missions.arm_vehicle(master):
@@ -717,16 +717,16 @@ def _run_takeoff(master, altitude_m: float) -> None:
             time.sleep(0.3)
             master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, float("nan"), 0, 0, altitude_m)
             print(f"[MISSION] Takeoff command sent to {altitude_m}m")
-            deadline = time.time() + 60.0
-            while time.time() < deadline and behavior_tracker.get() == BEHAVIOR_TAKEOFF:
-                alt = _snapshot_vehicle_state().get("alt")
-                if alt is not None and alt >= altitude_m - 1.0:
-                    break
-                time.sleep(0.5)
-            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
-        except Exception as exc:
-            print(f"[MISSION] takeoff error: {exc}")
-            behavior_tracker.finish(BEHAVIOR_TAKEOFF)
+        deadline = time.time() + 60.0
+        while time.time() < deadline and behavior_tracker.get() == BEHAVIOR_TAKEOFF:
+            alt = _snapshot_vehicle_state().get("alt")
+            if alt is not None and alt >= altitude_m - 1.0:
+                break
+            time.sleep(0.5)
+        behavior_tracker.finish(BEHAVIOR_TAKEOFF)
+    except Exception as exc:
+        print(f"[MISSION] takeoff error: {exc}")
+        behavior_tracker.finish(BEHAVIOR_TAKEOFF)
 
 def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guided_on_complete: bool) -> None:
     with _sar_mission_lock:

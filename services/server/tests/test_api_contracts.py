@@ -105,6 +105,24 @@ class APIContractTests(DatabaseTestCase):
             with self.client.websocket_connect("/ws/vehicle/uav-01") as vehicle:
                 vehicle.send_json({"op": "event", "event": "land_on_boat_touchdown"})
                 self.assertEqual(ui.receive_json(), {"op": "land_on_boat_touchdown", "vehicle_id": "uav-01"})
+                event = ui.receive_json()
+        self.assertEqual(event["op"], "event")
+        self.assertEqual(event["vehicle_id"], "uav-01")
+        self.assertEqual(event["vehicle_type"], "uav")
+        self.assertEqual(event["event"], "land_on_boat_touchdown")
+        self.assertIsInstance(event["stamp"], (int, float))
+
+    def test_mission_complete_event_is_broadcast_to_ui(self):
+        with self.client.websocket_connect("/ws/ui") as ui:
+            ui.receive_json()
+            with self.client.websocket_connect("/ws/vehicle/uav-01") as vehicle:
+                vehicle.send_json({"op": "event", "event": "mission_complete"})
+                event = ui.receive_json()
+        self.assertEqual(event["op"], "event")
+        self.assertEqual(event["vehicle_id"], "uav-01")
+        self.assertEqual(event["vehicle_type"], "uav")
+        self.assertEqual(event["event"], "mission_complete")
+        self.assertIsInstance(event["stamp"], (int, float))
 
     def test_rosbridge_subscriber_receives_navsatfix_derived_from_telemetry(self):
         topic = "/vehicles/boat-01/navsatfix"
@@ -136,6 +154,21 @@ class APIContractTests(DatabaseTestCase):
 
 
 class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
+    def test_sitl_sar_completion_does_not_clear_newer_behavior(self):
+        with patch.dict(main._sitl_behavior, {}, clear=True), patch.dict(
+            main._sitl_behavior_versions, {}, clear=True,
+        ):
+            main._set_sitl_behavior("sitl-uav", "search_grid")
+            behavior, version = main._sitl_behavior_snapshot("sitl-uav")
+
+            main._set_sitl_behavior("sitl-uav", "search_grid")
+            main._finish_sitl_behavior("sitl-uav", behavior, version)
+            self.assertEqual(main._sitl_behavior_snapshot("sitl-uav")[0], "search_grid")
+
+            behavior, version = main._sitl_behavior_snapshot("sitl-uav")
+            main._finish_sitl_behavior("sitl-uav", behavior, version)
+            self.assertEqual(main._sitl_behavior_snapshot("sitl-uav")[0], main.BEHAVIOR_IDLE)
+
     def test_sitl_rtk_corrections_do_not_cancel_ship_relative_plan(self):
         self.assertFalse(main._sitl_command_cancels_ship_relative("rtcm_data"))
         self.assertFalse(main._sitl_command_cancels_ship_relative("ship_relative_trajectory"))

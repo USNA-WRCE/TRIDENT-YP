@@ -154,6 +154,27 @@ export function handleDemoCommand(vehicles: DemoVehicle[], vehicleId: string, co
   if (!vehicle) return;
   const yp = vehicles.find((candidate) => candidate.vehicle_id === command.ship_vehicle_id) ?? vehicles.find((candidate) => candidate.vehicle_type === "yp");
   const ypPosition = yp ? { latitude: yp.lat, longitude: yp.lon, altitude: yp.alt } : null;
+  if (command.type === "cancel_sar") {
+    if (vehicle.mode === "search_grid" || vehicle.mode === "mob_search") {
+      vehicle.mode = "loiter";
+      vehicle.manualWaypoint = false;
+      vehicle.missionWaypoints = [];
+      vehicle.shipRelativeWaypoints = [];
+      vehicle.shipRelativeShipId = undefined;
+      vehicle.targetYawDeg = undefined;
+    }
+  }
+  if (command.type === "search_grid" || command.type === "mob") {
+    vehicle.mode = command.type === "mob" ? "mob_search" : "search_grid";
+    vehicle.manualWaypoint = false;
+    vehicle.missionWaypoints = [];
+    vehicle.shipRelativeWaypoints = [];
+    vehicle.shipRelativeShipId = undefined;
+    vehicle.targetYawDeg = undefined;
+    if (command.lat !== undefined && command.lon !== undefined) {
+      vehicle.target = { latitude: command.lat, longitude: command.lon, altitude: command.altitude_m ?? vehicle.alt };
+    }
+  }
   if (command.type === "rtb") { vehicle.mode = "rtb"; vehicle.manualWaypoint = false; vehicle.missionWaypoints = []; vehicle.shipRelativeWaypoints = []; vehicle.shipRelativeShipId = undefined; vehicle.targetYawDeg = undefined; vehicle.target = yp ? sternTargetForYp(yp, vehicle) : { latitude: 38.984764, longitude: -76.478643, altitude: vehicle.vehicle_type === "uuv" ? -4 : vehicle.vehicle_type === "uav" ? 45 : 0 }; }
   if (command.type === "waypoint" && command.target) { vehicle.mode = "waypoint"; vehicle.manualWaypoint = true; vehicle.missionWaypoints = []; vehicle.shipRelativeWaypoints = []; vehicle.shipRelativeShipId = undefined; vehicle.targetYawDeg = undefined; vehicle.target = command.target; }
   if (command.type === "mission_plan" && command.waypoints?.length) {
@@ -192,6 +213,7 @@ function demoBehavior(vehicle: DemoVehicle): string {
     case "rtb": return "return_to_boat";
     case "landing": return "landing";
     case "search_grid": return "search_grid";
+    case "mob_search": return "mob_search";
     default: return "idle";
   }
 }
