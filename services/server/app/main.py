@@ -202,6 +202,9 @@ def _set_sitl_behavior(vehicle_id: str, behavior: str) -> None:
         _sitl_behavior_versions[vehicle_id] = _sitl_behavior_versions.get(vehicle_id, 0) + 1
 
 
+WAYPOINT_CLEARING_COMMANDS = frozenset({"trajectory", "search_grid", "ship_relative_trajectory", "mission_plan", "mob"})
+
+
 def _sitl_behavior_snapshot(vehicle_id: str) -> tuple[str, int]:
     with _sitl_behavior_lock:
         return (
@@ -2814,6 +2817,10 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
             }
             shared_waypoints[vehicle_id] = waypoint
             await broadcast_ui({"op": "waypoint_overlay", "waypoint": waypoint})
+
+    if not is_temporary_avoidance and cmd_type in WAYPOINT_CLEARING_COMMANDS:
+        if shared_waypoints.pop(vehicle_id, None) is not None:
+            await broadcast_ui({"op": "waypoint_cleared", "vehicle_id": vehicle_id})
 
     if not is_temporary_avoidance and cmd_type in ("rtb", "cancel_sar", "waypoint"):
         if shared_sar_patterns.pop(vehicle_id, None) is not None:

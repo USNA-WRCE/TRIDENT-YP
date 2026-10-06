@@ -44,6 +44,7 @@ import { VoiceControl } from "./components/VoiceControl";
 import { HistoryExplorer } from "./components/HistoryExplorer";
 import { FitAllControl, FollowYpCenter, SarPatternOverlay, VehicleLayer, WaypointCrosshair, YpRangeRings, type WaypointMarker } from "./components/map/VehicleLayers";
 import { vehicleMarkerColor } from "./utils/vehicleStyle";
+import { selectYpVehicle } from "./utils/ypVehicle";
 import { commandAckSpeech } from "./utils/voiceFeedback";
 import { WeatherRadarLayer, WindLayer } from "./components/map/OverlayLayers";
 import { createDemoVehicles, demoVehicleSnapshot, handleDemoCommand, stepDemoVehicle, updateDemoVehicleColor, type DemoMessagePayload, type DemoVehicle } from "./services/demo";
@@ -341,6 +342,15 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }
       if (payload.op === "sar_pattern") {
         setSarPatterns((current) => ({ ...current, [payload.vehicle_id as string]: { patternType: payload.pattern_type as string, waypoints: payload.waypoints as [number, number][] } }));
+      }
+      if (payload.op === "waypoint_cleared") {
+        const clearedId = payload.vehicle_id as string;
+        setWaypointMarkers((current) => {
+          if (!(clearedId in current)) return current;
+          const next = { ...current };
+          delete next[clearedId];
+          return next;
+        });
       }
       if (payload.op === "waypoint_overlay") {
         const waypoint = payload.waypoint as WaypointMarker;
@@ -739,7 +749,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   }, [showSettings, showFlightLogOptions, showSITL, showMessages, mapMenuExpanded]);
 
   const vehicleList = useMemo(() => Object.values(vehicles).filter((vehicle) => vehicle.position), [vehicles]);
-  const yp = vehicleList.find((vehicle) => vehicle.vehicle_type === "yp");
+  const yp = selectYpVehicle(Object.values(vehicles), ypRoleVehicleId);
   const ypGpsLinked = Boolean(yp?.connected);
   const filteredMessages = useMemo(() => filterMessages(messageLog, topicFilters), [messageLog, topicFilters]);
   const renderedMapSource = DEMO_MODE ? "online" : mapSource;
@@ -1616,7 +1626,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
               >
                 <option value="">- dedicated yp_gps service -</option>
                 {Object.values(vehicles)
-                  .filter((v) => v.connected && (v.vehicle_type !== "yp" || v.vehicle_id === ypRoleVehicleId))
+                  .filter((v) => v.connected)
                   .map((v) => (
                     <option key={v.vehicle_id} value={v.vehicle_id}>
                       {v.vehicle_id} ({v.vehicle_type})

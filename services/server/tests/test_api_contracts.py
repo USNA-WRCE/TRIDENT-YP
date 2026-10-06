@@ -124,6 +124,15 @@ class APIContractTests(DatabaseTestCase):
         self.assertEqual(event["event"], "mission_complete")
         self.assertIsInstance(event["stamp"], (int, float))
 
+    def test_behavior_command_clears_shared_waypoint_for_all_uis(self):
+        main.shared_waypoints["uav-01"] = {"vehicle_id": "uav-01", "latitude": 1.0, "longitude": 2.0}
+        with self.client.websocket_connect("/ws/ui") as ui:
+            ui.receive_json()
+            asyncio.run(main.route_command("uav-01", {"type": "search_grid"}, "ui"))
+            messages = [ui.receive_json() for _ in range(2)]
+        self.assertIn({"op": "waypoint_cleared", "vehicle_id": "uav-01"}, messages)
+        self.assertNotIn("uav-01", main.shared_waypoints)
+
     def test_rosbridge_subscriber_receives_navsatfix_derived_from_telemetry(self):
         topic = "/vehicles/boat-01/navsatfix"
         with self.client.websocket_connect("/ws/rosbridge") as ros:
