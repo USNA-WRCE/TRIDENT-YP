@@ -107,15 +107,17 @@ async def serial_loop(ws: websockets.WebSocketClientProtocol) -> None:
             line = gps.readline().decode("ascii", errors="ignore").strip()
             parsed = parse_nmea(line)
             if parsed:
-                await send_fix(ws, parsed["latitude"], parsed["longitude"], parsed.get("altitude", 0.0), parsed.get("heading", 0.0), parsed.get("speed_mps", 0.0))
+                await send_fix(ws, parsed["latitude"], parsed["longitude"], parsed.get("altitude", 0.0), parsed.get("heading", 0.0), parsed.get("speed_mps"))
             await asyncio.sleep(0)
 
 
 MOVING_SPEED_MPS = 0.5
 
 
-async def send_fix(ws: websockets.WebSocketClientProtocol, lat: float, lon: float, alt: float, heading: float, speed_mps: float = 0.0) -> None:
-    behavior = "underway" if speed_mps > MOVING_SPEED_MPS else BEHAVIOR_IDLE
+async def send_fix(ws: websockets.WebSocketClientProtocol, lat: float, lon: float, alt: float, heading: float, speed_mps: Optional[float] = None) -> None:
+    behavior = None
+    if speed_mps is not None:
+        behavior = "underway" if speed_mps > MOVING_SPEED_MPS else BEHAVIOR_IDLE
     payload = build_telemetry(
         VEHICLE_ID, "yp",
         latitude=lat, longitude=lon, altitude=alt, heading=heading,

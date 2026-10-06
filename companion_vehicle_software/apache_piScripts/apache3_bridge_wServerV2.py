@@ -786,7 +786,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     custom_mode_val = getattr(msg, "custom_mode", 0)
                     mode_names = {0: "MANUAL", 4: "HOLD", 10: "AUTO", 11: "RTL", 12: "LOITER", 15: "GUIDED"}
                     system_status["flight_mode"] = mode_names.get(custom_mode_val, f"MODE_{custom_mode_val}")
-                    behavior_tracker.observe_mode(system_status["flight_mode"], guided_modes=("AUTO", "GUIDED", "MANUAL"))
+                    behavior_tracker.observe_mode(system_status["flight_mode"], guided_modes=("AUTO", "GUIDED"))
                 elif msg_type in ("GPS_RAW_INT", "GPS2_RAW"):
                     system_status["gps_status"] = get_gps_fix_label(getattr(msg, "fix_type", 0))
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)

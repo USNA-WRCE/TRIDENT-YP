@@ -94,7 +94,7 @@ The top bar provides these navigation modes and tools:
 | Local Waypoint Planner | Build ship-relative waypoint trajectories using the current YP position |
 | Vehicle Connections | Connect network MAVLink endpoints or RFD-900 serial radios |
 | Settings | Display, vessel, deconfliction, and MOB configuration |
-| Messages | Live message drawer filtered by vehicle and message kind, with retained snapshots |
+| Messages | Live message drawer filtered by vehicle and message kind |
 | User Management | Available to accounts with `manage_users` |
 | Logout | End the current session |
 

@@ -40,6 +40,27 @@ describe("hardware-free telemetry and commands", () => {
     expect(vehicle.mode).toBe("waypoint");
   });
 
+  it("reports and clears demo SAR behavior for search commands", () => {
+    const vehicles = createDemoVehicles();
+    const vehicle = vehicles[1];
+    handleDemoCommand(vehicles, vehicle.vehicle_id, {
+      type: "search_grid",
+      lat: vehicle.lat + 0.001,
+      lon: vehicle.lon,
+      altitude_m: vehicle.alt,
+    });
+    expect(demoVehicleSnapshot(vehicle).behavior).toBe("search_grid");
+
+    handleDemoCommand(vehicles, vehicle.vehicle_id, { type: "cancel_sar" });
+    expect(demoVehicleSnapshot(vehicle).behavior).toBe("idle");
+
+    handleDemoCommand(vehicles, vehicle.vehicle_id, { type: "mob" });
+    expect(demoVehicleSnapshot(vehicle).behavior).toBe("mob_search");
+
+    handleDemoCommand(vehicles, vehicle.vehicle_id, { type: "cancel_sar" });
+    expect(demoVehicleSnapshot(vehicle).behavior).toBe("idle");
+  });
+
   it("keeps the RTB target following the moving mother ship", () => {
     const vehicles = createDemoVehicles();
     const [yp, vehicle] = vehicles;

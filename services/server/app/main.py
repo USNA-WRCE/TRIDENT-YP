@@ -192,6 +192,32 @@ _sitl_land_touchdown_sent: dict[str, bool] = {} # vehicle_id -> True once auto-d
 _sitl_nav_lock = threading.Lock()
 _sitl_nav_states: dict[str, dict[str, float]] = {}
 _sitl_behavior: dict[str, str] = {} # vehicle_id -> behavior reported for server-hosted SITL bridges (hardware bridges report their own)
+_sitl_behavior_versions: dict[str, int] = {}
+_sitl_behavior_lock = threading.Lock()
+
+
+def _set_sitl_behavior(vehicle_id: str, behavior: str) -> None:
+    with _sitl_behavior_lock:
+        _sitl_behavior[vehicle_id] = behavior
+        _sitl_behavior_versions[vehicle_id] = _sitl_behavior_versions.get(vehicle_id, 0) + 1
+
+
+def _sitl_behavior_snapshot(vehicle_id: str) -> tuple[str, int]:
+    with _sitl_behavior_lock:
+        return (
+            _sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE),
+            _sitl_behavior_versions.get(vehicle_id, 0),
+        )
+
+
+def _finish_sitl_behavior(vehicle_id: str, behavior: str, version: int) -> None:
+    with _sitl_behavior_lock:
+        if (
+            _sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE) == behavior
+            and _sitl_behavior_versions.get(vehicle_id, 0) == version
+        ):
+            _sitl_behavior[vehicle_id] = BEHAVIOR_IDLE
+            _sitl_behavior_versions[vehicle_id] = version + 1
 
 # MAVLink MAV_TYPE -> (vehicle_type, human-readable frame name)
 _MAV_TYPE_MAP: dict[int, tuple[str, str]] = {
@@ -910,6 +936,7 @@ async def _run_mavlink_bridge(
                         # SAR missions need exclusive MAVLink access; run in a
                         # dedicated thread and signal the IO thread to pause.
                         _loop = asyncio.get_event_loop()
+                        expected_behavior, expected_version = _sitl_behavior_snapshot(vehicle_id)
 
                         def _forward_sar_telemetry(msg: Any) -> None:
                             try:
@@ -917,7 +944,11 @@ async def _run_mavlink_bridge(
                             except _stdlib_queue.Full:
                                 pass
 
-                        def _run_sar(p: dict[str, Any] = payload) -> None:
+                        def _run_sar(
+                            p: dict[str, Any] = payload,
+                            behavior: str = expected_behavior,
+                            version: int = expected_version,
+                        ) -> None:
                             _sar_stop_event.clear()
                             _sar_active.set()
                             try:
@@ -931,6 +962,7 @@ async def _run_mavlink_bridge(
                                 print(f"[SITL][SAR] Unhandled error: {exc}")
                             finally:
                                 _sar_active.clear()
+                                _finish_sitl_behavior(vehicle_id, behavior, version)
                         threading.Thread(target=_run_sar, daemon=True).start()
                     else:
                         _outbound.put_nowait(payload)
@@ -958,7 +990,7 @@ async def _run_mavlink_bridge(
                 elif msg_type == "LAND_TOUCHDOWN":
                     # The IO thread confirmed real ground contact and disarmed
                     # locally; stop our guidance loop and tell the UI.
-                    _sitl_behavior[vehicle_id] = BEHAVIOR_IDLE
+                    _set_sitl_behavior(vehicle_id, BEHAVIOR_IDLE)
                     await ingest_vehicle_message(build_event(
                         vehicle_id, info["vehicle_type"], EVENT_LAND_ON_BOAT_TOUCHDOWN, stamp=now,
                     ))
@@ -972,7 +1004,7 @@ async def _run_mavlink_bridge(
                         longitude=msg.lon / 1e7,
                         altitude=msg.relative_alt / 1000.0,
                         heading=(hdg / 100.0) if hdg is not None and hdg != 65535 else None,
-                        behavior=_sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE),
+                        behavior=_sitl_behavior_snapshot(vehicle_id)[0],
                         battery={"percentage": last_battery_pct} if last_battery_pct is not None else None,
                         stamp=now,
                     ))
@@ -981,7 +1013,7 @@ async def _run_mavlink_bridge(
                     await ingest_vehicle_message(build_telemetry(
                         vehicle_id,
                         info["vehicle_type"],
-                        behavior=_sitl_behavior.get(vehicle_id, BEHAVIOR_IDLE),
+                        behavior=_sitl_behavior_snapshot(vehicle_id)[0],
                         gps=gps_block_from_mavlink(msg),
                         stamp=now,
                     ))
@@ -2651,6 +2683,13 @@ async def _handle_vehicle_event(vehicle_id: str, vehicle_type: str, event: str, 
         # and already disarmed locally; just stop our guidance loop and tell the UI.
         await _stop_land_on_boat(vehicle_id)
         await broadcast_ui({"op": "land_on_boat_touchdown", "vehicle_id": vehicle_id})
+    await broadcast_ui({
+        "op": "event",
+        "vehicle_id": vehicle_id,
+        "vehicle_type": vehicle_type,
+        "stamp": stamp,
+        "event": event,
+    })
     write_influx("event", vehicle_id, vehicle_type, stamp, {"event": event})
 
 
@@ -2883,7 +2922,7 @@ async def _dispatch_vehicle_command(
     if vehicle_id in sitl_bridges:
         behavior = _behavior_for_command(command.get("type"), source)
         if behavior:
-            _sitl_behavior[vehicle_id] = behavior
+            _set_sitl_behavior(vehicle_id, behavior)
     payload = {
         "op": "command",
         "vehicle_id": vehicle_id,
