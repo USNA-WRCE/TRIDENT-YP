@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Header
+from fastapi import APIRouter, Body, Header, Request
 from fastapi.responses import JSONResponse
 
 from app.auth import (
@@ -19,7 +19,7 @@ router = APIRouter()
 
 
 @router.post("/api/auth/login")
-async def login(payload: dict[str, Any] = Body(default={})) -> JSONResponse:
+async def login(request: Request, payload: dict[str, Any] = Body(default={})) -> JSONResponse:
     """Authenticate a user and return a JWT token."""
     username: str = str(payload.get("username") or "").strip()
     password: str = str(payload.get("password") or "").strip()
@@ -49,7 +49,9 @@ async def login(payload: dict[str, Any] = Body(default={})) -> JSONResponse:
                 "permissions": sorted([p.permission for p in user.permissions])
             }
         })
-        response.set_cookie("auth_token", token, httponly=True, secure=AUTH_COOKIE_SECURE, samesite="lax", max_age=60 * 60 * 24)
+        forwarded_scheme = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+        secure_cookie = AUTH_COOKIE_SECURE or forwarded_scheme == "https"
+        response.set_cookie("auth_token", token, httponly=True, secure=secure_cookie, samesite="lax", max_age=60 * 60 * 24)
         return response
     finally:
         session.close()

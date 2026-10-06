@@ -10,6 +10,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 - [Quick start](#quick-start)
 - [User interface](#user-interface)
 - [Accounts and permissions](#accounts-and-permissions)
+- [Voice commands](#voice-commands)
 - [Vehicle connections](#vehicle-connections)
 - [Commanding and mission planning](#commanding-and-mission-planning)
 - [Search and rescue operations](#search-and-rescue-operations)
@@ -69,6 +70,7 @@ docker compose up --build
 Open:
 
 - Web UI: `http://localhost:8080`
+- HTTPS web UI: `https://yp.test:8443` after completing the [voice command setup](#voice-commands)
 - API docs: `http://localhost:8000/docs`
 - API root/status links: `http://localhost:8000`
 - InfluxDB: `http://localhost:8086`
@@ -194,6 +196,69 @@ Administrators open **User Management** from the users icon. The panel creates a
 Custom permissions: `read_telemetry`, `read_vehicle_status`, `send_waypoint`, `send_rtb`, `set_vehicle_mode`, `cancel_sar`, `arm_disarm`, `create_mission`, `upload_mission`, `search_grid`, `trigger_mob`, `manage_sitl`, `manage_settings`, `manage_video_streams`, and `manage_users`.
 
 Accounts are stored in SQLite at `data/auth/auth.db`, mounted into `yp-server` as `/data/auth/auth.db`. They persist across rebuilds and container recreation. Deleting the database intentionally resets the store to `admin` / `admin`; the database contains password hashes and is excluded from Git.
+
+## Voice commands
+
+Voice control uses browser microphone capture and offline Vosk speech recognition on the YP server. The browser sends a short recording over the local network; audio and transcript are held only in memory, are not returned to the browser or logged, and are discarded after command interpretation. The AMD GPU is not required for voice recognition; the optional YOLO detector's ROCm configuration is separate.
+
+Spoken feedback is available from the speaker button in the top bar and is enabled per browser/device. When enabled, Piper reads command previews, whether commands were routed to a vehicle connection, command rejections, vehicle connect/disconnect events, and confirmed land-on-boat touchdown events. A “command sent” announcement confirms routing, not autopilot completion. Speech audio is synthesized locally and returned as uncached WAV; it is not stored. Audio output must be enabled from a user gesture in each browser session.
+
+The initial command set supports takeoff, setting an aerial vehicle's altitude at its current position, grid search, fly-to coordinates, return to the YP-role vessel, and land on the YP-role vessel. Say the vehicle ID, such as “Drone the third” or “Ledger McQueen”. For a location, say latitude and longitude or select a point on the map and refer to “the selected point” or “here”. Commands are checked against the operator's existing command permissions before a preview is returned. Risky actions require confirmation by default; administrators can change this globally in **Settings > Display > Voice command confirmation**.
+
+### Provision the offline model
+
+The model is a one-time setup asset and is excluded from source control. On a computer with internet access, run:
+
+```bash
+python scripts/install_voice_model.py
+```
+
+Copy `data/vosk_models/vosk-model-small-en-us-0.15/` to the same path on the YP server. If the YP server has temporary internet access, run the installer there instead. Rebuild/start the stack with `docker compose up --build`; the model is mounted read-only into `yp-server`.
+
+### Provision the offline TTS voice
+
+The pinned Piper voice is also a one-time setup asset. On a computer with internet access, run:
+
+```bash
+python scripts/install_tts_voice.py
+```
+
+Copy `data/piper_voice/en_US-lessac-medium.onnx` and its matching `.onnx.json` file to the same path on the YP server. The TTS API returns an unavailable message until both files are present. Review the Piper package's GPL-3.0-or-later terms and the [Lessac voice model card](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium) and linked dataset license before redistributing the server image or voice files.
+
+### Enable trusted HTTPS on the offline network
+
+Microphone access from another device requires a secure browser context. Compose includes Caddy with an internal certificate authority and publishes HTTPS on port `8443`; the existing HTTP UI at port `8080` remains available but cannot use the microphone from LAN clients. No public internet or external certificate service is required at runtime.
+
+1. Choose a hostname that resolves to the YP server on operator devices. The default is `yp.test`; add it to the network's internal DNS or each device's hosts file. To change it, set `YP_HOST` in the Compose environment. `HTTPS_PORT` changes the host-side port (default `8443`).
+2. Start the stack, then export Caddy's local root certificate:
+
+    ```bash
+    docker compose up --build -d
+    docker compose cp https-proxy:/data/caddy/pki/authorities/local/root.crt ./trident-yp-root.crt
+    ```
+
+3. Have IT approve and install `trident-yp-root.crt` as a trusted root certificate on every operator device, using a secure channel to distribute the file. Examples:
+
+    ```powershell
+    # Windows, current user
+    certutil -user -addstore Root .\trident-yp-root.crt
+    ```
+
+    ```bash
+    # macOS, current user's login keychain
+    security add-trusted-cert -d -r trustRoot -k ~/Library/Keychains/login.keychain-db trident-yp-root.crt
+
+    # Debian/Ubuntu Linux, requires administrator approval
+    sudo install -m 0644 trident-yp-root.crt /usr/local/share/ca-certificates/trident-yp-root.crt
+    sudo update-ca-certificates
+    ```
+
+    Most browsers use the operating system trust store; Firefox may need its enterprise-root setting or a separate certificate import. Do not bypass certificate warnings.
+4. Open `https://yp.test:8443` (or the configured hostname and port), sign in, then use the microphone control. Current desktop and mobile browsers with `getUserMedia` and `MediaRecorder` support can use the same workflow; recognition does not depend on browser speech services.
+
+The Caddy CA key and certificates persist in the `caddy-data` Docker volume. Back up and protect that volume. Removing it rotates the local CA and requires distributing the new root certificate to clients. If local CA installation is not permitted, ask IT to issue a certificate for the YP hostname and configure the HTTPS proxy to use the organization's certificate instead.
+
+If the model is missing, speech recognition is unavailable, or a browser lacks microphone support, the voice panel reports an error; it never falls back to a cloud recognition service.
 
 ## Vehicle connections
 

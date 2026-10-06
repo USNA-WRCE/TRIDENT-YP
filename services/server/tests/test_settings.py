@@ -52,6 +52,16 @@ class SettingsTests(DatabaseTestCase):
             self.assertEqual(main.settings[key], value)
         self.assertEqual(self.client.get("/api/settings").json(), response.json())
 
+    def test_voice_confirmation_mode_is_validated_and_persisted_globally(self):
+        response = self.client.put("/api/settings", json={"voice_confirmation_mode": "all"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["voice_confirmation_mode"], "all")
+        self.assertEqual(settings.get_application_settings()["voice_confirmation_mode"], "all")
+
+        rejected = self.client.put("/api/settings", json={"voice_confirmation_mode": "sometimes"})
+        self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(settings.get_application_settings()["voice_confirmation_mode"], "all")
+
     def test_deconfliction_update_replaces_removed_overrides(self):
         with patch.object(main, "deconfliction_engine", DeconflictionEngine()):
             response = self.client.put("/api/deconfliction/settings", json={

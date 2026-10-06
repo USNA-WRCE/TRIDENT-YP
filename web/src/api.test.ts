@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deleteInfluxData, fetchSettings, listHistoricalVehicles, login, updateSettings, updateDeconflictionSettings } from "./api";
+import { deleteInfluxData, fetchSettings, interpretVoiceCommand, listHistoricalVehicles, login, synthesizeVoiceFeedback, updateSettings, updateDeconflictionSettings } from "./api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -73,6 +73,46 @@ describe("authenticated API requests", () => {
         credentials: "include",
         method: "DELETE",
         body: JSON.stringify({ confirmation: "DELETE" }),
+      }),
+    );
+  });
+
+  it("uploads voice audio and the selected map location through the authenticated API", async () => {
+    const preview = {
+      vehicle_id: "DroneJr",
+      command: { type: "rtb" },
+      summary: "Return DroneJr to the YP-role vessel (YP689).",
+      requires_confirmation: true,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(preview), { status: 200 }),
+    );
+    const audio = new Blob(["recording"], { type: "audio/webm;codecs=opus" });
+
+    await expect(interpretVoiceCommand(audio, { latitude: 38.9, longitude: -76.4 })).resolves.toEqual(preview);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/voice/interpret?selected_latitude=38.9&selected_longitude=-76.4",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST",
+        headers: { "Content-Type": "audio/webm;codecs=opus" },
+        body: audio,
+      }),
+    );
+  });
+
+  it("requests authenticated offline speech and returns the WAV bytes", async () => {
+    const audio = new ArrayBuffer(8);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(audio, { status: 200 }));
+
+    await expect(synthesizeVoiceFeedback("Vehicle connected.")).resolves.toEqual(audio);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/voice/speak",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "Vehicle connected." }),
       }),
     );
   });
