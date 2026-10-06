@@ -497,6 +497,19 @@ export async function interpretVoiceCommand(
   return result as VoiceCommandPreview;
 }
 
+export async function synthesizeVoiceFeedback(text: string): Promise<ArrayBuffer> {
+  const response = await apiFetch("/api/voice/speak", {
+    method: "POST",
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ text }),
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error ?? `Spoken feedback failed: ${response.status}`);
+  }
+  return response.arrayBuffer();
+}
+
 export interface MobResult {
   ok: boolean;
   vehicle_id?: string;
@@ -572,10 +585,11 @@ export async function connectSITL(url: string, vehicleId?: string, cameraHost?: 
 }
 
 export async function disconnectSITL(vehicleId: string): Promise<void> {
-  await apiFetch(`/api/sitl/${encodeURIComponent(vehicleId)}`, {
+  const response = await apiFetch(`/api/sitl/${encodeURIComponent(vehicleId)}`, {
     method: "DELETE",
     headers: getAuthHeaders(),
   });
+  if (!response.ok) throw new Error(`vehicle disconnect failed: ${response.status}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -201,6 +201,8 @@ Accounts are stored in SQLite at `data/auth/auth.db`, mounted into `yp-server` a
 
 Voice control uses browser microphone capture and offline Vosk speech recognition on the YP server. The browser sends a short recording over the local network; audio and transcript are held only in memory, are not returned to the browser or logged, and are discarded after command interpretation. The AMD GPU is not required for voice recognition; the optional YOLO detector's ROCm configuration is separate.
 
+Spoken feedback is available from the speaker button in the top bar and is enabled per browser/device. When enabled, Piper reads command previews, whether commands were routed to a vehicle connection, command rejections, vehicle connect/disconnect events, and confirmed land-on-boat touchdown events. A “command sent” announcement confirms routing, not autopilot completion. Speech audio is synthesized locally and returned as uncached WAV; it is not stored. Audio output must be enabled from a user gesture in each browser session.
+
 The initial command set supports takeoff, setting an aerial vehicle's altitude at its current position, grid search, fly-to coordinates, return to the YP-role vessel, and land on the YP-role vessel. Say the vehicle ID, such as “Drone the third” or “Ledger McQueen”. For a location, say latitude and longitude or select a point on the map and refer to “the selected point” or “here”. Commands are checked against the operator's existing command permissions before a preview is returned. Risky actions require confirmation by default; administrators can change this globally in **Settings > Display > Voice command confirmation**.
 
 ### Provision the offline model
@@ -212,6 +214,16 @@ python scripts/install_voice_model.py
 ```
 
 Copy `data/vosk_models/vosk-model-small-en-us-0.15/` to the same path on the YP server. If the YP server has temporary internet access, run the installer there instead. Rebuild/start the stack with `docker compose up --build`; the model is mounted read-only into `yp-server`.
+
+### Provision the offline TTS voice
+
+The pinned Piper voice is also a one-time setup asset. On a computer with internet access, run:
+
+```bash
+python scripts/install_tts_voice.py
+```
+
+Copy `data/piper_voice/en_US-lessac-medium.onnx` and its matching `.onnx.json` file to the same path on the YP server. The TTS API returns an unavailable message until both files are present. Review the Piper package's GPL-3.0-or-later terms and the [Lessac voice model card](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium) and linked dataset license before redistributing the server image or voice files.
 
 ### Enable trusted HTTPS on the offline network
 

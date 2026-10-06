@@ -69,6 +69,8 @@ instance/
 data/auth/*.db
 data/auth/*.db-*
 data/vosk_models/
+data/voice_models/
+data/piper_voice/
 
 # LIFEGUARD files, there for development purposes, not needed for production
 LIFEGUARD-yp_mob

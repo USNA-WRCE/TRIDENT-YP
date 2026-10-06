@@ -62,3 +62,25 @@ class VoiceApiTests(DatabaseTestCase):
         )
 
         self.assertIn("secure", response.headers["set-cookie"].lower())
+
+    def test_speak_returns_uncached_wave_audio(self):
+        audio = b"RIFF-test-wave"
+        with patch.object(main, "synthesize_speech", return_value=audio) as synthesize:
+            response = self.client.post("/api/voice/speak", json={"text": "Waypoint command sent."})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "audio/wav")
+        self.assertEqual(response.headers["cache-control"], "no-store, private")
+        self.assertEqual(response.content, audio)
+        synthesize.assert_called_once_with("Waypoint command sent.")
+
+    def test_speak_rejects_missing_auth_and_oversized_text(self):
+        self.client.cookies.clear()
+        with patch.object(main, "synthesize_speech") as synthesize:
+            unauthorized = self.client.post("/api/voice/speak", json={"text": "Hello"})
+        self.assertEqual(unauthorized.status_code, 401)
+        synthesize.assert_not_called()
+
+        self.login()
+        oversized = self.client.post("/api/voice/speak", json={"text": "x" * 401})
+        self.assertEqual(oversized.status_code, 413)

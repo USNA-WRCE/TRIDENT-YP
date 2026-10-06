@@ -15,9 +15,10 @@ interface VoiceControlProps {
   selectedLocation: VoiceLocation | null;
   onClearLocation: () => void;
   onDispatch: (vehicleId: string, command: Command) => boolean;
+  onSpeak: (text: string) => void;
 }
 
-export function VoiceControl({ canDispatch, selectedLocation, onClearLocation, onDispatch }: VoiceControlProps) {
+export function VoiceControl({ canDispatch, selectedLocation, onClearLocation, onDispatch, onSpeak }: VoiceControlProps) {
   const [open, setOpen] = useState(false);
   const [recording, setRecording] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -59,6 +60,7 @@ export function VoiceControl({ canDispatch, selectedLocation, onClearLocation, o
     setProcessing(true);
     try {
       const candidate = await interpretVoiceCommand(audio, location);
+      onSpeak(candidate.summary);
       if (candidate.requires_confirmation) setPreview(candidate);
       else dispatch(candidate);
     } catch (cause) {

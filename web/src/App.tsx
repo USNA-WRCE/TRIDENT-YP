@@ -18,6 +18,8 @@ import {
   Trash2,
   Wifi,
   WifiOff,
+  Volume2,
+  VolumeX,
   Map as MapIcon,
   LogOut,
   Users,
@@ -32,6 +34,7 @@ import Login from "./Login";
 const UserManagement = lazy(() => import("./UserManagement"));
 import { destinationPoint, localToGlobalWaypoint } from "./utils/geo";
 import { useTelemetrySocket } from "./hooks/useTelemetrySocket";
+import { useSpokenFeedback } from "./hooks/useSpokenFeedback";
 import { MessageDrawer, type StreamMessage } from "./components/MessageDrawer";
 import { SITLPanel } from "./components/SITLPanel";
 import { VehicleModal } from "./components/VehicleModal";
@@ -41,6 +44,7 @@ import { VoiceControl } from "./components/VoiceControl";
 import { HistoryExplorer } from "./components/HistoryExplorer";
 import { FitAllControl, FollowYpCenter, SarPatternOverlay, VehicleLayer, WaypointCrosshair, YpRangeRings, type WaypointMarker } from "./components/map/VehicleLayers";
 import { vehicleMarkerColor } from "./utils/vehicleStyle";
+import { commandAckSpeech } from "./utils/voiceFeedback";
 import { WeatherRadarLayer, WindLayer } from "./components/map/OverlayLayers";
 import { createDemoVehicles, demoVehicleSnapshot, handleDemoCommand, stepDemoVehicle, updateDemoVehicleColor, type DemoMessagePayload, type DemoVehicle } from "./services/demo";
 import { isAgentAvailable, startAgentRelay } from "./services/relayAgent";
@@ -76,6 +80,7 @@ const GPS_FIX_STALE_AFTER_S = 10;
 function isGpsFixStale(stamp: number | undefined): boolean {
   return stamp == null || Date.now() / 1000 - stamp > GPS_FIX_STALE_AFTER_S;
 }
+
 /** Renders elapsed time since a unix-seconds timestamp as a short human string. */
 function formatSecondsAgo(epochSeconds: number | null): string {
   if (epochSeconds == null) return "never";
@@ -231,6 +236,10 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [shipRelativePlans, setShipRelativePlans] = useState<Record<string, { shipVehicleId: string; localWaypoints: RelativeWaypoint[] }>>({});
   const [sarMissionActiveByVehicle, setSarMissionActiveByVehicle] = useState<Record<string, boolean>>({});
   const [rtbFollowState, setRtbFollowState] = useState<Record<string, boolean>>({});
+  const spokenFeedback = useSpokenFeedback();
+  const spokenFeedbackRef = useRef(spokenFeedback.speak);
+  const spokenConnectionStatesRef = useRef<Record<string, boolean>>({});
+  spokenFeedbackRef.current = spokenFeedback.speak;
   const followBeforeWaypointDragRef = useRef(false);
   const { connected: socketConnected, socketRef: wsRef } = useTelemetrySocket({
     enabled: !DEMO_MODE,
@@ -238,9 +247,11 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
     onPayload: (payload) => {
       if (payload.error && !payload.op) {
         console.warn("[YP] command rejected:", payload.error, payload.command_type ? `(${payload.command_type})` : "");
+        spokenFeedbackRef.current(`Command rejected. ${String(payload.error)}`);
       }
       if (payload.op === "snapshot") {
         const snapshotVehicles = payload.vehicles as Vehicle[];
+        spokenConnectionStatesRef.current = Object.fromEntries(snapshotVehicles.map((vehicle) => [vehicle.vehicle_id, vehicle.connected]));
         setVehicles(Object.fromEntries(snapshotVehicles.map((vehicle) => [vehicle.vehicle_id, withLocalVehicleColor(vehicle, localVehicleColorsRef.current)])));
         setMessageLog(snapshotMessages(snapshotVehicles).slice(0, MAX_MESSAGE_LOG));
         setWaypointMarkers(Object.fromEntries((payload.waypoints as WaypointMarker[] | undefined ?? []).map((waypoint) => [waypoint.vehicle_id, waypoint])));
@@ -267,6 +278,17 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }
       if (payload.op === "vehicle_update") {
         const incoming = withLocalVehicleColor(payload.vehicle as Vehicle, localVehicleColorsRef.current);
+        const previousConnected = spokenConnectionStatesRef.current[incoming.vehicle_id];
+        if (previousConnected !== undefined && previousConnected !== incoming.connected) {
+          spokenFeedbackRef.current(`Vehicle ${incoming.vehicle_id} ${incoming.connected ? "connected" : "disconnected"}.`);
+        } else if (previousConnected === undefined && incoming.connected) {
+          spokenFeedbackRef.current(`Vehicle ${incoming.vehicle_id} connected.`);
+        }
+        spokenConnectionStatesRef.current[incoming.vehicle_id] = incoming.connected;
+        const incomingMessage = payload.message as { type?: string; msg?: Record<string, unknown> } | undefined;
+        if (incomingMessage?.type?.includes("LandOnBoatTouchdown") && incomingMessage.msg?.landed) {
+          spokenFeedbackRef.current(`Vehicle ${incoming.vehicle_id} has landed on the YP vessel.`);
+        }
         setVehicles((current) => {
           const prev = current[incoming.vehicle_id];
           const prevHistory: Position[] = prev?.history ?? [];
@@ -282,6 +304,8 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }
       if (payload.op === "command_ack") {
         setMessageLog((current) => [streamMessageFromCommandAck(payload), ...current].slice(0, MAX_MESSAGE_LOG));
+        const acknowledgement = commandAckSpeech(payload);
+        if (acknowledgement) spokenFeedbackRef.current(acknowledgement);
         const ackVehicleId = payload.vehicle_id as string | undefined;
         const ackCommandType = (payload.command as { type?: string } | undefined)?.type;
         if (ackVehicleId && ackCommandType) updateSarMissionState(ackVehicleId, ackCommandType);
@@ -329,6 +353,10 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }
       if (payload.op === "vehicle_disconnected") {
         const disconnectedId = payload.vehicle_id as string;
+        if (spokenConnectionStatesRef.current[disconnectedId] !== false) {
+          spokenFeedbackRef.current(`Vehicle ${disconnectedId} disconnected.`);
+        }
+        spokenConnectionStatesRef.current[disconnectedId] = false;
         setVehicles((current) => {
           const next = { ...current };
           delete next[disconnectedId];
@@ -769,10 +797,14 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         updateSarMissionState(vehicleId, "mob");
         setMobModalOpen(false);
       } else {
-        setMobError(result.error ?? "Dispatch failed");
+        const message = result.error ?? "Dispatch failed";
+        setMobError(message);
+        spokenFeedback.speak(`Man overboard search dispatch failed. ${message}`);
       }
     } catch (err) {
-      setMobError(err instanceof Error ? err.message : "Network error");
+      const message = err instanceof Error ? err.message : "Network error";
+      setMobError(message);
+      spokenFeedback.speak(`Man overboard search dispatch failed. ${message}`);
     }
     setMobSending(false);
   };
@@ -1052,7 +1084,19 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
               selectedLocation={voiceSelectedLocation}
               onClearLocation={() => setVoiceSelectedLocation(null)}
               onDispatch={(vehicleId, body) => socketConnected && command(vehicleId, body)}
+              onSpeak={spokenFeedback.speak}
             />
+          )}
+          {!DEMO_MODE && (
+            <button
+              className={spokenFeedback.enabled ? "icon-button active" : "icon-button"}
+              type="button"
+              aria-label={spokenFeedback.enabled ? "Spoken feedback enabled" : "Enable spoken feedback"}
+              title={spokenFeedback.enabled ? "Spoken feedback enabled" : "Enable spoken feedback"}
+              onClick={() => void spokenFeedback.toggleEnabled()}
+            >
+              {spokenFeedback.enabled ? <Volume2 size={19} /> : <VolumeX size={19} />}
+            </button>
           )}
           {currentUser?.permissions.includes("manage_settings") && !VIEW_MODE && (
             <div className="flight-log-control">
@@ -1170,6 +1214,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           </button>}
         </div>
         {flightLogError && <div className="flight-log-error" role="alert">{flightLogError}</div>}
+        {spokenFeedback.error && <div className="flight-log-error" role="alert">{spokenFeedback.error}</div>}
       </div>
 
       {showSITL && !DEMO_MODE && (
@@ -1179,9 +1224,9 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
             onConnect={(url, vehicleId) =>
               connectSITL(url, vehicleId || undefined)
                 .then((result) => {
-                  if (!result.ok) return;
+                  if (!result.ok) spokenFeedback.speak(`Vehicle connection failed. ${result.error ?? "Check the connection details."}`);
                 })
-                .catch(() => undefined)
+                .catch((error: unknown) => spokenFeedback.speak(`Vehicle connection failed. ${error instanceof Error ? error.message : "Network error."}`))
             }
             onDisconnect={(vehicleId) =>
               disconnectSITL(vehicleId)
@@ -1192,7 +1237,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                     return next;
                   })
                 )
-                .catch(() => undefined)
+                .catch((error: unknown) => spokenFeedback.speak(`Vehicle disconnect failed. ${error instanceof Error ? error.message : "Network error."}`))
             }
           />
         </div>
@@ -1556,7 +1601,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 onChange={(e) => {
                   const newId = e.target.value || null;
                   setYpRoleVehicleId(newId);
-                  setYpRole(newId).catch(() => undefined);
+                  setYpRole(newId).catch((error: unknown) => spokenFeedback.speak(`YP role update failed. ${error instanceof Error ? error.message : "Network error."}`));
                 }}
               >
                 <option value="">- dedicated yp_gps service -</option>

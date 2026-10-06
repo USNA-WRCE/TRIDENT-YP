@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deleteInfluxData, fetchSettings, interpretVoiceCommand, listHistoricalVehicles, login, updateSettings, updateDeconflictionSettings } from "./api";
+import { deleteInfluxData, fetchSettings, interpretVoiceCommand, listHistoricalVehicles, login, synthesizeVoiceFeedback, updateSettings, updateDeconflictionSettings } from "./api";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -97,6 +97,22 @@ describe("authenticated API requests", () => {
         method: "POST",
         headers: { "Content-Type": "audio/webm;codecs=opus" },
         body: audio,
+      }),
+    );
+  });
+
+  it("requests authenticated offline speech and returns the WAV bytes", async () => {
+    const audio = new ArrayBuffer(8);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(audio, { status: 200 }));
+
+    await expect(synthesizeVoiceFeedback("Vehicle connected.")).resolves.toEqual(audio);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/voice/speak",
+      expect.objectContaining({
+        credentials: "include",
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: "Vehicle connected." }),
       }),
     );
   });

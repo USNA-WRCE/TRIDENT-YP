@@ -54,6 +54,12 @@ from app.voice_recognition import (
     VoiceRecognitionUnavailable,
     transcribe_audio,
 )
+from app.voice_synthesis import (
+    MAX_SPEECH_CHARACTERS,
+    VoiceSynthesisError,
+    VoiceSynthesisUnavailable,
+    synthesize_speech,
+)
 
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
@@ -1617,6 +1623,30 @@ async def interpret_voice_command(request: Request) -> JSONResponse:
     if not _check_command_permission(user, preview["command"].get("type")):
         return JSONResponse({"error": "You do not have permission for this voice command."}, status_code=403)
     return JSONResponse(preview)
+
+
+@app.post("/api/voice/speak")
+async def speak_voice_text(request: Request, payload: dict[str, Any] = Body(default={})) -> Response:
+    """Synthesize a short authenticated status message to uncached WAV bytes."""
+    user = get_current_user(request.cookies.get("auth_token"))
+    if not user:
+        return JSONResponse({"error": "Authentication required. Please login."}, status_code=401)
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({"error": "Speech text is required."}, status_code=400)
+    if len(text) > MAX_SPEECH_CHARACTERS:
+        return JSONResponse({"error": "Speech text is too long."}, status_code=413)
+    try:
+        audio = await asyncio.to_thread(synthesize_speech, text)
+    except VoiceSynthesisUnavailable as error:
+        return JSONResponse({"error": str(error)}, status_code=503)
+    except VoiceSynthesisError as error:
+        return JSONResponse({"error": str(error)}, status_code=422)
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store, private"},
+    )
 
 
 @app.get("/api/rtcm/status")

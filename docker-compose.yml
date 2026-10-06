@@ -44,6 +44,7 @@ services:
       INFLUX_TOKEN: yp-dev-token
       AUTH_DB_PATH: /data/auth/auth.db
       VOSK_MODEL_PATH: /data/vosk_models/vosk-model-small-en-us-0.15
+      PIPER_MODEL_PATH: /data/voice_models/en_US-lessac-medium.onnx
       TILE_DIR: /data/tiles
       TILE_CACHE_DIR: /data/tile-cache
       OSM_TILE_URL: https://tile.openstreetmap.org/{z}/{x}/{y}.png
@@ -77,6 +78,7 @@ services:
       - ./data/yolo_models:/data/yolo_models
       - ./data/logs:/data/logs
       - ./data/vosk_models:/data/vosk_models:ro
+      - ./data/piper_voice:/data/voice_models:ro
     depends_on:
       influxdb:
         condition: service_healthy

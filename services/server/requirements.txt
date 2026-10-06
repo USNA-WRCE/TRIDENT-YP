@@ -8,3 +8,4 @@ pyserial==3.5
 PyJWT==2.8.0
 sqlalchemy==2.0.31
 vosk==0.3.45
+piper-tts==1.8.0
