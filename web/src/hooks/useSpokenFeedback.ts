@@ -44,49 +44,6 @@ export function useSpokenFeedback() {
     if (context && context.state !== "closed") void context.close();
   }, []);
 
-  const toggleEnabled = useCallback(async () => {
-    setError("");
-    if (enabledRef.current) {
-      const current = contextRef.current;
-      if (!current || current.state !== "running") {
-        const AudioContext = audioContextConstructor();
-        if (!AudioContext) {
-          setError("This browser does not support spoken feedback.");
-          return;
-        }
-        try {
-          const context = current && current.state !== "closed" ? current : new AudioContext();
-          await context.resume();
-          contextRef.current = context;
-        } catch {
-          setError("Could not enable audio output in this browser.");
-        }
-        return;
-      }
-      enabledRef.current = false;
-      setEnabled(false);
-      nextStartTimeRef.current = 0;
-      await current.close();
-      contextRef.current = null;
-      return;
-    }
-
-    const AudioContext = audioContextConstructor();
-    if (!AudioContext) {
-      setError("This browser does not support spoken feedback.");
-      return;
-    }
-    try {
-      const context = new AudioContext();
-      await context.resume();
-      contextRef.current = context;
-      enabledRef.current = true;
-      setEnabled(true);
-    } catch {
-      setError("Could not enable audio output in this browser.");
-    }
-  }, []);
-
   const speak = useCallback((text: string) => {
     if (!enabledRef.current || !text.trim()) return;
     queueRef.current = queueRef.current
@@ -108,6 +65,69 @@ export function useSpokenFeedback() {
         setError(cause instanceof Error ? cause.message : "Spoken feedback is unavailable.");
       });
   }, []);
+
+  const activateSavedAudio = useCallback(async () => {
+    if (!enabledRef.current) return;
+    const current = contextRef.current;
+    if (current?.state === "running") return;
+
+    const AudioContext = audioContextConstructor();
+    if (!AudioContext) {
+      setError("This browser does not support spoken feedback.");
+      return;
+    }
+    try {
+      const context = current && current.state !== "closed" ? current : new AudioContext();
+      contextRef.current = context;
+      await context.resume();
+      if (contextRef.current === context && context.state === "running") setError("");
+    } catch {
+      setError("Could not enable audio output in this browser.");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return;
+    const activateOnGesture = (event: Event) => {
+      if (event.target instanceof Element && event.target.closest("[data-spoken-feedback-toggle]")) return;
+      void activateSavedAudio();
+    };
+    window.addEventListener("pointerdown", activateOnGesture, true);
+    window.addEventListener("keydown", activateOnGesture, true);
+    return () => {
+      window.removeEventListener("pointerdown", activateOnGesture, true);
+      window.removeEventListener("keydown", activateOnGesture, true);
+    };
+  }, [activateSavedAudio, enabled]);
+
+  const toggleEnabled = useCallback(async () => {
+    setError("");
+    if (enabledRef.current) {
+      enabledRef.current = false;
+      setEnabled(false);
+      nextStartTimeRef.current = 0;
+      const current = contextRef.current;
+      contextRef.current = null;
+      if (current && current.state !== "closed") await current.close();
+      return;
+    }
+
+    const AudioContext = audioContextConstructor();
+    if (!AudioContext) {
+      setError("This browser does not support spoken feedback.");
+      return;
+    }
+    try {
+      const context = new AudioContext();
+      await context.resume();
+      contextRef.current = context;
+      enabledRef.current = true;
+      setEnabled(true);
+      speak("LIFEGUARD Voice activated");
+    } catch {
+      setError("Could not enable audio output in this browser.");
+    }
+  }, [speak]);
 
   return { enabled, error, speak, toggleEnabled };
 }

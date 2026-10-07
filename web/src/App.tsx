@@ -1109,6 +1109,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
           )}
           {!DEMO_MODE && (
             <button
+              data-spoken-feedback-toggle
               className={spokenFeedback.enabled ? "icon-button active" : "icon-button"}
               type="button"
               aria-label={spokenFeedback.enabled ? "Spoken feedback enabled" : "Enable spoken feedback"}

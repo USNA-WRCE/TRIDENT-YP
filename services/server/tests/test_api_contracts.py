@@ -133,6 +133,35 @@ class APIContractTests(DatabaseTestCase):
         self.assertIn({"op": "waypoint_cleared", "vehicle_id": "uav-01"}, messages)
         self.assertNotIn("uav-01", main.shared_waypoints)
 
+    def test_cancel_sar_ack_reports_whether_an_active_sar_pattern_was_cleared(self):
+        for active_pattern in (True, False):
+            with self.subTest(active_pattern=active_pattern):
+                queue = asyncio.Queue()
+                if active_pattern:
+                    main.shared_sar_patterns["uav-01"] = {
+                        "pattern_type": "search_grid",
+                        "waypoints": [[38.9, -76.4]],
+                    }
+                else:
+                    main.shared_sar_patterns.pop("uav-01", None)
+
+                broadcast = AsyncMock()
+                with patch.dict(main.vehicle_queues, {"uav-01": queue}), patch.object(
+                    main, "broadcast_ui", broadcast,
+                ), patch.object(main, "broadcast_ros", AsyncMock()), patch.object(
+                    main, "write_influx",
+                ), patch.object(main, "_stop_rtb_follow", AsyncMock()), patch.object(
+                    main, "_stop_land_on_boat", AsyncMock(),
+                ):
+                    asyncio.run(main.route_command("uav-01", {"type": "cancel_sar"}, "ui"))
+
+                ack = next(
+                    call.args[0]
+                    for call in broadcast.await_args_list
+                    if call.args[0].get("op") == "command_ack"
+                )
+                self.assertIs(ack["sar_cancelled"], active_pattern)
+
     def test_rosbridge_subscriber_receives_navsatfix_derived_from_telemetry(self):
         topic = "/vehicles/boat-01/navsatfix"
         with self.client.websocket_connect("/ws/rosbridge") as ros:

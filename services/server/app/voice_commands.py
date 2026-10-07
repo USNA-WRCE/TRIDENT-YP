@@ -208,7 +208,7 @@ def parse_voice_command(
         if altitude > 120:
             raise VoiceCommandError("Takeoff altitude must not exceed 120 meters.")
         command = {"type": "takeoff", "altitude_m": altitude}
-        summary = f"Take off {vehicle_id} to {altitude:g} meters."
+        summary = f"Take off {vehicle_id} to {altitude:.1f} meters."
     elif re.search(r"\bsearch\b.*\bgrid\b", action_text):
         grid_size = _extract_measurement(action_text, "search grid size")
         if grid_size > 5000:
@@ -224,7 +224,7 @@ def parse_voice_command(
         }
         summary = (
             f"Search with {vehicle_id}: {grid_size:g}-meter grid at "
-            f"{latitude:.6f}, {longitude:.6f}; 30-meter altitude and 20-meter swath."
+            f"{latitude:.3f}, {longitude:.3f}; 30.0-meter altitude and 20-meter swath."
         )
     elif re.search(r"\b(?:fly|go|navigate)\s+to\b", action_text):
         latitude, longitude = _location(action_text, selected_location)
@@ -244,8 +244,8 @@ def parse_voice_command(
             },
         }
         summary = (
-            f"Send {vehicle_id} to {latitude:.6f}, {longitude:.6f} "
-            f"at {altitude:g} meters altitude."
+            f"Send {vehicle_id} to {latitude:.3f}, {longitude:.3f} "
+            f"at {altitude:.1f} meters altitude."
         )
     elif re.search(r"\b(?:altitude|height)\b|\b(?:climb|descend)\s+to\b", action_text):
         if vehicle_type not in ("uav", "uavf"):
@@ -269,7 +269,7 @@ def parse_voice_command(
                 "altitude": altitude,
             },
         }
-        summary = f"Set {vehicle_id} altitude to {altitude:g} meters at its current position."
+        summary = f"Set {vehicle_id} altitude to {altitude:.1f} meters at its current position."
     else:
         raise VoiceCommandError("That voice command is not supported yet.")
 
