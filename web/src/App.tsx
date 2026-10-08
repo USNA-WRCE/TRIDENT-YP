@@ -1666,7 +1666,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 Landing hover clearance
                 <span>{landOnBoatHoverClearanceM.toFixed(1)} m</span>
               </label>
-              <input min={0.1} max={5} step={0.1} type="range" value={landOnBoatHoverClearanceM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatHoverClearanceM(Number(event.target.value))} />
+              <input min={-1.5} max={5} step={0.1} type="range" value={landOnBoatHoverClearanceM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatHoverClearanceM(Number(event.target.value))} />
               <label>
                 Landing descent rate
                 <span>{landOnBoatDescentRateMs.toFixed(1)} m/s</span>
