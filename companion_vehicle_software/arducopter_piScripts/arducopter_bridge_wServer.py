@@ -871,7 +871,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     # Try to connect with a short 2-second timeout so it doesn't block MAVLink reading
                     ws = await asyncio.wait_for(
                         websockets.connect(f"{server_ws_url.rstrip('/')}/{vehicle_id}", ping_interval=10, ping_timeout=10),
-                        timeout=2.0
+                        timeout=10.0
                     )
                     system_status["ws_connected"] = True
                     system_status["ws_status"] = "Connected"
@@ -879,6 +879,7 @@ async def telemetry_loop(current_config: dict) -> None:
                 except Exception as e:
                     system_status["ws_connected"] = False
                     system_status["ws_status"] = "Server Offline (Retrying)"
+                    print(f"[WS] Connect to {server_ws_url} failed: {type(e).__name__}: {e}", flush=True)
                     ws = None
 
             # --- 2. Read WebSocket Commands ---
