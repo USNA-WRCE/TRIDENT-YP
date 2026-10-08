@@ -4,6 +4,7 @@ interface CommandAcknowledgement {
   source?: unknown;
   vehicle_id?: unknown;
   delivered?: unknown;
+  sar_cancelled?: unknown;
   command?: {
     type: string;
     altitude_m?: number;
@@ -18,15 +19,20 @@ export function commandAckSpeech(payload: CommandAcknowledgement): string | null
   const vehicleId = String(payload.vehicle_id || "vehicle");
   const command = payload.command;
   if (!command) return null;
+  if (command.type === "cancel_sar") {
+    return payload.sar_cancelled === true && payload.delivered !== false
+      ? `SAR search canceled for ${vehicleId}.`
+      : null;
+  }
   if (payload.delivered === false) {
     return `The ${command.type.replace(/_/g, " ")} command for ${vehicleId} was not delivered because its vehicle connection is unavailable.`;
   }
   switch (command.type as Command["type"] | "mob") {
     case "takeoff":
-      return `Takeoff command sent to ${vehicleId} to ${Number(command.altitude_m ?? 15)} meters.`;
+      return `Takeoff command sent to ${vehicleId} to ${Number(command.altitude_m ?? 15).toFixed(1)} meters.`;
     case "waypoint": {
       const altitude = command.target?.altitude;
-      return `Waypoint command sent to ${vehicleId}${altitude == null ? "." : ` with a target altitude of ${altitude} meters.`}`;
+      return `Waypoint command sent to ${vehicleId}${altitude == null ? "." : ` with a target altitude of ${altitude.toFixed(1)} meters.`}`;
     }
     case "search_grid":
       return `Search grid command sent to ${vehicleId} for a ${Number(command.grid_size_m ?? 200)} meter grid.`;

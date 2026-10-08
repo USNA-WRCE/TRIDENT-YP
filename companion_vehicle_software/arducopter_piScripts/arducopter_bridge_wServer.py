@@ -546,7 +546,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                     print(f"[INFO] Waypoint {index} reached, proceeding to next waypoint.", flush=True)
                     break
             else:
-                print(f"[INFO] Waypoint {index} not reached, current distance to target: {_distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon):.2f} m, {alt_condition_met}", flush=True)
+                dist_to_target_m = _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon)
+                print(f"[INFO] Waypoint {index} not reached, current distance to target: {dist_to_target_m:.2f} m, {alt_condition_met}", flush=True)
             time.sleep(update_period_s)
         if stop_event.is_set(): return
     behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
@@ -870,7 +871,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     # Try to connect with a short 2-second timeout so it doesn't block MAVLink reading
                     ws = await asyncio.wait_for(
                         websockets.connect(f"{server_ws_url.rstrip('/')}/{vehicle_id}", ping_interval=10, ping_timeout=10),
-                        timeout=2.0
+                        timeout=10.0
                     )
                     system_status["ws_connected"] = True
                     system_status["ws_status"] = "Connected"
@@ -878,6 +879,7 @@ async def telemetry_loop(current_config: dict) -> None:
                 except Exception as e:
                     system_status["ws_connected"] = False
                     system_status["ws_status"] = "Server Offline (Retrying)"
+                    print(f"[WS] Connect to {server_ws_url} failed: {type(e).__name__}: {e}", flush=True)
                     ws = None
 
             # --- 2. Read WebSocket Commands ---

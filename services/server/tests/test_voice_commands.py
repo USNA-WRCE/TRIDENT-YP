@@ -40,10 +40,11 @@ class VoiceCommandTests(unittest.TestCase):
         ]
 
     def test_takeoff_resolves_spoken_ordinal_vehicle_id(self):
-        result = parse_voice_command("Drone the third takeoff at fifteen meters", self.vehicles, "YP689")
+        result = parse_voice_command("Drone the third takeoff at 15.26 meters", self.vehicles, "YP689")
 
         self.assertEqual(result["vehicle_id"], "DroneThe3rd")
-        self.assertEqual(result["command"], {"type": "takeoff", "altitude_m": 15})
+        self.assertEqual(result["command"], {"type": "takeoff", "altitude_m": 15.26})
+        self.assertIn("to 15.3 meters", result["summary"])
         self.assertTrue(result["requires_confirmation"])
 
     def test_standalone_altitude_uses_current_position_waypoint(self):
@@ -72,7 +73,8 @@ class VoiceCommandTests(unittest.TestCase):
         result = parse_voice_command("Ledger McQueen search a twenty five meter grid at location", self.vehicles, "YP689", {"latitude": 38.95, "longitude": -76.48})
 
         self.assertEqual(result["command"]["grid_size_m"], 25)
-        self.assertIn("38.950000, -76.480000", result["summary"])
+        self.assertIn("38.950, -76.480", result["summary"])
+        self.assertIn("30.0-meter altitude", result["summary"])
 
     def test_grid_search_uses_selected_map_point_when_named(self):
         result = parse_voice_command(

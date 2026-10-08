@@ -2822,8 +2822,10 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
         if shared_waypoints.pop(vehicle_id, None) is not None:
             await broadcast_ui({"op": "waypoint_cleared", "vehicle_id": vehicle_id})
 
+    sar_cancelled = False
     if not is_temporary_avoidance and cmd_type in ("rtb", "cancel_sar", "waypoint"):
         if shared_sar_patterns.pop(vehicle_id, None) is not None:
+            sar_cancelled = cmd_type == "cancel_sar"
             await broadcast_ui({"op": "sar_pattern_cleared", "vehicle_id": vehicle_id})
 
     if cmd_type == "clear_sar_pattern":
@@ -2914,7 +2916,14 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
     if vehicle_id in vehicles and not is_temporary_avoidance:
         await _update_deconfliction_state(vehicle_id, vehicles[vehicle_id], command)
 
-    await _dispatch_vehicle_command(vehicle_id, command, source, emit_ack=True, write_log=True)
+    await _dispatch_vehicle_command(
+        vehicle_id,
+        command,
+        source,
+        emit_ack=True,
+        write_log=True,
+        sar_cancelled=sar_cancelled if cmd_type == "cancel_sar" else None,
+    )
 
 
 async def _dispatch_vehicle_command(
@@ -2924,6 +2933,7 @@ async def _dispatch_vehicle_command(
     *,
     emit_ack: bool,
     write_log: bool,
+    sar_cancelled: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Queue a command for delivery to a vehicle, optionally logging and acking it."""
     if vehicle_id in sitl_bridges:
@@ -2957,6 +2967,8 @@ async def _dispatch_vehicle_command(
     if emit_ack:
         ack_payload = dict(payload)
         ack_payload["op"] = "command_ack"
+        if sar_cancelled is not None:
+            ack_payload["sar_cancelled"] = sar_cancelled
         await broadcast_ui(ack_payload)
 
     return payload
