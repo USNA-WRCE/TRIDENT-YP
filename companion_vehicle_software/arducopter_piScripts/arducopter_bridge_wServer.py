@@ -546,7 +546,8 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
                     print(f"[INFO] Waypoint {index} reached, proceeding to next waypoint.", flush=True)
                     break
             else:
-                print(f"[INFO] Waypoint {index} not reached, current distance to target: {_distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon):.2f} m, {alt_condition_met}", flush=True)
+                dist_to_target_m = _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon)
+                print(f"[INFO] Waypoint {index} not reached, current distance to target: {dist_to_target_m:.2f} m, {alt_condition_met}", flush=True)
             time.sleep(update_period_s)
         if stop_event.is_set(): return
     behavior_tracker.finish(BEHAVIOR_SHIP_RELATIVE)
