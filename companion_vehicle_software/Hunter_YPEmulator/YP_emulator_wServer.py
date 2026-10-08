@@ -3,6 +3,7 @@ import json
 import math
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,7 @@ LOG_DIR = Path(os.getenv("LOG_DOWNLOAD_DIR", "flight_logs"))
 LOG_REQUEST_TIMEOUT_S = 5.0
 LOG_CHUNK_BYTES = 90  # MAVLink LOG_DATA payload size
 LOG_CHUNK_MAX_RETRIES = 8
+LOG_DOWNLOAD_TOTAL_TIMEOUT_S = 180.0
 _cube_master = None  # most recent mavutil connection, used by the shutdown disarm/download sequence
 
 # Shared Live Telemetry & Connection Status
@@ -52,6 +54,7 @@ system_status = {
     "ws_connected": False,
     "ws_status": "Connecting...",
     "flight_mode": "UNKNOWN",
+    "armed": False,
     "behavior": BEHAVIOR_IDLE,
     "gps_status": "No Fix",
     "satellites": 0,
@@ -121,6 +124,10 @@ HTML_TEMPLATE = """
                 <div class="diag-value"><span id="ws_status" class="badge badge-offline">Offline</span></div>
             </div>
             <div class="diag-item">
+                <div class="diag-label">Arm Status</div>
+                <div class="diag-value"><span id="arm_status" class="badge badge-offline">Unknown</span></div>
+            </div>
+            <div class="diag-item">
                 <div class="diag-label">Flight Mode</div>
                 <div class="diag-value" id="flight_mode" style="color: #38bdf8;">UNKNOWN</div>
             </div>
@@ -181,6 +188,10 @@ HTML_TEMPLATE = """
                 const wsElem = document.getElementById('ws_status');
                 wsElem.innerText = data.ws_status;
                 wsElem.className = 'badge ' + (data.ws_connected ? 'badge-online' : 'badge-offline');
+
+                const armElem = document.getElementById('arm_status');
+                armElem.innerText = !data.cube_connected ? 'Unknown' : (data.armed ? 'Armed' : 'Disarmed');
+                armElem.className = 'badge ' + (data.cube_connected && data.armed ? 'badge-online' : 'badge-offline');
 
                 document.getElementById('flight_mode').innerText = data.flight_mode;
                 document.getElementById('behavior').innerText = data.behavior.replace(/_/g, ' ');
@@ -332,14 +343,14 @@ def _force_arm_for_logging(master) -> None:
     except Exception as exc:
         print(f"[ARM] Force-arm request failed: {exc}")
 
-def _download_latest_dataflash_log(master, vehicle_id: str) -> None:
+def _download_latest_dataflash_log(master, vehicle_id: str, stop: threading.Event) -> None:
     """Fetch the flight controller's most recently closed dataflash log over MAVLink."""
     try:
         master.mav.log_request_list_send(master.target_system, master.target_component, 0, 0xFFFF)
         log_id = None
         log_size = None
         deadline = time.time() + LOG_REQUEST_TIMEOUT_S
-        while time.time() < deadline:
+        while time.time() < deadline and not stop.is_set():
             entry = master.recv_match(type="LOG_ENTRY", blocking=True, timeout=1.0)
             if entry is None:
                 continue
@@ -356,15 +367,25 @@ def _download_latest_dataflash_log(master, vehicle_id: str) -> None:
         data = bytearray(log_size)
         offset = 0
         retries = 0
+        # Request the whole remainder once; the Cube streams chunks. Re-request from the gap on stall/loss.
+        need_request = True
         while offset < log_size:
-            count = min(LOG_CHUNK_BYTES, log_size - offset)
-            master.mav.log_request_data_send(master.target_system, master.target_component, log_id, offset, count)
+            if stop.is_set():
+                return
+            if need_request:
+                master.mav.log_request_data_send(master.target_system, master.target_component, log_id, offset, log_size - offset)
+                need_request = False
             chunk = master.recv_match(type="LOG_DATA", blocking=True, timeout=2.0)
-            if chunk is None or chunk.id != log_id or chunk.ofs != offset:
+            if chunk is None or chunk.id != log_id:
                 retries += 1
                 if retries > LOG_CHUNK_MAX_RETRIES:
                     print(f"[LOG] Download of log {log_id} for {vehicle_id} timed out at offset {offset}/{log_size}")
                     return
+                need_request = True
+                continue
+            if chunk.ofs != offset:
+                if chunk.ofs > offset:
+                    need_request = True
                 continue
             retries = 0
             chunk_len = min(chunk.count, log_size - offset)
@@ -393,9 +414,16 @@ async def _disarm_and_download_log(vehicle_id: str) -> None:
         )
         print("[SHUTDOWN] Disarm sent; waiting for the Cube to close its log...")
         await asyncio.sleep(2.0)
-        await asyncio.wait_for(asyncio.to_thread(_download_latest_dataflash_log, master, vehicle_id), timeout=30.0)
-    except asyncio.TimeoutError:
-        print("[SHUTDOWN] Flight log download timed out.")
+        stop = threading.Event()
+        worker = threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id, stop), daemon=True)
+        worker.start()
+        deadline = time.time() + LOG_DOWNLOAD_TOTAL_TIMEOUT_S
+        while worker.is_alive():
+            if time.time() > deadline:
+                stop.set()
+                print("[SHUTDOWN] Flight log download timed out.")
+                break
+            await asyncio.sleep(0.2)
     except Exception as exc:
         print(f"[SHUTDOWN] Disarm/log download failed: {exc}")
 
@@ -516,6 +544,7 @@ async def mavlink_loop(current_config: dict):
                 system_status["cube_connected"] = True
                 system_status["cube_status"] = "Connected"
                 system_status["last_hb_time"] = time.time()
+                system_status["armed"] = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 try:
                     system_status["flight_mode"] = master.flightmode
                 except Exception:
@@ -567,6 +596,7 @@ async def mavlink_loop(current_config: dict):
                             system_status["cube_connected"] = True
                             system_status["cube_status"] = "Connected"
                             system_status["last_hb_time"] = time.time()
+                            system_status["armed"] = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                             try:
                                 system_status["flight_mode"] = master.flightmode
                             except Exception:
@@ -609,8 +639,14 @@ async def main():
     await start_web_server()
 
     loop = asyncio.get_running_loop()
+    def _on_signal():
+        if shutdown_event.is_set():
+            print("Forced exit.")
+            os._exit(1)
+        shutdown_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown_event.set)
+        loop.add_signal_handler(sig, _on_signal)
 
     while True:
         reconnect_event.clear()
