@@ -1,3 +1,12 @@
+FROM node:20-alpine AS openmct
+WORKDIR /openmct
+RUN npm config set fetch-retries 5 \
+	&& npm config set fetch-retry-mintimeout 20000 \
+	&& npm config set fetch-retry-maxtimeout 120000 \
+	&& npm init -y >/dev/null \
+	&& npm install --no-audit --no-fund openmct@2.2.0 \
+	&& test -f node_modules/openmct/dist/openmct.js
+
 FROM node:20-alpine AS build
 
 WORKDIR /app
@@ -12,4 +21,5 @@ RUN npm run build
 FROM nginx:1.27-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=openmct /openmct/node_modules/openmct/dist /usr/share/nginx/html/vendor/openmct
 EXPOSE 80

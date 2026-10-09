@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "node -e \"const fs=require('fs');fs.existsSync('node_modules/openmct/dist/openmct.js')||require('child_process').execSync('npm install --no-save --no-audit --no-fund openmct@2.2.0',{stdio:'inherit'})\"",
     "dev": "vite --host 0.0.0.0",
     "build": "tsc && vite build",
     "build:demo": "tsc && vite build --mode demo",

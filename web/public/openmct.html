@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vehicle Telemetry Analysis - OpenMCT</title>
     
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist/openmct.css">
-    <script src="https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist/openmct.js"></script>
+    <script src="/vendor/openmct/openmct.js"></script>
 
     <style>
         html, body {
@@ -78,7 +77,7 @@
                 }
             }
 
-            openmct.setAssetPath('https://cdn.jsdelivr.net/npm/openmct@2.2.0/dist');
+            openmct.setAssetPath('/vendor/openmct');
 
             // 1. Install Base Plugins and Navigation/Layout Tree Plugins
             openmct.install(openmct.plugins.LocalStorage());
@@ -94,11 +93,16 @@
             const fifteenMinutes = 15 * 60 * 1000;
             const requestedStart = Number(urlParams.get('start'));
             const requestedEnd = Number(urlParams.get('end'));
-            const initialBounds = urlParams.has('start') && urlParams.has('end')
+            const hasExplicitRange = urlParams.has('start') && urlParams.has('end')
                 && Number.isFinite(requestedStart) && Number.isFinite(requestedEnd)
-                && requestedStart < requestedEnd
+                && requestedStart < requestedEnd;
+            const initialBounds = hasExplicitRange
                 ? { start: requestedStart, end: requestedEnd }
                 : { start: now - fifteenMinutes, end: now };
+
+            const realtimeOffsets = { start: -fifteenMinutes, end: 0 };
+            // Live view unless a specific range or a flight-log backup was requested.
+            const startRealtime = !hasExplicitRange && !backupRecords;
 
             const conductorPlugin = openmct.plugins.Conductor || openmct.plugins.TimeConductor;
             if (typeof conductorPlugin === 'function') {
@@ -107,24 +111,23 @@
                         {
                             name: "Historical Range",
                             timeSystem: 'utc',
-                            mode: 'fixed',
                             bounds: initialBounds
                         },
                         {
                             name: "Realtime",
                             timeSystem: 'utc',
-                            mode: 'realtime',
-                            bounds: {
-                                start: -fifteenMinutes,
-                                end: 0
-                            }
+                            clock: 'local',
+                            clockOffsets: realtimeOffsets
                         }
                     ]
                 }));
             }
 
-            // Set default time system to UTC
+            // Set default time system to UTC, then switch to the live clock if appropriate
             openmct.time.timeSystem('utc', initialBounds);
+            if (startRealtime) {
+                openmct.time.clock('local', realtimeOffsets);
+            }
 
             openmct.types.addType('telemetry.telemetryPoint', {
                 name: 'Telemetry Point',
