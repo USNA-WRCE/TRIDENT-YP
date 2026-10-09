@@ -181,6 +181,7 @@ shared_ship_relative_plans: dict[str, dict[str, Any]] = {}
 # SITL MAVLink bridge state
 sitl_bridges: dict[str, asyncio.Task[None]] = {}  # vehicle_id -> running asyncio task
 sitl_bridge_info: dict[str, dict[str, Any]] = {}  # vehicle_id -> status/metadata
+_simulated_vehicle_ids: set[str] = set()  # ids of vehicles that self-identify as websocket simulators
 _rtb_follow_tasks: dict[str, asyncio.Task[None]] = {} # vehicle_id -> placeholder for running return to boat (RTB) and follow boat task
 _rtb_follow_state: dict[str, bool] = {} # vehicle_id -> True once RTB-follow is issuing velocity-based station-keeping (not still maneuvering into position)
 _land_on_boat_tasks: dict[str, asyncio.Task[None]] = {} # vehicle_id -> placeholder for running land on boat task
@@ -2197,6 +2198,8 @@ async def vehicle_ws(websocket: WebSocket, vehicle_id: str) -> None:
         while True:
             payload = await websocket.receive_json()
             payload.setdefault("vehicle_id", vehicle_id)
+            if payload.pop("simulated", False):
+                _simulated_vehicle_ids.add(vehicle_id)
             await ingest_vehicle_message(payload)
 
     async def send_loop() -> None:
@@ -2216,6 +2219,7 @@ async def vehicle_ws(websocket: WebSocket, vehicle_id: str) -> None:
         # A replacement connection may already own this vehicle's queue.
         if vehicle_queues.get(vehicle_id) is queue:
             vehicle_queues.pop(vehicle_id, None)
+            _simulated_vehicle_ids.discard(vehicle_id)
             async with state_lock:
                 vehicles.pop(vehicle_id, None)
             await broadcast_ui({"op": "vehicle_removed", "vehicle_id": vehicle_id})
@@ -2870,7 +2874,7 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
         # For websocket sim vehicles only, embed full 3-D waypoints so
         # sim_vehicle.py can navigate the pattern visually. Do not attach this
         # list for hardware bridges.
-        if vehicle_id.startswith("sim-") and sar_waypoints:
+        if (vehicle_id.startswith("sim-") or vehicle_id in _simulated_vehicle_ids) and sar_waypoints:
             command = {**command, "sim_waypoints": sar_waypoints}
 
     if cmd_type == "mission_plan":

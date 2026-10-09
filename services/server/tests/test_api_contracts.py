@@ -323,13 +323,15 @@ class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(output.getvalue().count("Reached final waypoint"), 1)
 
     async def test_sar_path_is_computed_once_and_only_simulators_receive_navigation_points(self):
-        for vehicle_id in ("sim-drone", "hardware-drone"):
+        for vehicle_id in ("sim-drone", "UAV", "hardware-drone"):
             with self.subTest(vehicle_id=vehicle_id):
                 command = {"type": "search_grid", "lat": 38.9, "lon": -76.4}
                 queue = asyncio.Queue()
                 with patch.dict(main.vehicle_queues, {vehicle_id: queue}, clear=True), patch.dict(
                     main.vehicles, {}, clear=True,
                 ), patch.dict(main.shared_sar_patterns, {}, clear=True), patch.object(
+                    main, "_simulated_vehicle_ids", {"UAV"},
+                ), patch.object(
                     main, "broadcast_ui", AsyncMock(),
                 ) as broadcast, patch.object(main, "write_influx"), patch.object(
                     main, "broadcast_ros", AsyncMock(),
@@ -341,7 +343,7 @@ class VehicleConnectionCleanupTests(unittest.IsolatedAsyncioTestCase):
                     pattern = broadcast.await_args_list[0].args[0]
                     self.assertEqual(pattern["waypoints"], [[38.9, -76.4], [38.91, -76.41]])
                     delivered_command = queue.get_nowait()["command"]
-                    if vehicle_id.startswith("sim-"):
+                    if vehicle_id in ("sim-drone", "UAV"):
                         self.assertEqual(delivered_command["sim_waypoints"], [[38.9, -76.4, 30], [38.91, -76.41, 30]])
                     else:
                         self.assertNotIn("sim_waypoints", delivered_command)

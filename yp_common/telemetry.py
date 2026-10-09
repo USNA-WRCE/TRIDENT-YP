@@ -71,6 +71,7 @@ def build_telemetry(
     battery: Optional[dict[str, Any]] = None,
     gps: Optional[dict[str, Any]] = None,
     stamp: Optional[float] = None,
+    simulated: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "op": "telemetry",
@@ -78,6 +79,8 @@ def build_telemetry(
         "vehicle_type": vehicle_type,
         "stamp": time.time() if stamp is None else stamp,
     }
+    if simulated:
+        payload["simulated"] = True
     if latitude is not None and longitude is not None:
         payload["position"] = {"latitude": latitude, "longitude": longitude, "altitude": 0.0 if altitude is None else altitude}
     if heading is not None:

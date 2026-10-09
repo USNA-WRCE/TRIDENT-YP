@@ -30,6 +30,7 @@ HOME_LON = float(os.getenv("HOME_LON", "-76.4819"))
 HOME_ALT = float(os.getenv("HOME_ALT", "45.0" if VEHICLE_TYPE == "uav" else "0.0"))
 SEND_HZ = float(os.getenv("SEND_HZ", "5"))
 SPAWN_JITTER_DEG = float(os.getenv("SPAWN_JITTER_DEG", "0.004"))
+SHIP_STATE_TIMEOUT_S = float(os.getenv("SHIP_STATE_TIMEOUT_S", "2.0"))
 TARGET_JITTER_DEG = float(os.getenv("TARGET_JITTER_DEG", "0.006"))
 
 SPEED_MPS = {"uav": 9.0, "usv": 2.8, "ugv": 2.0, "uuv": 1.3}.get(VEHICLE_TYPE, 5.0)
@@ -53,6 +54,84 @@ class VehicleSim:
         self.mission_complete_pending = False
         self.rtb_follow_heading: float | None = None
         self.rtb_follow_speed_mps: float | None = None
+        self.ship_states: dict[str, dict[str, float]] = {}
+        self.ship_plan: dict[str, Any] | None = None
+
+    def update_ship_state(self, vehicle: dict[str, Any]) -> None:
+        position = vehicle.get("position") or {}
+        vehicle_id = vehicle.get("vehicle_id")
+        lat, lon = position.get("latitude"), position.get("longitude")
+        if not vehicle_id or lat is None or lon is None:
+            return
+        now = time.time()
+        previous = self.ship_states.get(vehicle_id)
+        vn = ve = 0.0
+        if previous:
+            dt = now - previous["stamp"]
+            if dt > 0.05:
+                vn = (float(lat) - previous["lat"]) * 111_320.0 / dt
+                ve = (float(lon) - previous["lon"]) * 111_320.0 * math.cos(math.radians(float(lat))) / dt
+            else:
+                vn, ve = previous["vn"], previous["ve"]
+        heading = vehicle.get("heading")
+        self.ship_states[vehicle_id] = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "alt": float(position.get("altitude", 0.0)),
+            "heading": float(heading) % 360.0 if heading is not None else (previous or {}).get("heading", 0.0),
+            "vn": vn,
+            "ve": ve,
+            "stamp": now,
+        }
+
+    def start_ship_relative(self, command_body: dict[str, Any]) -> None:
+        ship_id = command_body.get("ship_vehicle_id")
+        waypoints = [wp for wp in command_body.get("local_waypoints") or [] if isinstance(wp, dict)]
+        if not ship_id or not waypoints:
+            return
+        loops = max(1, min(100, int(command_body.get("loop_count", 1))))
+        self.ship_plan = {
+            "ship_id": ship_id,
+            "waypoints": waypoints * loops,
+            "index": 0,
+            "arrival_radius_m": float(command_body.get("arrival_radius_m", 6.0)),
+            "hold_last": bool(command_body.get("hold_last_waypoint", False)),
+            "face_ship": bool(command_body.get("face_ship", False)),
+        }
+        self.mission_waypoints = []
+        self.mode = "ship_relative"
+        self.behavior = BEHAVIOR_SHIP_RELATIVE
+
+    def update_ship_relative(self) -> bool:
+        """Retarget the moving ship-relative waypoint; return False while ship data is stale."""
+        plan = self.ship_plan
+        ship = self.ship_states.get(plan["ship_id"]) if plan else None
+        if not plan or not ship or time.time() - ship["stamp"] > SHIP_STATE_TIMEOUT_S:
+            return False
+        waypoint = plan["waypoints"][plan["index"]]
+        local_x = float(waypoint.get("x", 0.0))
+        local_y = float(waypoint.get("y", 0.0))
+        bearing = (ship["heading"] + math.degrees(math.atan2(local_x, local_y))) % 360.0
+        lat, lon = destination_point(ship["lat"], ship["lon"], bearing, math.hypot(local_x, local_y))
+        self.target = {"latitude": lat, "longitude": lon, "altitude": ship["alt"] + float(waypoint.get("z", 0.0))}
+        ship_speed = math.hypot(ship["vn"], ship["ve"])
+        self.rtb_follow_speed_mps = ship_speed
+        self.rtb_follow_heading = math.degrees(math.atan2(ship["ve"], ship["vn"])) % 360.0 if ship_speed > 0.05 else ship["heading"]
+
+        if haversine_m(self.lat, self.lon, lat, lon) > plan["arrival_radius_m"]:
+            return True
+        is_last = plan["index"] >= len(plan["waypoints"]) - 1
+        if not is_last:
+            plan["index"] += 1
+        elif not plan["hold_last"]:
+            self.ship_plan = None
+            self.mode = "loiter"
+            self.behavior = BEHAVIOR_IDLE
+            self.rtb_follow_heading = None
+            self.rtb_follow_speed_mps = None
+            self.target = self.random_target()
+            return False
+        return True
 
     def random_target(self) -> dict[str, float]:
         return {
@@ -64,6 +143,11 @@ class VehicleSim:
     def handle_command(self, command: dict[str, Any]) -> None:
         command_body = command.get("command", command)
         command_type = command_body.get("type")
+        if command_type == "ship_relative_trajectory":
+            self.start_ship_relative(command_body)
+            return
+        if command_type != "rtcm_data":
+            self.ship_plan = None
         if command_type == "rtb":
             self.mode = "rtb"
             self.behavior = BEHAVIOR_RETURN_TO_BOAT
@@ -161,8 +245,13 @@ class VehicleSim:
         dt = min(0.5, max(0.001, now - self.last_step))
         self.last_step = now
 
+        if self.mode == "ship_relative" and not self.update_ship_relative():
+            return
+
         distance = haversine_m(self.lat, self.lon, self.target["latitude"], self.target["longitude"])
-        if distance < max(4.0, SPEED_MPS * dt * 2.0):
+        if self.mode == "ship_relative":
+            pass
+        elif distance < max(4.0, SPEED_MPS * dt * 2.0):
             if self.mode == "rtb":
                 self.mode = "hold"
                 self.behavior = BEHAVIOR_IDLE
@@ -183,7 +272,11 @@ class VehicleSim:
                 self.behavior = BEHAVIOR_IDLE
             return
 
-        if self.mode in ("rtb_follow", "land_on_boat") and self.rtb_follow_heading is not None:
+        move_bearing: float | None = None
+        face_ship = None
+        if self.mode == "ship_relative" and self.ship_plan and self.ship_plan["face_ship"]:
+            face_ship = self.ship_states.get(self.ship_plan["ship_id"])
+        if self.mode in ("rtb_follow", "land_on_boat", "ship_relative") and self.rtb_follow_heading is not None:
             # Station keeping combines the YP velocity with a small position
             # correction. It never caps travel at the moving target, avoiding
             # the overshoot-and-correct oscillation caused by point chasing.
@@ -201,13 +294,26 @@ class VehicleSim:
             desired_speed = math.hypot(desired_north, desired_east)
             if desired_speed > 0.01:
                 desired_heading = math.degrees(math.atan2(desired_east, desired_north)) % 360.0
-                self.heading = smooth_angle(self.heading, desired_heading, min(1.0, dt * 2.5))
+                if face_ship is not None:
+                    # Yaw is independent of the direction of travel, as with the real bridges.
+                    move_bearing = desired_heading
+                    self.heading = smooth_angle(
+                        self.heading,
+                        bearing_deg(self.lat, self.lon, face_ship["lat"], face_ship["lon"]),
+                        min(1.0, dt * 2.5),
+                    )
+                else:
+                    self.heading = smooth_angle(self.heading, desired_heading, min(1.0, dt * 2.5))
+                    move_bearing = self.heading
             travel = min(desired_speed, SPEED_MPS * 1.5) * dt
         else:
             bearing = bearing_deg(self.lat, self.lon, self.target["latitude"], self.target["longitude"])
             self.heading = smooth_angle(self.heading, bearing, min(1.0, dt * 1.8))
+            move_bearing = self.heading
             travel = min(distance, SPEED_MPS * dt)
-        self.lat, self.lon = destination_point(self.lat, self.lon, self.heading, travel)
+        if move_bearing is None:
+            move_bearing = self.heading
+        self.lat, self.lon = destination_point(self.lat, self.lon, move_bearing, travel)
 
         desired_alt = self.target.get("altitude", HOME_ALT)
         self.alt += max(-1.0, min(1.0, desired_alt - self.alt)) * min(1.0, dt)
@@ -216,8 +322,8 @@ class VehicleSim:
         elif VEHICLE_TYPE == "uuv":
             self.alt = min(-1.0, self.alt)
 
-        self.local_x += math.sin(math.radians(self.heading)) * travel
-        self.local_y += math.cos(math.radians(self.heading)) * travel
+        self.local_x += math.sin(math.radians(move_bearing)) * travel
+        self.local_y += math.cos(math.radians(move_bearing)) * travel
         self.battery = max(0.0, self.battery - dt * 0.000035)
 
     def messages(self) -> list[dict[str, Any]]:
@@ -232,6 +338,7 @@ class VehicleSim:
                 behavior=self.behavior,
                 mode=self.mode,
                 armed=True,
+                simulated=True,
                 battery={"percentage": self.battery, "voltage": 22.2 * self.battery, "current": -4.0},
             )
         ]
@@ -250,6 +357,7 @@ async def main() -> None:
                 print(f"{VEHICLE_ID} connected to {uri}")
                 sim.last_step = time.time()
                 receiver = asyncio.create_task(receive_commands(ws, sim))
+                ship_listener = asyncio.create_task(ship_state_listener(sim))
                 try:
                     while True:
                         sim.step()
@@ -258,9 +366,34 @@ async def main() -> None:
                         await asyncio.sleep(1.0 / SEND_HZ)
                 finally:
                     receiver.cancel()
+                    ship_listener.cancel()
         except Exception as exc:
             print(f"{VEHICLE_ID} reconnecting after error: {exc}")
             await asyncio.sleep(2.0)
+
+
+async def ship_state_listener(sim: VehicleSim) -> None:
+    """Track every vehicle's position via the server's read-only state feed, for ship-relative missions."""
+    base = SERVER_WS_URL.rstrip("/")
+    marker = "/ws/vehicle"
+    if marker not in base:
+        return
+    uri = f"{base.split(marker, 1)[0]}/ws/ship_state"
+    while True:
+        try:
+            async with websockets.connect(uri, ping_interval=10, ping_timeout=10, max_size=None) as ws:
+                async for raw in ws:
+                    message = json.loads(raw)
+                    if message.get("op") == "snapshot":
+                        for vehicle in message.get("vehicles", []):
+                            sim.update_ship_state(vehicle)
+                    elif message.get("op") == "vehicle_update":
+                        sim.update_ship_state(message.get("vehicle") or {})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"{VEHICLE_ID} ship-state listener error: {exc}")
+            await asyncio.sleep(1.0)
 
 
 async def receive_commands(ws: websockets.WebSocketClientProtocol, sim: VehicleSim) -> None:
