@@ -7,6 +7,7 @@ import {
 import { Circle, Download, Trash2, Upload } from "lucide-react";
 import { WaypointScene } from "./3d/WaypointScene";
 import type { Command, RelativeWaypoint, Vehicle } from "../types";
+import { usePersistentState } from "../hooks/usePersistentState";
 import { applyDispatchAltitudeOffset, parseLocalWaypointPlan, serializeLocalWaypointPlan } from "../services/localWaypointPlan";
 import { generateCircularWaypoints, yawTowardOrigin } from "../services/circularWaypoints";
 
@@ -24,12 +25,12 @@ export function WaypointPlanner({
   const [waypoints, setWaypoints] = useState<LocalWaypoint[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedVehicleId, setSelectedVehicleId] = useState("");
-  const [faceInward, setFaceInward] = useState(false);
-  const [holdLastWaypoint, setHoldLastWaypoint] = useState(false);
-  const [missionLoops, setMissionLoops] = useState(1);
-  const [dispatchAltitudeOffset, setDispatchAltitudeOffset] = useState(15);
-  const [circleRadius, setCircleRadius] = useState(30);
-  const [circleWaypointCount, setCircleWaypointCount] = useState(8);
+  const [faceInward, setFaceInward] = usePersistentState("wp-face-inward", false);
+  const [holdLastWaypoint, setHoldLastWaypoint] = usePersistentState("wp-hold-last", false);
+  const [missionLoops, setMissionLoops] = usePersistentState("wp-loops", 1);
+  const [dispatchAltitudeOffset, setDispatchAltitudeOffset] = usePersistentState("wp-altitude-offset", 15);
+  const [circleRadius, setCircleRadius] = usePersistentState("wp-circle-radius", 30);
+  const [circleWaypointCount, setCircleWaypointCount] = usePersistentState("wp-circle-count", 8);
   const previewWaypoints = faceInward
     ? waypoints.map((waypoint) => ({ ...waypoint, yaw: yawTowardOrigin(waypoint.x, waypoint.y) }))
     : waypoints;

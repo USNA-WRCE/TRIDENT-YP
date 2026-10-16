@@ -4,16 +4,17 @@ Handles collision detection and avoidance for multi-vehicle operations,
 including mission priority hierarchy and course correction strategies.
 """
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
 
 # Mission priority levels (higher number = higher priority)
 MISSION_PRIORITY = {
-    "mob": 4,           # Man Overboard (highest)
-    "search_grid": 3,   # Search Grid pattern
+    "mob": 5,           # Man Overboard (highest)
+    "search_grid": 4,   # Search Grid pattern
+    "rtb": 3,           # Return to base (above everything except SAR missions)
     "mission_plan": 2,  # Mission Planner mission
     "waypoint": 1,      # Simple waypoint command
-    "rtb": 1,           # Return to base (same as waypoint)
 }
 YP_PRIORITY = max(MISSION_PRIORITY.values()) + 1
 
@@ -42,6 +43,7 @@ class VehicleState:
     paused_reason: Optional[str] = None
     saved_command: Optional[Dict[str, Any]] = None  # saved command for resume
     avoidance_active: bool = False
+    mission_set_at: float = 0.0  # monotonic time the current mission_type was assigned
 
 
 class DeconflictionEngine:
@@ -97,6 +99,23 @@ class DeconflictionEngine:
         state.position = position
         if mission_type:
             state.mission_type = mission_type
+            state.mission_set_at = time.monotonic()
+
+    def clear_mission_if_idle(self, vehicle_id: str, grace_s: float = 5.0) -> None:
+        """Drop a finished mission's priority once the vehicle reports idle.
+
+        The grace period avoids clearing a just-issued command before the
+        vehicle's telemetry has switched away from its previous behavior.
+        """
+        state = self.vehicle_states.get(vehicle_id)
+        if (
+            state
+            and state.mission_type
+            and not state.avoidance_active
+            and time.monotonic() - state.mission_set_at > grace_s
+        ):
+            state.mission_type = None
+            state.saved_command = None
     
     def set_mission_data(self, vehicle_id: str, mission_data: Dict[str, Any]) -> None:
         """Save mission parameters for later resume."""
