@@ -747,15 +747,25 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
                 behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
                 return
             if auto_arm_start:
-                # Arm in GUIDED first: ArduPilot refuses to arm from a disarmed AUTO mode.
-                sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
-                time.sleep(0.2)
-                sar_missions.arm_vehicle(master)
-                time.sleep(0.2)
-                sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
-                time.sleep(0.2)
-                sar_missions.start_mission(master)
-        except Exception as exc: pass
+                # 1. If already flying/armed, just switch to AUTO and start mission
+                if _armed_state:
+                    print("[MISSION] Vehicle is already armed/flying. Switching to AUTO...")
+                    sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+                    time.sleep(0.2)
+                    sar_missions.start_mission(master)
+                # 2. If on the ground (disarmed), arm in GUIDED first, then switch to AUTO
+                else:
+                    print("[MISSION] Vehicle disarmed on ground. Arming in GUIDED mode...")
+                    sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
+                    time.sleep(0.3)
+                    sar_missions.arm_vehicle(master)
+                    time.sleep(0.3)
+                    sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+                    time.sleep(0.3)
+                    sar_missions.start_mission(master)
+        except Exception as exc:
+            print(f"[MISSION] Error executing mission plan: {exc}")
+            behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
 
 
 def _download_latest_dataflash_log(master, vehicle_id: str) -> None:

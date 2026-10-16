@@ -1444,15 +1444,21 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> bool:
             return
 
         if bool(command.get("auto_arm_start", True)):
-            # Arm in GUIDED first (ArduCopter refuses to arm from a disarmed
-            # AUTO mode unless already flying); then switch to AUTO and start.
-            _sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
-            time.sleep(0.2)
-            _sar_missions.arm_vehicle(master)
-            time.sleep(0.2)
-            _sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
-            time.sleep(0.2)
-            _sar_missions.start_mission(master)
+            vehicle_id = str(cmd_payload.get("vehicle_id") or "")
+            is_armed = vehicles.get(vehicle_id, {}).get("armed", False)
+
+            if is_armed:
+                _sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+                time.sleep(0.2)
+                _sar_missions.start_mission(master)
+            else:
+                _sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
+                time.sleep(0.2)
+                _sar_missions.arm_vehicle(master)
+                time.sleep(0.2)
+                _sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
+                time.sleep(0.2)
+                _sar_missions.start_mission(master)
 
     elif cmd_type == "set_mode":
         mode = command.get("mode")
