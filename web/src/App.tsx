@@ -25,6 +25,7 @@ import {
   Users,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { usePersistentState } from "./hooks/usePersistentState";
 import { MapContainer, Polyline, TileLayer, useMap, useMapEvents } from "react-leaflet";
 
 import { connectSITL, deleteInfluxData, disconnectSITL, exportFlightLog, fetchSettings, fetchRtcmStatus, getCurrentUser, listAxisCameras, listSITLBridges, sendCommand, setYpRole, triggerMOB, updateSettings, logout as logoutUser, fetchDeconflictionSettings, updateDeconflictionSettings } from "./api";
@@ -149,20 +150,20 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [showSettings, setShowSettings] = useState(false);
   const [showFlightLogOptions, setShowFlightLogOptions] = useState(false);
   const [showMessages, setShowMessages] = useState(false);
-  const [messagePanelWidth, setMessagePanelWidth] = useState(500);
+  const [messagePanelWidth, setMessagePanelWidth] = usePersistentState("message-panel-width", 500);
   const [topicFilters, setTopicFilters] = useState<string[]>([]);
   const [messageLog, setMessageLog] = useState<StreamMessage[]>([]);
-  const [mapBase, setMapBase] = useState<MapBase>("satellite");
-  const [showWeatherRadar, setShowWeatherRadar] = useState(false);
-  const [showWindOverlay, setShowWindOverlay] = useState(false);
-  const [mapSource, setMapSource] = useState<MapSource>(DEMO_MODE ? "online" : "auto");
+  const [mapBase, setMapBase] = usePersistentState<MapBase>("map-base", "satellite", (v): v is MapBase => v === "satellite" || v === "street");
+  const [showWeatherRadar, setShowWeatherRadar] = usePersistentState("show-weather-radar", false);
+  const [showWindOverlay, setShowWindOverlay] = usePersistentState("show-wind-overlay", false);
+  const [mapSource, setMapSource] = usePersistentState<MapSource>("map-source", DEMO_MODE ? "online" : "auto", (v): v is MapSource => v === "auto" || v === "cache" || v === "online");
   const [mapMenuExpanded, setMapMenuExpanded] = useState(false);
   const [mapZoom, setMapZoom] = useState(17);
   const [mapCenter, setMapCenter] = useState<[number, number]>(USNA_CENTER);
   const [followYp, setFollowYp] = useState(true);
   const [showYpRangeRings, setShowYpRangeRings] = useState(true);
   const [messageRetentionMinutes, setMessageRetentionMinutes] = useState(10);
-  const [flightLogHours, setFlightLogHours] = useState(8);
+  const [flightLogHours, setFlightLogHours] = usePersistentState("flight-log-hours", 8);
   const [flightLogExporting, setFlightLogExporting] = useState(false);
   const [flightLogError, setFlightLogError] = useState<string | null>(null);
   const [influxDeleteConfirmOpen, setInfluxDeleteConfirmOpen] = useState(false);
@@ -202,7 +203,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [rtkHostOrPort, setRtkHostOrPort] = useState("/dev/ttyACM0");
   const [rtkNetworkPort, setRtkNetworkPort] = useState(9000);
   const [rtkBaudrate, setRtkBaudrate] = useState(115200);
-  const [rtkRelayPort, setRtkRelayPort] = useState("/dev/ttyACM0");
+  const [rtkRelayPort, setRtkRelayPort] = usePersistentState("rtk-relay-port", "/dev/ttyACM0");
   const [rtkAgentAvailable, setRtkAgentAvailable] = useState(false);
   const [rtkRelayStarting, setRtkRelayStarting] = useState(false);
   const [rtkRelayError, setRtkRelayError] = useState<string | null>(null);

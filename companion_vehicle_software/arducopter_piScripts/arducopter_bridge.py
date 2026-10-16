@@ -935,12 +935,14 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
 
             if auto_arm_start:
                 # Arm in GUIDED first: ArduPilot refuses to arm from a disarmed AUTO mode.
-                sar_missions.set_mode(master, "GUIDED", wait_for_ack=False)
-                time.sleep(0.2)
-                sar_missions.arm_vehicle(master)
-                time.sleep(0.2)
-                sar_missions.set_mode(master, "AUTO", wait_for_ack=False)
-                time.sleep(0.2)
+                sar_missions.set_mode(master, "GUIDED")
+                time.sleep(1.5)
+                if not sar_missions.arm_vehicle(master):
+                    print("[MISSION] Arming failed; mission not started")
+                    return
+                time.sleep(0.5)
+                sar_missions.set_mode(master, "AUTO")
+                time.sleep(1.0)
                 sar_missions.start_mission(master)
                 print("[MISSION] Mission armed and started")
         except Exception as exc:

@@ -16,6 +16,7 @@ import {
   useMapEvents,
 } from "react-leaflet";
 import type { Command, Vehicle } from "../types";
+import { usePersistentState } from "../hooks/usePersistentState";
 import {
   FitAllControl,
   FollowYpCenter,
@@ -230,8 +231,8 @@ export function MissionPlannerMode({
   const [waypoints, setWaypoints] = useState<MissionWaypoint[]>([]);
   const [vehicleId, setVehicleId] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [defaultAltitude, setDefaultAltitude] = useState(30);
-  const [forceGuided, setForceGuided] = useState(false);
+  const [defaultAltitude, setDefaultAltitude] = usePersistentState("planner-default-altitude", 30);
+  const [forceGuided, setForceGuided] = usePersistentState("planner-force-guided", false);
   const fileRef = useRef<HTMLInputElement>(null);
   const dragRef = useRef(false);
   const editing = waypoints.find((item) => item.id === editingId) ?? null;

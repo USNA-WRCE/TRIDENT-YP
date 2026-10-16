@@ -80,6 +80,7 @@ INFLUX_ORG = os.getenv("INFLUX_ORG", "yp")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "telemetry")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "yp-dev-token")
 VEHICLE_TTL_SECONDS = float(os.getenv("VEHICLE_TTL_SECONDS", "30"))
+MAX_VEHICLE_CLOCK_SKEW_S = float(os.getenv("MAX_VEHICLE_CLOCK_SKEW_S", "30"))
 HISTORY_MAX_POINTS = int(os.getenv("HISTORY_MAX_POINTS", "5000"))
 MESSAGE_RETENTION_SECONDS = float(os.getenv("MESSAGE_RETENTION_SECONDS", str(10 * 60)))
 MESSAGE_CLEANUP_INTERVAL_SECONDS = float(os.getenv("MESSAGE_CLEANUP_INTERVAL_SECONDS", str(10 * 60)))
@@ -2549,7 +2550,14 @@ async def detector_ws(websocket: WebSocket) -> None:
 async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
     """Update vehicle state from an incoming telemetry message and fan it out to clients."""
     received_at = time.time()
-    now = float(payload.get("stamp") or received_at)
+    try:
+        now = float(payload.get("stamp") or received_at)
+    except (TypeError, ValueError):
+        now = received_at
+    # Hardware bridges without a synced clock (e.g. a Pi with no RTC/NTP) send bogus
+    # stamps, which files telemetry outside the history window; trust server time instead.
+    if abs(now - received_at) > MAX_VEHICLE_CLOCK_SKEW_S:
+        now = received_at
     vehicle_id = str(payload.get("vehicle_id") or "unknown")
     # Natural type from the message payload; stored so clearing the YP role can revert it.
     natural_type = normalize_vehicle_type(payload.get("vehicle_type") or infer_vehicle_type(vehicle_id))
@@ -2617,6 +2625,12 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
                         vehicle.get("vehicle_type", "uav"),
                         nav,
                     )
+                    if (
+                        payload.get("behavior") in ("idle", "manual")
+                        and vehicle_id not in _rtb_follow_tasks
+                        and vehicle_id not in _land_on_boat_tasks
+                    ):
+                        deconfliction_engine.clear_mission_if_idle(vehicle_id)
 
         if heading is not None:
             vehicle["heading"] = heading

@@ -572,10 +572,32 @@ def _run_single_waypoint(master, lat: float, lon: float):
         else:
             behavior_tracker.finish(behavior_for_command("waypoint"))
 
+# Final search-grid waypoint; telemetry reports idle once the vehicle reaches it.
+_search_grid_end: tuple[float, float] | None = None
+
+
+def _check_search_grid_complete(lat: float, lon: float) -> None:
+    global _search_grid_end
+    end = _search_grid_end
+    if end is None:
+        return
+    if behavior_tracker.get() != behavior_for_command("search_grid"):
+        _search_grid_end = None
+        return
+    dlat = math.radians(end[0] - lat)
+    dlon = math.radians(end[1] - lon) * math.cos(math.radians(lat))
+    if math.hypot(dlat, dlon) * 6_371_000.0 <= SAR_ARRIVAL_RADIUS_M:
+        _search_grid_end = None
+        behavior_tracker.finish(behavior_for_command("search_grid"))
+
+
 def _run_search_grid(master, waypoints: list[tuple[float, float]]):
+    global _search_grid_end
     _stop_active_controller_sync()
     with _sar_mission_lock:
+        _search_grid_end = None
         if upload_mission_batch(master, waypoints, append_terminal_loiter=True):
+            _search_grid_end = tuple(waypoints[-1]) if waypoints else None
             time.sleep(0.2)
             set_chcnav_mode(master, CUSTOM_MODE_AUTO)
         else:
@@ -805,6 +827,7 @@ async def telemetry_loop(current_config: dict) -> None:
                         _vehicle_state["vn_ms"] = getattr(msg, "vx", 0) / 100.0
                         _vehicle_state["ve_ms"] = getattr(msg, "vy", 0) / 100.0
                         _vehicle_state["stamp"] = now
+                    _check_search_grid_complete(lat, lon)
                     telemetry_sample = (lat, lon, heading)
 
             # --- 4. Send WebSocket Telemetry ---
