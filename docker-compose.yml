@@ -247,7 +247,6 @@ services:
     build:
       context: .
       dockerfile: services/sim_vehicle/Dockerfile
-      network: host
     environment:
       SERVER_WS_URL: ws://yp-server:8000/ws/vehicle
       VEHICLE_TYPE: uav
