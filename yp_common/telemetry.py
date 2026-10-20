@@ -7,6 +7,7 @@ Wire format (vehicle -> server, JSON over /ws/vehicle/{vehicle_id}):
      "heading": deg,                                        # optional
      "behavior": str,                                       # what the vehicle is doing
      "mode": str, "armed": bool,                            # optional
+     "autopilot": "ardupilot" | "px4",                      # optional; selects the UI's flight-mode list
      "battery": {"percentage", "voltage", "current"},       # optional, percentage 0..1
      "gps": {"fix_type", "fix_type_label", "satellites", "h_acc_m", "v_acc_m"}}  # optional
 
@@ -68,6 +69,7 @@ def build_telemetry(
     behavior: Optional[str] = None,
     mode: Optional[str] = None,
     armed: Optional[bool] = None,
+    autopilot: Optional[str] = None,
     battery: Optional[dict[str, Any]] = None,
     gps: Optional[dict[str, Any]] = None,
     stamp: Optional[float] = None,
@@ -91,6 +93,8 @@ def build_telemetry(
         payload["mode"] = mode
     if armed is not None:
         payload["armed"] = armed
+    if autopilot:
+        payload["autopilot"] = autopilot
     if battery:
         payload["battery"] = battery
     if gps:

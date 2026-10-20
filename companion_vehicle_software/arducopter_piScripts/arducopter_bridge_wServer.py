@@ -812,7 +812,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, autopilot="ardupilot", behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                 elif msg_type == "GLOBAL_POSITION_INT":
                     lat, lon = msg.lat / 1e7, msg.lon / 1e7
@@ -832,7 +832,7 @@ async def telemetry_loop(current_config: dict) -> None:
                 try:
                     if telemetry_sample is not None and (now - last_send_time) >= (1.0 / send_hz):
                         lat, lon, heading = telemetry_sample
-                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=0.0, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"])))
+                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, autopilot="ardupilot", latitude=lat, longitude=lon, altitude=0.0, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"])))
                         last_send_time = now
 
                     if now - last_video_send_time >= 60.0:

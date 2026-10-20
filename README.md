@@ -278,7 +278,7 @@ Open **Vehicle Connections** and use the **Network** tab. Supported connection s
 | UDP output | `udpout:192.168.1.100:14550` | Sends MAVLink datagrams |
 | Serial | `serial:/dev/ttyUSB0:57600` | Native Linux/device passthrough |
 
-Vehicle ID and Camera Host are optional. IDs are derived from the URL when omitted. The bridge detects vehicle frame type from the first heartbeat, streams telemetry at 10 Hz, and supports multiple simultaneous connections.
+Vehicle ID and Camera Host are optional. IDs are derived from the URL when omitted. The bridge detects vehicle frame type from the first heartbeat (fixed-wing frames show as `uavf` with the fixed-wing icon), streams telemetry at 10 Hz, and supports multiple simultaneous connections.
 
 REST API:
 
@@ -311,6 +311,12 @@ To avoid opening a terminal every time you switch a port or baud rate, run `pyth
 
 - `arducopter_ws_bridge` connects a real ArduPilot/MAVLink vehicle over WebSocket and supports waypoint, RTB, SAR, and flight-mode commands.
 - `companion_vehicle_software/arducopter_piScripts/` contains Raspberry Pi ArduPilot bridge variants and configuration.
+- `companion_vehicle_software/arduplane_piScripts/` contains the fixed-wing ArduPlane bridge (`arduplane_bridge_wServer.py`, default vehicle ID `floatplaneYP`, web page on port `8083`) for an RC float plane. It reports vehicle type `uavf` so the UI shows the fixed-wing icon. Its web page matches the ArduCopter bridge and adds a MAVLink connection dropdown (serial, UDP, TCP or custom, so it can connect to ArduPlane SITL), armed state, airspeed and groundspeed. Build a Pi bundle with `python bundle_bridge.py arduplane`. Command behavior:
+  - `waypoint`, `rtb_follow` and `ship_relative_trajectory` use GUIDED reposition and loiter on arrival.
+  - `takeoff` uploads a takeoff mission and runs it in AUTO.
+  - `search_grid`, `mob` and `mission_plan` run as AUTO missions with altitude, lane spacing and arrival radius clamped to fixed-wing limits.
+  - `cancel_sar` switches to LOITER, and `land_on_boat_step` is not supported.
+  - Tunables are environment variables such as `PLANE_MIN_ALT_M`, `PLANE_TAKEOFF_ALT_M` and `PLANE_LOITER_RADIUS_M`. The defaults are untested and have not been flown or run in ArduPlane SITL, so review them before use.
 - `companion_vehicle_software/blueboat_piScripts/` contains BlueBoat bridge variants.
 - `companion_vehicle_software/Hunter_YPEmulator/` contains the YP emulator.
 
@@ -375,7 +381,7 @@ All bridge types support these command types where the vehicle can execute them:
 | `disarm` | Disarm the vehicle |
 | `takeoff` | Arm (in GUIDED) and take off to `altitude_m` — UAV/UAVF only |
 
-Available mode lists are vehicle-specific. ArduPilot UAVs support `STABILIZE`, `ACRO`, `ALT_HOLD`, `AUTO`, `GUIDED`, `LOITER`, `RTL`, `CIRCLE`, `LAND`, `DRIFT`, `SPORT`, `FLIP`, `AUTOTUNE`, and `POSHOLD`; ArduPilot USV/UGV support `MANUAL`, `GUIDED`, `AUTO`, `RTL`, `LOITER`, and `CIRCLE`; PX4 UAVF supports `MANUAL`, `ALTITUDE_CONTROL`, `POSITION_CONTROL`, `AUTO`, `OFFBOARD`, and `EMERGENCY`.
+Available mode lists are vehicle-specific. ArduPilot UAVs support `STABILIZE`, `ACRO`, `ALT_HOLD`, `AUTO`, `GUIDED`, `LOITER`, `RTL`, `CIRCLE`, `LAND`, `DRIFT`, `SPORT`, `FLIP`, `AUTOTUNE`, and `POSHOLD`; ArduPilot USV/UGV support `MANUAL`, `GUIDED`, `AUTO`, `RTL`, `LOITER`, and `CIRCLE`; PX4 UAVF supports `MANUAL`, `ALTITUDE_CONTROL`, `POSITION_CONTROL`, `AUTO`, `OFFBOARD`, and `EMERGENCY`; ArduPlane UAVF supports `MANUAL`, `FBWA`, `FBWB`, `CRUISE`, `LOITER`, `CIRCLE`, `GUIDED`, `AUTO`, `RTL`, and `TAKEOFF`. The UI picks the UAVF list from the `autopilot` field (`ardupilot` or `px4`) that bridges and SITL connections include in telemetry.
 
 ### Mission Planner
 

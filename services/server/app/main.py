@@ -227,7 +227,7 @@ def _finish_sitl_behavior(vehicle_id: str, behavior: str, version: int) -> None:
 # MAVLink MAV_TYPE -> (vehicle_type, human-readable frame name)
 _MAV_TYPE_MAP: dict[int, tuple[str, str]] = {
     0: ("uav", "Generic"),
-    1: ("uav", "Fixed Wing"),
+    1: ("uavf", "Fixed Wing"),
     2: ("uav", "Quadrotor"),
     3: ("uav", "Coaxial Helicopter"),
     4: ("uav", "Helicopter"),
@@ -1010,6 +1010,7 @@ async def _run_mavlink_bridge(
                         altitude=msg.relative_alt / 1000.0,
                         heading=(hdg / 100.0) if hdg is not None and hdg != 65535 else None,
                         behavior=_sitl_behavior_snapshot(vehicle_id)[0],
+                        autopilot={"ArduPilot": "ardupilot", "PX4": "px4"}.get(str(info.get("autopilot"))),
                         battery={"percentage": last_battery_pct} if last_battery_pct is not None else None,
                         stamp=now,
                     ))
@@ -1019,6 +1020,7 @@ async def _run_mavlink_bridge(
                         vehicle_id,
                         info["vehicle_type"],
                         behavior=_sitl_behavior_snapshot(vehicle_id)[0],
+                        autopilot={"ArduPilot": "ardupilot", "PX4": "px4"}.get(str(info.get("autopilot"))),
                         gps=gps_block_from_mavlink(msg),
                         stamp=now,
                     ))
@@ -2129,7 +2131,7 @@ async def trigger_mob(payload: dict[str, Any] = Body(default={}), authorization:
                 # Tier 1 — UAV SITL bridge (best: real ArduPilot MAVLink execution)
                 next(
                     (v for v in vehicles.values()
-                     if v.get("vehicle_type") == "uav"
+                     if v.get("vehicle_type") in ("uav", "uavf")
                      and v.get("connected")
                      and v["vehicle_id"] in sitl_bridges),
                     None,
@@ -2153,7 +2155,7 @@ async def trigger_mob(payload: dict[str, Any] = Body(default={}), authorization:
                 # Tier 4 — sim UAV (visual-only fallback for testing)
                 or next(
                     (v for v in vehicles.values()
-                     if v.get("vehicle_type") == "uav"
+                     if v.get("vehicle_type") in ("uav", "uavf")
                      and v.get("connected")
                      and v["vehicle_id"].startswith("sim-")),
                     None,
@@ -2611,6 +2613,8 @@ async def ingest_vehicle_message(payload: dict[str, Any]) -> None:
             vehicle["mode"] = payload["mode"]
         if isinstance(payload.get("armed"), bool):
             vehicle["armed"] = payload["armed"]
+        if isinstance(payload.get("autopilot"), str) and payload["autopilot"]:
+            vehicle["autopilot"] = payload["autopilot"].lower()
 
         if nav:
             vehicle["position"] = nav
@@ -3715,7 +3719,7 @@ def public_vehicle(vehicle: dict[str, Any]) -> dict[str, Any]:
 def infer_vehicle_type(vehicle_id: str) -> str:
     """Guess a vehicle's type from a keyword substring in its id, defaulting to \"uav\"."""
     lower = vehicle_id.lower()
-    for candidate in ("uav", "usv", "ugv", "uuv", "yp"):
+    for candidate in ("uavf", "uav", "usv", "ugv", "uuv", "yp"):
         if candidate in lower:
             return candidate
     return "uav"
@@ -3724,7 +3728,7 @@ def infer_vehicle_type(vehicle_id: str) -> str:
 def normalize_vehicle_type(value: Any) -> str:
     """Coerce a value to a known vehicle type string, defaulting to \"uav\"."""
     text = str(value or "uav").lower()
-    return text if text in {"uav", "usv", "ugv", "uuv", "yp"} else "uav"
+    return text if text in {"uav", "uavf", "usv", "ugv", "uuv", "yp"} else "uav"
 
 
 def quaternion_to_yaw_deg(q: dict[str, Any]) -> Optional[float]:
