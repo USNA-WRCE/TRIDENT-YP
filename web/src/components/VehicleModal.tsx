@@ -33,6 +33,14 @@ const VEHICLE_MODES: Record<VehicleType, string[]> = {
   yp: [],
 };
 
+// ArduPlane fixed-wing vehicles use their own mode names; other "uavf" vehicles (PX4) use VEHICLE_MODES.
+const ARDUPLANE_MODES = ["MANUAL", "FBWA", "FBWB", "CRUISE", "LOITER", "CIRCLE", "GUIDED", "AUTO", "RTL", "TAKEOFF"];
+
+function modesForVehicle(vehicle: Vehicle): string[] {
+  if (vehicle.vehicle_type === "uavf" && vehicle.autopilot === "ardupilot") return ARDUPLANE_MODES;
+  return VEHICLE_MODES[vehicle.vehicle_type] ?? [];
+}
+
 // Only vehicles that fly need a takeoff control.
 const TAKEOFF_CAPABLE_TYPES: VehicleType[] = ["uav", "uavf"];
 
@@ -177,7 +185,7 @@ export function VehicleModal({
         {canCommand && TAKEOFF_CAPABLE_TYPES.includes(vehicle.vehicle_type) && (
           <button className={styles.primary} onClick={() => setShowTakeoffPanel((value) => !value)}><PlaneTakeoff size={18} />Takeoff{showTakeoffPanel && <X size={14} aria-label="Close takeoff panel" />}</button>
         )}
-        {canCommand && VEHICLE_MODES[vehicle.vehicle_type]?.length > 0 && <button className={styles.secondary} onClick={() => setShowModeSelector((value) => !value)}>Settings{showModeSelector && <X size={14} aria-label="Close mode selector" />}</button>}
+        {canCommand && modesForVehicle(vehicle).length > 0 && <button className={styles.secondary} onClick={() => setShowModeSelector((value) => !value)}>Settings{showModeSelector && <X size={14} aria-label="Close mode selector" />}</button>}
         {canStreamVideo && <button className={styles.stream} onClick={onStreamVideo}><Video size={18} />Stream Video</button>}
         {canCommand && <button className={styles.primary} onClick={onWaypoint}><Route size={18} />Waypoint</button>}
         
@@ -209,7 +217,7 @@ export function VehicleModal({
           </div>
         </div>
       )}
-      {showModeSelector && VEHICLE_MODES[vehicle.vehicle_type]?.length > 0 && <div className={styles.colorPanel}><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>{VEHICLE_MODES[vehicle.vehicle_type].map((mode) => <button key={mode} className={styles.secondary} style={{ fontSize: "13px", padding: "6px 8px" }} onClick={() => { onSetMode(mode); setShowModeSelector(false); }}>{mode}</button>)}</div></div>}
+      {showModeSelector && modesForVehicle(vehicle).length > 0 && <div className={styles.colorPanel}><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>{modesForVehicle(vehicle).map((mode) => <button key={mode} className={styles.secondary} style={{ fontSize: "13px", padding: "6px 8px" }} onClick={() => { onSetMode(mode); setShowModeSelector(false); }}>{mode}</button>)}</div></div>}
       <div style={{ position: "absolute", bottom: 0, right: 0, width: "24px", height: "24px", cursor: "nwse-resize", display: "flex", alignItems: "flex-end", justifyContent: "flex-end", padding: "4px" }} onPointerDown={(event) => startDrag("resize", event)} onPointerMove={moveDrag} onPointerUp={endDrag}><Maximize2 size={14} color="#64748b" style={{ transform: "rotate(90deg)" }} /></div>
     </div>
   );

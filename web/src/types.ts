@@ -51,6 +51,7 @@ export interface Vehicle {
   behavior?: string;
   mode?: string;
   armed?: boolean;
+  autopilot?: "ardupilot" | "px4";
 }
 
 export interface Command {

@@ -986,7 +986,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, autopilot="ardupilot", behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                     if now - system_status["last_gps_fix_forwarded_at"] >= 10.0:
                         system_status["last_gps_fix_forwarded_at"] = now

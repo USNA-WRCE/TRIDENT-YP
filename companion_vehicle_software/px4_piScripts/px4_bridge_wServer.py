@@ -1143,7 +1143,7 @@ async def telemetry_loop(current_config: dict) -> None:
                     system_status["satellites"] = getattr(msg, "satellites_visible", 0)
                     if ws is not None:
                         try:
-                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
+                            await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, autopilot="px4", behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                         except Exception: pass
                     if now - system_status["last_gps_fix_forwarded_at"] >= 10.0:
                         system_status["last_gps_fix_forwarded_at"] = now
@@ -1164,7 +1164,7 @@ async def telemetry_loop(current_config: dict) -> None:
                 try:
                     if telemetry_sample is not None and (now - last_send_time) >= (1.0 / send_hz):
                         lat, lon, alt, heading = telemetry_sample
-                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"], armed=_armed_state)))
+                        await ws.send(json.dumps(build_telemetry(vehicle_id, VEHICLE_TYPE, autopilot="px4", latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=system_status["flight_mode"], armed=_armed_state)))
                         last_send_time = now
 
                     if now - last_video_send_time >= 60.0:

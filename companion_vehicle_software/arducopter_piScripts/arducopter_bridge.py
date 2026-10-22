@@ -777,7 +777,7 @@ async def telemetry_loop() -> None:
                     else:
                         behavior_tracker.observe_mode(_current_mode)
                 elif msg is not None and msg.get_type() in ("GPS_RAW_INT", "GPS2_RAW"):
-                    await ws.send(json.dumps(build_telemetry(VEHICLE_ID, VEHICLE_TYPE, behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
+                    await ws.send(json.dumps(build_telemetry(VEHICLE_ID, VEHICLE_TYPE, autopilot="ardupilot", behavior=behavior_tracker.get(), gps=gps_block_from_mavlink(msg))))
                 elif msg is not None:
                     lat = msg.lat / 1e7
                     lon = msg.lon / 1e7
@@ -796,7 +796,7 @@ async def telemetry_loop() -> None:
 
                     lat, lon, alt, heading = telemetry_sample
 
-                    payload = build_telemetry(VEHICLE_ID, VEHICLE_TYPE, latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=_current_mode, armed=_armed_state)
+                    payload = build_telemetry(VEHICLE_ID, VEHICLE_TYPE, autopilot="ardupilot", latitude=lat, longitude=lon, altitude=alt, heading=heading, behavior=behavior_tracker.get(), mode=_current_mode, armed=_armed_state)
                     json_payload = json.dumps(payload)
 
                     await ws.send(json_payload)
