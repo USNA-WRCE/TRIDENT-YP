@@ -111,6 +111,7 @@ _sar_latest_nav = {"lat": None, "lon": None, "alt": None, "heading": None, "stam
 
 SHIP_STATE_TIMEOUT_S = float(os.getenv("SHIP_STATE_TIMEOUT_S", "2.0"))
 SHIP_RELATIVE_DEFAULT_UPDATE_HZ = float(os.getenv("SHIP_RELATIVE_UPDATE_HZ", "10.0"))
+SHIP_RELATIVE_MIN_ARRIVAL_RADIUS_M = float(os.getenv("SHIP_RELATIVE_MIN_ARRIVAL_RADIUS_M", "8.0"))
 SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M = float(os.getenv("SHIP_RELATIVE_ARRIVAL_RADIUS_M", "6.0"))
 
 _vehicle_state_lock = threading.Lock()
@@ -619,7 +620,7 @@ def execute_land_step(master, command_data: dict) -> bool:
 
     vn = float(command_data.get("velocity_north_ms", 0.0))
     ve = float(command_data.get("velocity_east_ms", 0.0))
-    vd = float(command_data.get("sink_rate_ms", 0.0))  
+    vd = abs(float(command_data.get("sink_rate_ms", 0.0)))  # NED: positive = descend
     yaw_rad = math.radians(float(command_data.get("heading", 0.0)))
 
     now = time.monotonic()
@@ -649,7 +650,7 @@ def execute_land_step(master, command_data: dict) -> bool:
     master.mav.set_position_target_global_int_send(
         0, master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b100111000000,
+        0b100111000100,  # ignore z position: descend purely on commanded sink rate
         int(float(lat) * 1e7), int(float(lon) * 1e7), float(alt),
         vn, ve, vd, 0, 0, 0, yaw_rad, 0
     )
@@ -696,6 +697,7 @@ def _run_ship_relative_mission(master, ship_vehicle_id: str, local_waypoints: li
 
 def _run_ship_relative_mission_inner(master, ship_vehicle_id: str, local_waypoints: list, arrival_radius_m: float, update_hz: float, stop_event: threading.Event, face_ship: bool, loop_count: int, hold_last_waypoint: bool) -> None:
     update_period_s = 1.0 / max(update_hz, 1.0)
+    arrival_radius_m = max(arrival_radius_m, SHIP_RELATIVE_MIN_ARRIVAL_RADIUS_M)
     offboard_confirmed = False
     prestream_started = time.monotonic()
     last_offboard_request = 0.0
@@ -748,7 +750,7 @@ def _run_ship_relative_mission_inner(master, ship_vehicle_id: str, local_waypoin
                 set_px4_mode(master, "OFFBOARD")
                 last_offboard_request = time.monotonic()
                 
-            alt_condition_met = True if VEHICLE_TYPE in ["usv", "ugv"] else abs(float(vehicle_state["alt"]) - target_alt) <= max(2.0, arrival_radius_m * 0.5)
+            alt_condition_met = True if VEHICLE_TYPE in ["usv", "ugv"] else abs(float(vehicle_state["alt"]) - target_alt) <= max(3.0, arrival_radius_m * 0.5)
             if _distance_m(float(vehicle_state["lat"]), float(vehicle_state["lon"]), target_lat, target_lon) <= arrival_radius_m and alt_condition_met:
                 if index < len(repeated_waypoints) or not hold_last_waypoint:
                     break
@@ -786,6 +788,11 @@ def _stream_waypoints_offboard(master, waypoints: list, arrival_radius_m: float)
             goto_waypoint(master, wp_lat, wp_lon, wp_alt, force_offboard=False)
             time.sleep(0.1)
 
+def _loiter_if_completed(master) -> None:
+    """Ending the OFFBOARD stream would trip PX4's offboard-loss failsafe (RTL); loiter at the last point instead."""
+    if not _sar_stop_event.is_set():
+        set_px4_mode(master, "AUTO.LOITER")
+
 def _execute_takeoff_raw(master, altitude_m: float) -> None:
     """Non-locking helper to force arm and takeoff."""
     global _armed_state
@@ -821,6 +828,7 @@ def _run_single_waypoint(master, lat, lon, alt):
         _sar_stop_event.clear()
         try:
             _stream_waypoints_offboard(master, [[lat, lon, alt]], SAR_ARRIVAL_RADIUS_M)
+            _loiter_if_completed(master)
         finally:
             behavior_tracker.finish(BEHAVIOR_WAYPOINT)
             behavior_tracker.finish(BEHAVIOR_RETURN_TO_BOAT)
@@ -836,6 +844,7 @@ def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m
                 _execute_takeoff_raw(master, altitude_m)
                 
             _stream_waypoints_offboard(master, waypoints, SAR_ARRIVAL_RADIUS_M)
+            _loiter_if_completed(master)
         except Exception as exc: 
             print(f"SAR Error: {exc}")
         finally:
@@ -863,6 +872,7 @@ def _run_mob_search(master, track_points: list, corridor_half_width_m: float, sw
                 _execute_takeoff_raw(master, takeoff_altitude_m)
                 
             _stream_waypoints_offboard(master, waypoints, SAR_ARRIVAL_RADIUS_M)
+            _loiter_if_completed(master)
         except Exception as exc: 
             print(f"SAR Error: {exc}")
         finally:
