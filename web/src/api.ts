@@ -9,7 +9,6 @@ export interface ServerSettings {
   rtb_stern_distance_m?: number;
   rtb_altitude_m?: number;
   rtb_yp_safe_distance_m?: number;
-  land_on_boat_hover_clearance_m?: number;
   land_on_boat_descent_rate_ms?: number;
   land_on_boat_pad_offset_m?: number;
   land_on_boat_alignment_radius_m?: number;

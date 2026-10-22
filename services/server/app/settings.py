@@ -64,7 +64,6 @@ APPLICATION_SETTING_DEFAULTS: dict[str, Any] = {
     "rtb_stern_distance_m": 35.0,
     "rtb_altitude_m": 30.0,
     "rtb_yp_safe_distance_m": 20.0,
-    "land_on_boat_hover_clearance_m": 0.5,
     "land_on_boat_descent_rate_ms": 0.5,
     "land_on_boat_pad_offset_m": -0.4,
     "land_on_boat_alignment_radius_m": 1.0,
@@ -153,8 +152,10 @@ def normalize_application_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("rtk_host_or_port must be a non-empty hostname or serial path")
             value = value.strip()
         elif key == "land_on_boat_pad_offset_m":
+            if isinstance(value, bool):
+                raise ValueError(f"{key} must be a finite number")
             value = float(value)
-            if isinstance(value, bool) or not math.isfinite(value):
+            if not math.isfinite(value):
                 raise ValueError(f"{key} must be a finite number")
         else:
             value = _positive_number(key, value)

@@ -100,7 +100,6 @@ SAR_ALTITUDE_M = float(os.getenv("SAR_ALTITUDE_M", "30.0"))
 SAR_MOB_TRACK_SECONDS = float(os.getenv("SAR_MOB_TRACK_SECONDS", "120.0"))
 SAR_TAKEOFF_ALT_M = float(os.getenv("SAR_TAKEOFF_ALT_M", "30.0"))
 SAR_CLIMB_SPEED_MS = float(os.getenv("SAR_CLIMB_SPEED_MS", "8.0"))
-LAND_ON_BOAT_HOVER_CLEARANCE_M = float(os.getenv("LAND_ON_BOAT_HOVER_CLEARANCE_M", "0.5"))
 LAND_ON_BOAT_DESCENT_RATE_MS = float(os.getenv("LAND_ON_BOAT_DESCENT_RATE_MS", "0.5"))
 LAND_ON_BOAT_PAD_OFFSET_M = float(os.getenv("LAND_ON_BOAT_PAD_OFFSET_M", "-0.4"))
 LAND_ON_BOAT_ALIGNMENT_RADIUS_M = float(os.getenv("LAND_ON_BOAT_ALIGNMENT_RADIUS_M", "1.0"))
@@ -3380,7 +3379,7 @@ async def _start_land_on_boat(vehicle_id: str, source: str) -> None:
 
 
 async def _land_on_boat_loop(vehicle_id: str) -> None:
-    """Track the moving pad, descend to a hover clearance, and hold there.
+    """Track the moving pad horizontally, then descend until touchdown.
 
     The vehicle bridge (not this loop) confirms actual ground contact via
     ArduCopter's onboard landing detector and disarms locally, then reports
@@ -3388,7 +3387,6 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
     """
     STATE_APPROACH = 0
     STATE_DESCENT = 1
-    STATE_HOVER = 2
 
     current_state = STATE_APPROACH
     target_alt_m: Optional[float] = None
@@ -3435,36 +3433,34 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
                         float(target_pos["latitude"]), float(target_pos["longitude"]),
                         pad_lat, pad_lon,
                     )
-                    hover_clearance_m = float(settings.get("land_on_boat_hover_clearance_m", LAND_ON_BOAT_HOVER_CLEARANCE_M))
                     descent_rate_ms = float(settings.get("land_on_boat_descent_rate_ms", LAND_ON_BOAT_DESCENT_RATE_MS))
                     alignment_radius_m = float(settings.get("land_on_boat_alignment_radius_m", LAND_ON_BOAT_ALIGNMENT_RADIUS_M))
-                    pad_hover_alt_m = float(yp_pos.get("altitude") or 0.0) + hover_clearance_m
+                    # Altitudes are in the vehicle's own home-relative frame. The
+                    # YP's reported altitude is a different (MSL/unknown) frame and
+                    # the deck height is unknown, so it is never used here.
                     vehicle_alt_m = float(target_pos.get("altitude") or 0.0)
 
-                    # Avoid an abrupt first altitude command; descend from the
-                    # current reported altitude toward the pad-relative target.
                     if target_alt_m is None:
-                        target_alt_m = max(vehicle_alt_m, pad_hover_alt_m)
+                        target_alt_m = vehicle_alt_m
 
                     sink_rate_ms = 0.0
-                    if current_state == STATE_APPROACH and horiz_dist_m <= alignment_radius_m:
-                        current_state = STATE_DESCENT
-                        print(f"[LAND] Aligned with pad; descending to {hover_clearance_m:.2f}m hover on {vehicle_id}")
-
-                    if current_state == STATE_DESCENT:
+                    if current_state == STATE_APPROACH:
+                        target_alt_m = vehicle_alt_m
+                        if horiz_dist_m <= alignment_radius_m:
+                            current_state = STATE_DESCENT
+                            print(f"[LAND] Aligned with pad; starting blind descent on {vehicle_id}")
+                    elif horiz_dist_m > 2.0 * alignment_radius_m:
+                        # Lost the pad: stop sinking and hold until re-aligned.
+                        target_alt_m = vehicle_alt_m
+                    else:
+                        # Descend until the bridge's landing detector reports contact.
+                        # Keep the target within 1 m of the actual altitude so a
+                        # lagging vehicle does not wind up a large downward demand.
                         target_alt_m = max(
-                            pad_hover_alt_m,
                             target_alt_m - descent_rate_ms * period_s,
+                            vehicle_alt_m - 1.0,
                         )
-                        if target_alt_m <= pad_hover_alt_m:
-                            target_alt_m = pad_hover_alt_m
-                            current_state = STATE_HOVER
-                            print(f"[LAND] Hover clearance reached on {vehicle_id}; holding above pad")
-                        else:
-                            sink_rate_ms = descent_rate_ms
-
-                    if current_state == STATE_HOVER:
-                        target_alt_m = pad_hover_alt_m
+                        sink_rate_ms = descent_rate_ms
 
                     step_command = {
                         "type": "land_on_boat_step",

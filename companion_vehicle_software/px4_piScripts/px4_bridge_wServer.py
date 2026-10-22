@@ -122,7 +122,9 @@ _ship_relative_stop_event: threading.Event | None = None
 _last_rtb_step_time = 0.0
 _rtb_offboard_forced = False
 _last_land_step_time = 0.0
-_land_step_offboard_forced = False
+_land_step_stream_start = 0.0
+_land_last_mode_request = 0.0
+_land_offboard_confirmed = False
 _landed_state = 0  
 _land_touchdown_since: float | None = None
 _land_touchdown_sent = False
@@ -606,7 +608,7 @@ def follow_yp_velocity(master, command_data: dict) -> None:
         pass
 
 def execute_land_step(master, command_data: dict) -> bool:
-    global _last_land_step_time, _land_step_offboard_forced, _land_touchdown_since, _land_touchdown_sent
+    global _last_land_step_time, _land_step_stream_start, _land_last_mode_request, _land_offboard_confirmed, _land_touchdown_since, _land_touchdown_sent
     target = command_data.get("target", {})
     lat = target.get("latitude")
     lon = target.get("longitude")
@@ -622,7 +624,9 @@ def execute_land_step(master, command_data: dict) -> bool:
 
     now = time.monotonic()
     if now - _last_land_step_time > 1.0:
-        _land_step_offboard_forced = False
+        _land_step_stream_start = now
+        _land_last_mode_request = 0.0
+        _land_offboard_confirmed = False
         _land_touchdown_since = None
         _land_touchdown_sent = False
     _last_land_step_time = now
@@ -640,21 +644,26 @@ def execute_land_step(master, command_data: dict) -> bool:
         return False
     _land_touchdown_since = None
 
+    # PX4 only accepts OFFBOARD while setpoints are already streaming (>2 Hz),
+    # so always send the setpoint first and request the mode afterwards.
     master.mav.set_position_target_global_int_send(
         0, master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
         0b100111000000,
         int(float(lat) * 1e7), int(float(lon) * 1e7), float(alt),
-        vn, ve, vd, 0, 0, 0, yaw_rad, 0 
+        vn, ve, vd, 0, 0, 0, yaw_rad, 0
     )
 
     try:
-        if not _land_step_offboard_forced:
-            set_px4_mode(master, "OFFBOARD")
-            _land_step_offboard_forced = True
-        elif getattr(master, "flightmode", "") not in ("OFFBOARD", "GUIDED"):
+        in_offboard = getattr(master, "flightmode", "") in ("OFFBOARD", "GUIDED")
+        if in_offboard:
+            _land_offboard_confirmed = True
+        elif _land_offboard_confirmed:
             print("[LAND] Safety pilot has taken control; halting land-on-boat guidance")
             return False
+        elif now - _land_step_stream_start >= 0.5 and now - _land_last_mode_request >= 2.0:
+            set_px4_mode(master, "OFFBOARD")
+            _land_last_mode_request = now
     except Exception:
         pass
 

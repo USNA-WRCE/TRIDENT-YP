@@ -175,7 +175,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
   const [rtbSternDistanceM, setRtbSternDistanceM] = useState(35);
   const [rtbAltitudeM, setRtbAltitudeM] = useState(30);
   const [rtbYpSafeDistanceM, setRtbYpSafeDistanceM] = useState(20);
-  const [landOnBoatHoverClearanceM, setLandOnBoatHoverClearanceM] = useState(0.5);
   const [landOnBoatDescentRateMs, setLandOnBoatDescentRateMs] = useState(0.5);
   const [landOnBoatPadOffsetM, setLandOnBoatPadOffsetM] = useState(-0.4);
   const [landOnBoatAlignmentRadiusM, setLandOnBoatAlignmentRadiusM] = useState(1.0);
@@ -530,9 +529,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         if (typeof serverSettings.rtb_yp_safe_distance_m === "number") {
           setRtbYpSafeDistanceM(serverSettings.rtb_yp_safe_distance_m);
         }
-        if (typeof serverSettings.land_on_boat_hover_clearance_m === "number") {
-          setLandOnBoatHoverClearanceM(serverSettings.land_on_boat_hover_clearance_m);
-        }
         if (typeof serverSettings.land_on_boat_descent_rate_ms === "number") {
           setLandOnBoatDescentRateMs(serverSettings.land_on_boat_descent_rate_ms);
         }
@@ -639,7 +635,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
         rtb_stern_distance_m: rtbSternDistanceM,
         rtb_altitude_m: rtbAltitudeM,
         rtb_yp_safe_distance_m: rtbYpSafeDistanceM,
-        land_on_boat_hover_clearance_m: landOnBoatHoverClearanceM,
         land_on_boat_descent_rate_ms: landOnBoatDescentRateMs,
         land_on_boat_pad_offset_m: landOnBoatPadOffsetM,
         land_on_boat_alignment_radius_m: landOnBoatAlignmentRadiusM,
@@ -660,7 +655,7 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
       }).catch(() => undefined);
     }, 350);
     return () => window.clearTimeout(timeout);
-  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, rtbYpSafeDistanceM, landOnBoatHoverClearanceM, landOnBoatDescentRateMs, landOnBoatPadOffsetM, landOnBoatAlignmentRadiusM, landOnBoatAutoDisarm, landOnBoatTouchdownDwellS, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, voiceConfirmationMode, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
+  }, [trailSeconds, showYpRangeRings, messageRetentionMinutes, rtbUpdateHz, rtbSternDistanceM, rtbAltitudeM, rtbYpSafeDistanceM, landOnBoatDescentRateMs, landOnBoatPadOffsetM, landOnBoatAlignmentRadiusM, landOnBoatAutoDisarm, landOnBoatTouchdownDwellS, mobTrackSeconds, mobSwathM, mobAltM, mobCorridorHalfWidthM, mobTakeoffAltitudeM, mobClimbSpeedMs, voiceConfirmationMode, ypRoleVehicleId, rtkSourceType, rtkHostOrPort, rtkNetworkPort, rtkBaudrate, settingsLoaded]);
 
   useEffect(() => {
     if (DEMO_MODE) return;
@@ -1663,11 +1658,6 @@ function GroundStation({ currentUser, onLogout }: { currentUser: CurrentUser; on
                 <span>{rtbYpSafeDistanceM} m</span>
               </label>
               <input min={5} max={100} step={5} type="range" value={rtbYpSafeDistanceM} disabled={DEMO_MODE} onChange={(event) => setRtbYpSafeDistanceM(Number(event.target.value))} />
-              <label>
-                Landing hover clearance
-                <span>{landOnBoatHoverClearanceM.toFixed(1)} m</span>
-              </label>
-              <input min={-1.5} max={5} step={0.1} type="range" value={landOnBoatHoverClearanceM} disabled={DEMO_MODE} onChange={(event) => setLandOnBoatHoverClearanceM(Number(event.target.value))} />
               <label>
                 Landing descent rate
                 <span>{landOnBoatDescentRateMs.toFixed(1)} m/s</span>
