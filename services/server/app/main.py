@@ -3390,6 +3390,7 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
 
     current_state = STATE_APPROACH
     target_alt_m: Optional[float] = None
+    last_status_log_s = 0.0
 
     try:
         while True:
@@ -3444,6 +3445,10 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
                         target_alt_m = vehicle_alt_m
 
                     sink_rate_ms = 0.0
+                    now_s = time.monotonic()
+                    if now_s - last_status_log_s >= 1.0:
+                        last_status_log_s = now_s
+                        print(f"[LAND] {vehicle_id} state={current_state} pad_dist={horiz_dist_m:.2f}m (align<={alignment_radius_m:.1f}m) alt={vehicle_alt_m:.1f}m pad_speed={yp_speed_mps:.1f}m/s")
                     if current_state == STATE_APPROACH:
                         target_alt_m = vehicle_alt_m
                         if horiz_dist_m <= alignment_radius_m:

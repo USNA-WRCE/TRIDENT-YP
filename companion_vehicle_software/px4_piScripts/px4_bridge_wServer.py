@@ -105,6 +105,14 @@ SAR_ARRIVAL_RADIUS_M = float(os.getenv("SAR_ARRIVAL_RADIUS_M", "10.0"))
 
 _sar_mission_lock = threading.Lock()
 _sar_stop_event = threading.Event()
+_sar_generation = 0
+
+def _supersede_sar_threads() -> int:
+    """Stop the running mission thread and invalidate any queued ones; returns the new generation."""
+    global _sar_generation
+    _sar_generation += 1
+    _sar_stop_event.set()
+    return _sar_generation
 _pause_telemetry = threading.Event()
 _sar_telemetry_lock = threading.Lock()
 _sar_latest_nav = {"lat": None, "lon": None, "alt": None, "heading": None, "stamp": 0.0}
@@ -126,6 +134,9 @@ _last_land_step_time = 0.0
 _land_step_stream_start = 0.0
 _land_last_mode_request = 0.0
 _land_offboard_confirmed = False
+_rtb_offboard_confirmed = False
+_rtb_last_mode_request = 0.0
+_goto_last_mode_request = 0.0
 _landed_state = 0  
 _land_touchdown_since: float | None = None
 _land_touchdown_sent = False
@@ -516,6 +527,17 @@ def get_px4_mode(custom_mode: int) -> str:
     #print(mode_map.get(main_mode, "UNKNOWN")) 
     return mode_map.get(main_mode, "UNKNOWN")
 
+def _px4_in_offboard() -> bool:
+    # pymavlink's master.flightmode never reports OFFBOARD for PX4, so use the bridge's own heartbeat decoding.
+    return system_status.get("flight_mode") == "OFFBOARD"
+
+_PILOT_MODES = ("MANUAL", "ALTCTL", "POSCTL", "ACRO", "STABILIZED")
+
+def _pilot_has_control() -> bool:
+    # Only manual flight modes mean a human took over; AUTO.* (loiter, RTL, ...) are
+    # automatic transitions the bridge should recover from by re-requesting OFFBOARD.
+    return system_status.get("flight_mode") in _PILOT_MODES
+
 def set_px4_mode(master, mode_str: str) -> None:
     """Safe wrapper for setting PX4 modes using binary MAV_CMD_DO_SET_MODE flags."""
     mode_map = {
@@ -570,8 +592,13 @@ def goto_waypoint(master, target_lat, target_lon, target_alt, timeout=30, force_
         0, 0, 0, 0, 0, 0, yaw_rad, 0
     )
         
-    if force_offboard:
+    # Each RTB waypoint restarts this thread, so only request OFFBOARD when a
+    # heartbeat shows it isn't active, and not more than once per second.
+    global _goto_last_mode_request
+    now = time.monotonic()
+    if force_offboard and not _px4_in_offboard() and now - _goto_last_mode_request >= 1.0:
         set_px4_mode(master, 'OFFBOARD')
+        _goto_last_mode_request = now
 
 def _rtb_waypoint_should_force_offboard() -> bool:
     global _last_rtb_step_time, _rtb_offboard_forced
@@ -585,7 +612,7 @@ def _rtb_waypoint_should_force_offboard() -> bool:
     return True
 
 def follow_yp_velocity(master, command_data: dict) -> None:
-    global _last_rtb_step_time, _rtb_offboard_forced
+    global _last_rtb_step_time, _rtb_offboard_confirmed, _rtb_last_mode_request
     target = command_data.get("target", {})
     lat, lon = target.get("latitude"), target.get("longitude")
     if lat is None or lon is None:
@@ -593,18 +620,23 @@ def follow_yp_velocity(master, command_data: dict) -> None:
 
     now = time.monotonic()
     if now - _last_rtb_step_time > 1.0:
-        _rtb_offboard_forced = False
+        _rtb_offboard_confirmed = False
+        _rtb_last_mode_request = 0.0
     _last_rtb_step_time = now
 
     master.mav.set_position_target_global_int_send(0, master.target_system, master.target_component, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, 0b100111000000, int(float(lat) * 1e7), int(float(lon) * 1e7), float(target.get("altitude") or 0.0), float(command_data.get("velocity_north_ms") or 0.0), float(command_data.get("velocity_east_ms") or 0.0), 0.0, 0, 0, 0, math.radians(float(command_data.get("heading") or 0.0)), 0.0)
 
+    # Request OFFBOARD until a heartbeat confirms it; only after that does a
+    # mode change mean the safety pilot (or a failsafe) took over.
     try:
-        if not _rtb_offboard_forced:
-            set_px4_mode(master, "OFFBOARD")
-            _rtb_offboard_forced = True
-        elif getattr(master, "flightmode", "") not in ("OFFBOARD", "GUIDED"):
-            print("[RTB] Safety pilot has taken control; halting RTB-follow guidance")
+        if _px4_in_offboard():
+            _rtb_offboard_confirmed = True
+        elif _pilot_has_control():
+            print(f"[RTB] Pilot mode {system_status.get('flight_mode')}; halting RTB-follow guidance")
             return
+        elif now - _rtb_last_mode_request >= 1.0:
+            set_px4_mode(master, "OFFBOARD")
+            _rtb_last_mode_request = now
     except Exception as exc:
         pass
 
@@ -626,6 +658,7 @@ def execute_land_step(master, command_data: dict) -> bool:
     now = time.monotonic()
     if now - _last_land_step_time > 1.0:
         _land_step_stream_start = now
+        print("[LAND] Land-on-boat guidance started")
         _land_last_mode_request = 0.0
         _land_offboard_confirmed = False
         _land_touchdown_since = None
@@ -650,19 +683,21 @@ def execute_land_step(master, command_data: dict) -> bool:
     master.mav.set_position_target_global_int_send(
         0, master.target_system, master.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b100111000100,  # ignore z position: descend purely on commanded sink rate
+        0b100111000000,  # PX4 needs x, y and z position all enabled for position control; ignoring z drops to velocity-only and the vehicle never closes on the pad
         int(float(lat) * 1e7), int(float(lon) * 1e7), float(alt),
         vn, ve, vd, 0, 0, 0, yaw_rad, 0
     )
 
     try:
-        in_offboard = getattr(master, "flightmode", "") in ("OFFBOARD", "GUIDED")
+        in_offboard = _px4_in_offboard()
         if in_offboard:
+            if not _land_offboard_confirmed:
+                print("[LAND] OFFBOARD confirmed")
             _land_offboard_confirmed = True
-        elif _land_offboard_confirmed:
-            print("[LAND] Safety pilot has taken control; halting land-on-boat guidance")
+        elif _pilot_has_control():
+            print(f"[LAND] Pilot mode {system_status.get('flight_mode')}; halting land-on-boat guidance")
             return False
-        elif now - _land_step_stream_start >= 0.5 and now - _land_last_mode_request >= 2.0:
+        elif now - _land_step_stream_start >= 0.5 and now - _land_last_mode_request >= 1.0:
             set_px4_mode(master, "OFFBOARD")
             _land_last_mode_request = now
     except Exception:
@@ -728,8 +763,7 @@ def _run_ship_relative_mission_inner(master, ship_vehicle_id: str, local_waypoin
             
             master.mav.set_position_target_global_int_send(0, master.target_system, master.target_component, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, type_mask, int(target_lat * 1e7), int(target_lon * 1e7), target_alt, float(ship_state.get("vn_ms") or 0.0), float(ship_state.get("ve_ms") or 0.0), 0.0, 0, 0, 0, target_yaw_rad, 0.0)
             
-            current_mode = str(getattr(master, "flightmode", "")).upper()
-            if current_mode in ("OFFBOARD", "GUIDED"):
+            if _px4_in_offboard():
                 offboard_confirmed = True
                 if not arm_requested:
                     master.mav.command_long_send(
@@ -823,8 +857,10 @@ def _execute_takeoff_raw(master, altitude_m: float) -> None:
             break
         time.sleep(0.1)
 
-def _run_single_waypoint(master, lat, lon, alt):
+def _run_single_waypoint(master, lat, lon, alt, gen=None):
     with _sar_mission_lock:
+        if gen is not None and gen != _sar_generation:
+            return
         _sar_stop_event.clear()
         try:
             _stream_waypoints_offboard(master, [[lat, lon, alt]], SAR_ARRIVAL_RADIUS_M)
@@ -833,9 +869,11 @@ def _run_single_waypoint(master, lat, lon, alt):
             behavior_tracker.finish(BEHAVIOR_WAYPOINT)
             behavior_tracker.finish(BEHAVIOR_RETURN_TO_BOAT)
 
-def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m: float, altitude_m: float) -> None:
+def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m: float, altitude_m: float, gen=None) -> None:
     if VEHICLE_TYPE in ["usv", "ugv"]: altitude_m = 0.0
     with _sar_mission_lock:
+        if gen is not None and gen != _sar_generation:
+            return
         _sar_stop_event.clear()
         try:
             waypoints = behaviors_agnostic.calculate_search_grid_waypoints(lat, lon, grid_size_m, swath_m, altitude_m)
@@ -850,9 +888,11 @@ def _run_search_grid(master, lat: float, lon: float, grid_size_m: float, swath_m
         finally:
             behavior_tracker.finish(BEHAVIOR_SEARCH_GRID)
 
-def _run_mob_search(master, track_points: list, corridor_half_width_m: float, swath_m: float, altitude_m: float, takeoff_altitude_m: float, climb_speed_ms: float) -> None:
+def _run_mob_search(master, track_points: list, corridor_half_width_m: float, swath_m: float, altitude_m: float, takeoff_altitude_m: float, climb_speed_ms: float, gen=None) -> None:
     if VEHICLE_TYPE in ["usv", "ugv"]: altitude_m, takeoff_altitude_m = 0.0, 0.0
     with _sar_mission_lock:
+        if gen is not None and gen != _sar_generation:
+            return
         _sar_stop_event.clear()
         try:
             start_from_newest = False
@@ -1070,6 +1110,8 @@ async def telemetry_loop(current_config: dict) -> None:
                             if cmd_type != "rtcm_data":
                                 behavior_tracker.set(behavior_for_command(cmd_type, server_msg.get("source")))
 
+                            sar_gen = _supersede_sar_threads() if cmd_type in ("rtb_follow", "land_on_boat_step", "waypoint", "search_grid", "mob", "cancel_sar") else None
+
                             if cmd_type == "rtb_follow":
                                 follow_yp_velocity(master, command_data)
                             elif cmd_type == "land_on_boat_step":
@@ -1081,15 +1123,15 @@ async def telemetry_loop(current_config: dict) -> None:
                                 # goto_waypoint(master, command_data["target"]["latitude"], command_data["target"]["longitude"], command_data["target"]["altitude"], force_offboard=(True if server_msg.get("source") != "rtb_follow" else _rtb_waypoint_should_force_offboard()))
                                 threading.Thread(
                                     target=_run_single_waypoint, 
-                                    args=(master, command_data["target"]["latitude"], command_data["target"]["longitude"], command_data["target"]["altitude"]), 
+                                    args=(master, command_data["target"]["latitude"], command_data["target"]["longitude"], command_data["target"]["altitude"], sar_gen), 
                                     daemon=True
                                     ).start()
                             elif cmd_type == "search_grid" and None not in (command_data.get("lat"), command_data.get("lon")):
-                                threading.Thread(target=_run_search_grid, args=(master, float(command_data["lat"]), float(command_data["lon"]), float(command_data.get("grid_size_m", 200)), float(command_data.get("swath_m", 20)), float(command_data.get("altitude_m", 30))), daemon=True).start()
+                                threading.Thread(target=_run_search_grid, args=(master, float(command_data["lat"]), float(command_data["lon"]), float(command_data.get("grid_size_m", 200)), float(command_data.get("swath_m", 20)), float(command_data.get("altitude_m", 30)), sar_gen), daemon=True).start()
                             elif cmd_type == "mob" and len(command_data.get("track_points", [])) >= 2:
-                                threading.Thread(target=_run_mob_search, args=(master, command_data["track_points"], float(command_data.get("corridor_half_width_m", 50.0)), float(command_data.get("swath_m", 20.0)), float(command_data.get("altitude_m", 30.0)), float(command_data.get("takeoff_altitude_m", SAR_TAKEOFF_ALT_M)), float(command_data.get("climb_speed_ms", SAR_CLIMB_SPEED_MS))), daemon=True).start()
+                                threading.Thread(target=_run_mob_search, args=(master, command_data["track_points"], float(command_data.get("corridor_half_width_m", 50.0)), float(command_data.get("swath_m", 20.0)), float(command_data.get("altitude_m", 30.0)), float(command_data.get("takeoff_altitude_m", SAR_TAKEOFF_ALT_M)), float(command_data.get("climb_speed_ms", SAR_CLIMB_SPEED_MS)), sar_gen), daemon=True).start()
                             elif cmd_type == "cancel_sar":
-                                _sar_stop_event.set()
+                                pass
                             elif cmd_type == "disarm":
                                 master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
                             elif cmd_type == "arm":
