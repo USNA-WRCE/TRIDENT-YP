@@ -1,7 +1,6 @@
 import asyncio
 import json
-from math      import floor
-from numpy     import degrees, radians, sin, cos, arctan2, sqrt
+import math
 import os
 import socket
 import threading
@@ -13,7 +12,6 @@ from typing import Any
 from aiohttp import web
 from pymavlink import mavutil
 import websockets
-import math
 
 import sar_missions
 from yp_common.telemetry import (
@@ -28,7 +26,6 @@ from yp_common.telemetry import (
 BEHAVIOR_MANUAL_CONTROL = "manual_control"
 
 CONFIG_PATH = Path("config.json")
-
 
 
 def _resolve_webrtc_ip() -> str:
@@ -50,6 +47,7 @@ def _resolve_webrtc_ip() -> str:
     except OSError:
         pass
     return "127.0.0.1"
+
 
 # --- DEFAULT CONFIGURATION FOR APACHE 3 (USV) ---
 DEFAULT_CONFIG = {
@@ -97,35 +95,22 @@ CUSTOM_MODE_RTL = 11
 CUSTOM_MODE_LOITER = 12
 CUSTOM_MODE_GUIDED = 15
 
-SAR_TAKEOFF_ALT_M = 0.0
-SAR_CLIMB_SPEED_MS = 0.0
-SAR_INCLUDE_TAKEOFF = False
-SAR_STREAMING_MODE = False  # CHCNav requires full mission batch uploads
-SAR_ARRIVAL_RADIUS_M = float(os.getenv("SAR_ARRIVAL_RADIUS_M", "10.0"))
+SAR_ARRIVAL_RADIUS_M = float(os.getenv("SAR_ARRIVAL_RADIUS_M", "3.0"))  # 3m arrival threshold
+EARTH_RADIUS_M = 6_378_137.0
 
 _sar_mission_lock = threading.Lock()
 _sar_stop_event = threading.Event()
-_sar_telemetry_lock = threading.Lock()
-_sar_latest_nav = {"lat": None, "lon": None, "alt": 0.0, "heading": None, "stamp": 0.0}
-
-SHIP_STATE_TIMEOUT_S = float(os.getenv("SHIP_STATE_TIMEOUT_S", "2.0"))
-SHIP_RELATIVE_DEFAULT_UPDATE_HZ = float(os.getenv("SHIP_RELATIVE_UPDATE_HZ", "10.0"))
-SHIP_RELATIVE_DEFAULT_ARRIVAL_RADIUS_M = float(os.getenv("SHIP_RELATIVE_ARRIVAL_RADIUS_M", "6.0"))
-EARTH_RADIUS_M = 6_378_137.0
 
 _vehicle_state_lock = threading.Lock()
-_vehicle_state = {"lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms":0.0, "stamp": 0.0}
-_ship_state_lock = threading.Lock()
-_ship_state = {"vehicle_id": None, "lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": 0.0}
+_vehicle_state = {"lat": None, "lon": None, "alt": 0.0, "heading_deg": None, "vn_ms": 0.0, "ve_ms": 0.0, "stamp": 0.0}
 
-# --- HEADING & SPEED CONTROLLER STATE THREADING ---
-_controller_thread: threading.Thread | None = None
-_controller_stop_event = threading.Event()
-_controller_target_lock = threading.Lock()
-_controller_targets = {
-    "heading_deg": 0.0,
-    "speed_mps": 0.0,
-}
+# --- SEQUENTIAL WAYPOINT GUIDANCE STATE THREADING ---
+_guidance_thread: threading.Thread | None = None
+_guidance_stop_event = threading.Event()
+_guidance_lock = threading.Lock()
+_active_waypoints: list[tuple[float, float]] = []
+_active_command_type: str = "waypoint"
+
 
 # --- CONFIG MANAGEMENT & WEB SERVER ---
 
@@ -139,9 +124,11 @@ def load_config() -> dict:
             print(f"Error loading config.json, using defaults: {e}")
     return DEFAULT_CONFIG.copy()
 
+
 def save_config(new_config: dict):
     with open(CONFIG_PATH, "w") as f:
         json.dump(new_config, f, indent=2)
+
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -201,7 +188,6 @@ HTML_TEMPLATE = """
     <div class="diag-card">
         <label style="margin-top:0;">Request Mode Change</label>
         <select id="mode_select">
-            <option value="10">AUTO (10)</option>
             <option value="0">MANUAL (0)</option>
             <option value="12">LOITER / Station Keeping (12)</option>
             <option value="11">RTL / Return to Home (11)</option>
@@ -307,8 +293,10 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
 def _default_video_url() -> str:
     return f"http://{WEBRTC_IP}:8889/apache3/whep"
+
 
 async def handle_index(request):
     url = config["mavlink_url"]
@@ -330,19 +318,21 @@ async def handle_index(request):
     )
     return web.Response(text=html, content_type="text/html")
 
+
 async def handle_status_api(request):
     if time.time() - system_status["last_hb_time"] > 4.0:
         system_status["cube_connected"] = False
         system_status["cube_status"] = "Heartbeat Lost"
     return web.json_response(system_status)
 
+
 async def handle_mode_api(request):
     try:
         body = await request.json()
-        target_mode_id = int(body.get("mode_id", CUSTOM_MODE_AUTO))
+        target_mode_id = int(body.get("mode_id", CUSTOM_MODE_MANUAL))
 
-        await _stop_active_controller()  # Terminate active RC override controller when manual mode change is issued
-        
+        _stop_active_guidance_sync()
+
         with mav_master_lock:
             if not mav_master or not system_status["cube_connected"]:
                 return web.json_response({"ok": False, "error": "Apache controller disconnected"}, status=503)
@@ -352,16 +342,17 @@ async def handle_mode_api(request):
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+
 async def handle_save(request):
     data = await request.post()
     global config
-    
+
     url_select = data.get("mavlink_url_select")
     if url_select == "custom":
         config["mavlink_url"] = data.get("mavlink_url_custom", "").strip()
     elif url_select:
         config["mavlink_url"] = url_select.strip()
-        
+
     config["server_ws_url"] = data.get("server_ws_url", config["server_ws_url"]).strip()
     config["vehicle_id"] = data.get("vehicle_id", config["vehicle_id"]).strip()
     config["send_hz"] = float(data.get("send_hz", config["send_hz"]))
@@ -370,6 +361,7 @@ async def handle_save(request):
     save_config(config)
     reconnect_event.set()
     return web.HTTPFound(location="/")
+
 
 async def start_web_server():
     app = web.Application()
@@ -383,7 +375,30 @@ async def start_web_server():
     await site.start()
     print(f"Web interface running at http://0.0.0.0:{config.get('web_port', 8880)}")
 
-# --- CHCNAV MAVLINK MISSION & COMMAND FUNCTIONS ---
+
+# --- MAVLINK & GUIDANCE MATH HELPERS ---
+
+def haversine_calc(lat_frm: float, lon_frm: float, lat_to: float, lon_to: float) -> tuple[float, float]:
+    """Calculates range distance (m) and bearing angle (rad) between two coordinates."""
+    lat0 = math.radians(lat_frm)
+    lon0 = math.radians(lon_frm)
+    lat = math.radians(lat_to)
+    lon = math.radians(lon_to)
+
+    delta_lat = lat - lat0
+    delta_lon = lon - lon0
+
+    a = math.sin(delta_lat / 2.0) ** 2 + math.cos(lat0) * math.cos(lat) * (math.sin(delta_lon / 2.0) ** 2)
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    d = EARTH_RADIUS_M * c
+
+    theta = math.atan2(math.sin(delta_lon) * math.cos(lat),
+                       math.cos(lat0) * math.sin(lat) - math.sin(lat0) * math.cos(lat) * math.cos(delta_lon))
+    if theta < 0:
+        theta += math.radians(360)
+
+    return d, theta
+
 
 def set_chcnav_mode(master, mode_id: int):
     """Sets mode using CHCNav custom_mode integer values."""
@@ -393,11 +408,11 @@ def set_chcnav_mode(master, mode_id: int):
         mode_id
     )
 
+
 def _send_raw_rc_override(master, steering_pwm: int = 1500, throttle_pwm: int = 1500):
     """
     Directly transmits MAVLink RC_CHANNELS_OVERRIDE message (msgid = 70).
-    Channel 1 = Steering (1100 = Full Left, 1500 = Center, 1900 = Full Right)
-    Channel 2 = Throttle (1100 = Full Reverse, 1500 = Neutral, 1900 = Full Forward)
+    Channel 1 = Steering, Channel 2 = Throttle
     """
     target_sys = master.target_system or 1
     target_comp = master.target_component or 1
@@ -411,258 +426,173 @@ def _send_raw_rc_override(master, steering_pwm: int = 1500, throttle_pwm: int = 
         )
     )
 
-def _stop_active_controller_sync():
-    """Synchronous helper to signal and join the controller thread."""
-    global _controller_thread
-    if _controller_thread and _controller_thread.is_alive():
-        _controller_stop_event.set()
-        _controller_thread.join(timeout=1.0)
-    _controller_stop_event.clear()
-    _controller_thread = None
+
+def _stop_active_guidance_sync():
+    """Synchronous helper to signal and stop any active guidance loop thread."""
+    global _guidance_thread
+    if _guidance_thread and _guidance_thread.is_alive():
+        _guidance_stop_event.set()
+        _guidance_thread.join(timeout=1.0)
+    _guidance_stop_event.clear()
+    _guidance_thread = None
+
 
 async def _stop_active_controller():
     """Non-blocking async call that offloads thread joining off the main event loop."""
-    if _controller_thread and _controller_thread.is_alive():
-        await asyncio.to_thread(_stop_active_controller_sync)
+    if _guidance_thread and _guidance_thread.is_alive():
+        await asyncio.to_thread(_stop_active_guidance_sync)
     else:
-        _controller_stop_event.clear()
+        _guidance_stop_event.clear()
 
-def _start_heading_speed_control(target_heading_deg: float, target_speed_mps: float):
-    """Spawns or updates the heading/speed controller thread."""
-    global _controller_thread
-    with _controller_target_lock:
-        _controller_targets["heading_deg"] = float(target_heading_deg)
-        _controller_targets["speed_mps"] = float(target_speed_mps)
 
-    if _controller_thread is None or not _controller_thread.is_alive():
-        _controller_stop_event.clear()
-        _controller_thread = threading.Thread(
-            target=_heading_speed_control_loop,
+def _start_sequential_waypoint_guidance(waypoints: list[tuple[float, float]], cmd_type: str = "waypoint"):
+    """
+    Spawns a background thread that executes the waypoint sequence one-by-one.
+    Replaces mission upload batch commands with dynamic 15Hz RC override tracking.
+    """
+    global _guidance_thread, _active_waypoints, _active_command_type, _last_rc_cmd_time
+
+    _stop_active_guidance_sync()
+    _last_rc_cmd_time = time.time()
+
+    with _guidance_lock:
+        _active_waypoints = list(waypoints)
+        _active_command_type = cmd_type
+
+    if _active_waypoints:
+        _guidance_stop_event.clear()
+        _guidance_thread = threading.Thread(
+            target=_run_sequential_waypoint_guidance_loop,
             daemon=True
         )
-        _controller_thread.start()
+        _guidance_thread.start()
 
-def _heading_speed_control_loop():
+
+def _run_sequential_waypoint_guidance_loop():
     """
-    15Hz Control Loop Thread: Calculates heading & speed error, computes PWMs, 
-    and streams MAVLink RC_CHANNELS_OVERRIDE messages to the Apache 3.
+    15Hz Guidance Loop: Dynamically guides the vessel through each waypoint using
+    Haversine distance checks and 15Hz discrete PID transfers from apache_hold_position.py.
     """
-    print("[CONTROLLER] Starting Heading/Speed controller loop...")
     global _last_rc_cmd_time
-    _last_rc_cmd_time = time.time()
-    dt = 1.0 / 15.0  # 15 Hz loop rate
+    print("[GUIDANCE] Starting Sequential Waypoint guidance loop...")
+
+    dt_ctl = 1.0 / 15.0  # 15 Hz loop rate
+    old_brg_2_wp = 0.0
+    old_hdg_ref = 0.0
     thr_1 = 0.0
     thr_2 = 0.0
     e_1 = 0.0
 
-    while not _controller_stop_event.is_set():
-        with _controller_target_lock:
-            target_hdg = _controller_targets["heading_deg"]
-            target_spd = _controller_targets["speed_mps"]
+    # Ensure vessel is in MANUAL mode for RC override control
+    with mav_master_lock:
+        if mav_master:
+            set_chcnav_mode(mav_master, CUSTOM_MODE_MANUAL)
 
-        with mav_master_lock:
-            master = mav_master
-            connected = system_status.get("cube_connected", False)
+    with _guidance_lock:
+        waypoints = list(_active_waypoints)
+        cmd_type = _active_command_type
 
-        if master and connected:
+    for idx, (lat_d, lon_d) in enumerate(waypoints, start=1):
+        print(f"[GUIDANCE] Heading to Waypoint {idx}/{len(waypoints)}: ({lat_d:.7f},{lon_d:.7f})")
 
-            # Stop controller if flight mode changed away from MANUAL
+        while not _guidance_stop_event.is_set():
+            # Abort if operator toggles physical controller mode switch away from MANUAL
             if system_status.get("flight_mode") not in ("MANUAL", "MODE_0"):
-                print("[CONTROLLER] Flight mode changed externally; disengaging controller.")
-                break
-            
-            # Pull vehicle position and velocity info.
+                print(f"[GUIDANCE] External mode change to {system_status.get('flight_mode')} detected! Aborting.")
+                behavior_tracker.finish(behavior_for_command(cmd_type))
+                return
+
+            with mav_master_lock:
+                master = mav_master
+                connected = system_status.get("cube_connected", False)
+
+            if not master or not connected:
+                time.sleep(dt_ctl)
+                continue
+
+            # Read latest vehicle position state
             with _vehicle_state_lock:
-                current_hdg = _vehicle_state.get("heading_deg", 0.0) or 0.0
-                current_lat = _vehicle_state.get("lat")
-                current_lon = _vehicle_state.get("lon")
-                current_vn = _vehicle_state.get("vn_ms", 0.0)
-                current_ve = _vehicle_state.get("ve_ms", 0.0)
+                lat = _vehicle_state.get("lat")
+                lon = _vehicle_state.get("lon")
+                current_hdg_deg = _vehicle_state.get("heading_deg", 0.0) or 0.0
+                vx = _vehicle_state.get("vn_ms", 0.0)
+                vy = _vehicle_state.get("ve_ms", 0.0)
 
-            _last_rc_cmd_time = time.time()  # <--- REFRESH WATCHDOG TIMER so behavior times out if messages aren't received at 2 Hz
+            if lat is None or lon is None:
+                time.sleep(dt_ctl)
+                continue
 
-            
-            # Measured speed. Only positive. 
-            u = math.sqrt(current_vn**2 + current_ve**2)
-            
-            # Measured heading.
-            hdg = current_hdg*math.pi/180.0 # (rad)
+            _last_rc_cmd_time = time.time()  # Refresh watchdog timestamp
 
-            # ---------------------------------------------------------------
-            # Calculate heading error.
-            # ---------------------------------------------------------------    
-            
-            # Wrap heading error in degrees (-180 to +180)
-            e_h_deg = (target_hdg - current_hdg + 180.0) % 360.0 - 180.0
-            e_h = math.radians(e_h_deg)
+            # 1. Measured scalar speed and heading in radians
+            u = math.sqrt(vx**2 + vy**2)
+            hdg = math.radians(current_hdg_deg)
 
-            # Steering command.
-            steer = 0.5*e_h   # proportional controller
-            
-            # Age variables.
-            steer_1 = steer 
-            
-            # ---------------------------------------------------------------
-            # Calculate speed error.
-            # ---------------------------------------------------------------    
-            e  = target_spd - u
+            # 2. Calculate range & bearing to active waypoint
+            rng_2_wp, brg_2_wp = haversine_calc(lat, lon, lat_d, lon_d)
 
-            thr = 1/(1+1.6*dt)*(-(-2-1.6*dt)*thr_1 - thr_2 + (0.26319*dt + 0.26319*1.33*dt**2)*e -0.26319*dt*e_1)
-            
-            # Age variables.
-            e_1   = e
+            # 3. Check Waypoint Arrival Criteria
+            if rng_2_wp <= SAR_ARRIVAL_RADIUS_M:
+                print(f"[GUIDANCE] Reached Waypoint {idx}/{len(waypoints)}! Distance: {rng_2_wp:.2f}m")
+                break  # Advance to next waypoint in list
+
+            u_ref = 1.0 if rng_2_wp > SAR_ARRIVAL_RADIUS_M else 0.0
+
+            # 4. Heading error with low-pass filter (2s)
+            hdg_ref = 0.875 * old_hdg_ref + 0.0625 * (brg_2_wp + old_brg_2_wp)
+            old_hdg_ref = hdg_ref
+            old_brg_2_wp = brg_2_wp
+
+            e_h = hdg_ref - hdg
+            if e_h > math.radians(180):
+                e_h -= math.radians(360)
+            if e_h < math.radians(-180):
+                e_h += math.radians(360)
+
+            steer = 0.5 * e_h
+
+            # 5. Speed error & discrete transfer function
+            e = u_ref - u
+            thr = (1.0 / (1.0 + 1.6 * dt_ctl)) * (
+                -(-2.0 - 1.6 * dt_ctl) * thr_1
+                - thr_2
+                + (0.26319 * dt_ctl + 0.26319 * 1.33 * (dt_ctl**2)) * e
+                - 0.26319 * dt_ctl * e_1
+            )
+            e_1 = e
             thr_2 = thr_1
             thr_1 = thr
 
+            # Clamp steering and throttle outputs
+            str_cmd = int(1500 + 500 * steer)
+            str_cmd = max(1100, min(1900, str_cmd))
 
-            # Act.
-            steering_pwm = int(1500 + 500*steer)
-            if steering_pwm < 1100:
-                steering_pwm = 1100
-            if steering_pwm > 1900:
-                steering_pwm = 1900
-            throttle_pwm = int(1500 + 500*thr)
-            if throttle_pwm < 1100:
-                throttle_pwm = 1100
-            if throttle_pwm > 1900:
-                throttle_pwm = 1900
+            thr_cmd = int(1500 + 500 * thr)
+            thr_cmd = max(1100, min(1900, thr_cmd))
 
-            """ # Print info to screen.
-                print(f"Run time : {int(hrs):02}:{int(mns):02}:{int(scs):02}")
-                print("----------------------------------------------------------")
-                print(f"Desired (lat,lon)        : ({lat_d:10.7f},{lon_d:10.7f})")
-                print(f"Actual  (lat,lon)        : ({lat:10.7f},{lon:10.7f})")
-                print(f"Range to WP          (m) : {rng_2_wp:6.1f}                         ")
-                print(f"Vehicle speed      (m/s) : {u:6.1f}                     ")
-                print()
-                print(f"Vehicle heading      (d) : {degrees(hdg):6.1f}                     ")
-                print(f"Bearing to WP        (d) : {degrees(brg_2_wp):6.1f}                ")
-                print(f"Steer cmd            (%) : {steer*100:6.1f}                         ")
-                print(f"Throttle cmd         (%) : {thr*100:6.1f}                         ")
-                print("----------------------------------------------------------")
-
-                # Update time epoch.
-                t_prt += 1 """
-
-            
-            # Example Placeholder:
-            #steering_pwm = 1500  # Replace with calculated steering PWM
-            #throttle_pwm = 1500  # Replace with calculated throttle PWM
-            # =================================================================
             try:
-                _send_raw_rc_override(master, steering_pwm=steering_pwm, throttle_pwm=throttle_pwm)
+                _send_raw_rc_override(master, steering_pwm=str_cmd, throttle_pwm=thr_cmd)
             except Exception as err:
-                print(f"[CONTROLLER] RC Override Send Error: {err}")
+                print(f"[GUIDANCE] RC Override Error: {err}")
 
-        time.sleep(dt)
+            time.sleep(dt_ctl)
 
-    # When controller exits, send neutral PWMs for safety
+    # Mission complete or stopped -> neutralize thrusters
     with mav_master_lock:
         if mav_master and system_status.get("cube_connected", False):
             try:
                 _send_raw_rc_override(mav_master, 1500, 1500)
+                set_chcnav_mode(mav_master, CUSTOM_MODE_LOITER)  # Engage station keeping
             except Exception:
                 pass
-    print("[CONTROLLER] Heading/Speed controller loop stopped.")
+    behavior_tracker.finish(behavior_for_command(cmd_type))
+    print("[GUIDANCE] Sequential Waypoint guidance loop complete.")
 
-def upload_mission_batch(master, waypoints: list[tuple[float, float]], append_terminal_loiter: bool = True) -> bool:
-    """
-    Uploads waypoints using CHCNav's MISSION_COUNT -> MISSION_ITEM handshake protocol.
-    Appends an Unlimited Loiter (Command 17) item at the final coordinate so the boat
-    automatically holds station upon completing the route.
-    """
-    target_sys = master.target_system or 1
-    target_comp = master.target_component or 1
-
-    formatted_wps = list(waypoints)
-    if append_terminal_loiter and formatted_wps:
-        formatted_wps.append(formatted_wps[-1])  # Repeat final position for Loiter item
-
-    count = len(formatted_wps) + 1  # Include Home Point at seq 0
-
-    print(f"[MISSION] Starting upload of {count} items to Apache USV...")
-    master.mav.mission_count_send(target_sys, target_comp, count)
-
-    for i in range(count):
-        msg = master.recv_match(type=['MISSION_REQUEST', 'MISSION_REQUEST_INT'], blocking=True, timeout=5.0)
-        if not msg:
-            print(f"[MISSION] Timeout waiting for item request {i}")
-            return False
-
-        seq = msg.seq
-        if seq == 0:
-            lat, lon = formatted_wps[0]
-            frame = mavutil.mavlink.MAV_FRAME_GLOBAL
-            cmd_id = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
-        elif append_terminal_loiter and seq == count - 1:
-            lat, lon = formatted_wps[seq - 1]
-            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-            cmd_id = 17  # MAV_CMD_NAV_LOITER_UNLIM
-        else:
-            lat, lon = formatted_wps[seq - 1]
-            frame = mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
-            cmd_id = mavutil.mavlink.MAV_CMD_NAV_WAYPOINT
-
-        master.mav.mission_item_send(
-            target_sys,
-            target_comp,
-            seq,
-            frame,
-            cmd_id,
-            0, 1, 0, 0, 0, 0,
-            lat, lon, 0.0
-        )
-
-    ack = master.recv_match(type='MISSION_ACK', blocking=True, timeout=5.0)
-    if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
-        print("[MISSION] Upload acknowledged and accepted!")
-        return True
-    print(f"[MISSION] Upload failed or rejected with ACK type: {getattr(ack, 'type', 'None')}")
-    return False
-
-def _run_single_waypoint(master, lat: float, lon: float):
-    _stop_active_controller_sync()
-    with _sar_mission_lock:
-        if upload_mission_batch(master, [(lat, lon)], append_terminal_loiter=True):
-            time.sleep(0.2)
-            set_chcnav_mode(master, CUSTOM_MODE_AUTO)
-        else:
-            behavior_tracker.finish(behavior_for_command("waypoint"))
-
-# Final search-grid waypoint; telemetry reports idle once the vehicle reaches it.
-_search_grid_end: tuple[float, float] | None = None
-
-
-def _check_search_grid_complete(lat: float, lon: float) -> None:
-    global _search_grid_end
-    end = _search_grid_end
-    if end is None:
-        return
-    if behavior_tracker.get() != behavior_for_command("search_grid"):
-        _search_grid_end = None
-        return
-    dlat = math.radians(end[0] - lat)
-    dlon = math.radians(end[1] - lon) * math.cos(math.radians(lat))
-    if math.hypot(dlat, dlon) * 6_371_000.0 <= SAR_ARRIVAL_RADIUS_M:
-        _search_grid_end = None
-        behavior_tracker.finish(behavior_for_command("search_grid"))
-
-
-def _run_search_grid(master, waypoints: list[tuple[float, float]]):
-    global _search_grid_end
-    _stop_active_controller_sync()
-    with _sar_mission_lock:
-        _search_grid_end = None
-        if upload_mission_batch(master, waypoints, append_terminal_loiter=True):
-            _search_grid_end = tuple(waypoints[-1]) if waypoints else None
-            time.sleep(0.2)
-            set_chcnav_mode(master, CUSTOM_MODE_AUTO)
-        else:
-            behavior_tracker.finish(behavior_for_command("search_grid"))
 
 def get_gps_fix_label(fix_type: int) -> str:
     fix_map = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
     return fix_map.get(fix_type, f"Fix {fix_type}")
+
 
 def create_video_stream_message(vehicle_id: str, video_url: str) -> dict:
     return {
@@ -673,13 +603,6 @@ def create_video_stream_message(vehicle_id: str, video_url: str) -> dict:
             "streams": [{"label": "Apache Video Stream", "url": video_url}]
         }
     }
-
-def _ui_ws_url(base_url: str) -> str:
-    base = base_url.rstrip("/")
-    marker = "/ws/vehicle"
-    if marker in base:
-        return f"{base.split(marker, 1)[0]}/ws/ship_state"
-    return base
 
 
 async def _rc_override_watchdog_loop():
@@ -697,10 +620,8 @@ async def _rc_override_watchdog_loop():
         if _last_rc_cmd_time > 0 and (now - _last_rc_cmd_time) > _RC_COMMAND_TIMEOUT_S:
             print("[WATCHDOG] Control stream timed out!")
 
-            # 1. Kill the running heading/speed control thread so it doesn't fight the watchdog
-            _stop_active_controller()
+            await _stop_active_controller()
 
-            # 2. Send neutral override commands (1500us) to stop thrusters and center rudder
             with mav_master_lock:
                 if mav_master and system_status.get("cube_connected", False):
                     try:
@@ -708,11 +629,10 @@ async def _rc_override_watchdog_loop():
                     except Exception as e:
                         print(f"[WATCHDOG] Error sending neutral safety command: {e}")
 
-            # 3. Reset watchdog timer to prevent repeated print/cmd spam
             _last_rc_cmd_time = 0.0
             behavior_tracker.finish(BEHAVIOR_MANUAL_CONTROL)
             behavior_tracker.finish(BEHAVIOR_RETURN_TO_BOAT)
-            print("[WATCHDOG] Control stream timed out! Active controller stopped & neutral commands dispatched.")
+
 
 # --- MAIN TELEMETRY & COMMAND LOOP ---
 
@@ -743,7 +663,7 @@ async def telemetry_loop(current_config: dict) -> None:
         system_status["cube_connected"] = True
         system_status["cube_status"] = "Connected"
         system_status["last_hb_time"] = time.time()
-        
+
         # Decode active mode from custom_mode integer
         custom_mode_val = getattr(msg, "custom_mode", 0)
         mode_names = {0: "MANUAL", 4: "HOLD", 10: "AUTO", 11: "RTL", 12: "LOITER", 15: "GUIDED"}
@@ -806,27 +726,31 @@ async def telemetry_loop(current_config: dict) -> None:
                             elif cmd_type in ("heading_speed", "rtb_follow"):
                                 target_hdg = float(command_data.get("heading", command_data.get("heading_deg", 0.0)))
                                 target_spd = float(command_data.get("speed_mps", command_data.get("speed", 1.5)))
-                                _start_heading_speed_control(target_hdg, target_spd)
+                                _start_sequential_waypoint_guidance([], cmd_type=cmd_type)
 
+                            # --- SINGLE WAYPOINT COMMAND ---
                             elif cmd_type == "waypoint":
                                 await _stop_active_controller()
                                 target = command_data.get("target", {})
                                 if "latitude" in target and "longitude" in target:
-                                    threading.Thread(
-                                        target=_run_single_waypoint,
-                                        args=(master, float(target["latitude"]), float(target["longitude"])),
-                                        daemon=True
-                                    ).start()
+                                    wps = [(float(target["latitude"]), float(target["longitude"]))]
+                                    _start_sequential_waypoint_guidance(wps, cmd_type="waypoint")
 
+                            # --- SEARCH GRID COMMAND ---
                             elif cmd_type == "search_grid":
+                                await _stop_active_controller()
                                 grid_wps = command_data.get("waypoints", [])
                                 if grid_wps:
                                     wps_tuples = [(float(pt[0]), float(pt[1])) for pt in grid_wps if len(pt) >= 2]
-                                    threading.Thread(
-                                        target=_run_search_grid,
-                                        args=(master, wps_tuples),
-                                        daemon=True
-                                    ).start()
+                                    _start_sequential_waypoint_guidance(wps_tuples, cmd_type="search_grid")
+
+                            # --- MAN OVERBOARD (MOB) COMMAND ---
+                            elif cmd_type == "mob":
+                                await _stop_active_controller()
+                                track_pts = command_data.get("track_points", [])
+                                if track_pts:
+                                    wps_tuples = [(float(pt[0]), float(pt[1])) for pt in track_pts if len(pt) >= 2]
+                                    _start_sequential_waypoint_guidance(wps_tuples, cmd_type="mob")
 
                             elif cmd_type == "rtb":
                                 await _stop_active_controller()
@@ -901,7 +825,6 @@ async def telemetry_loop(current_config: dict) -> None:
                         _vehicle_state["vn_ms"] = getattr(msg, "vx", 0) / 100.0
                         _vehicle_state["ve_ms"] = getattr(msg, "vy", 0) / 100.0
                         _vehicle_state["stamp"] = now
-                    _check_search_grid_complete(lat, lon)
                     telemetry_sample = (lat, lon, heading)
 
             # --- 4. Send WebSocket Telemetry ---
@@ -932,12 +855,13 @@ async def telemetry_loop(current_config: dict) -> None:
         system_status["ws_status"] = "Disconnected"
         traceback.print_exc()
     finally:
-        _stop_active_controller()
+        await _stop_active_controller()
         if ws is not None:
             try:
                 await ws.close()
             except Exception:
                 pass
+
 
 async def main():
     global config
@@ -955,6 +879,7 @@ async def main():
 
         print("Settings updated via web UI! Restarting telemetry connections...")
         telemetry_task.cancel()
+
 
 if __name__ == "__main__":
     try:
