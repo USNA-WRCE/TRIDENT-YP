@@ -10,6 +10,7 @@ Shipboard ground station for a Naval Academy Yard Patrol craft. The stack collec
 - [Quick start](#quick-start)
 - [User interface](#user-interface)
 - [Accounts and permissions](#accounts-and-permissions)
+- [Scripting and programmatic control](#scripting-and-programmatic-control)
 - [Voice commands](#voice-commands)
 - [Vehicle connections](#vehicle-connections)
 - [Commanding and mission planning](#commanding-and-mission-planning)
@@ -193,9 +194,45 @@ Administrators open **User Management** from the users icon. The panel creates a
 | `man_overboard` | Mission planning plus MOB dispatch |
 | `admin` | All operational permissions plus settings, connections, video streams, and user management |
 
-Custom permissions: `read_telemetry`, `read_vehicle_status`, `send_waypoint`, `send_rtb`, `set_vehicle_mode`, `cancel_sar`, `arm_disarm`, `create_mission`, `upload_mission`, `search_grid`, `trigger_mob`, `manage_sitl`, `manage_settings`, `manage_video_streams`, and `manage_users`.
+Custom permissions: `read_telemetry`, `read_vehicle_status`, `send_waypoint`, `send_rtb`, `set_vehicle_mode`, `cancel_sar`, `arm_disarm`, `create_mission`, `upload_mission`, `search_grid`, `trigger_mob`, `rc_override`, `manage_sitl`, `manage_settings`, `manage_video_streams`, and `manage_users`. `rc_override` (direct RC channel control from scripts) is only part of the `admin` role and must be granted explicitly otherwise.
 
 Accounts are stored in SQLite at `data/auth/auth.db`, mounted into `yp-server` as `/data/auth/auth.db`. They persist across rebuilds and container recreation. Deleting the database intentionally resets the store to `admin` / `admin`; the database contains password hashes and is excluded from Git.
+
+## Scripting and programmatic control
+
+Programmers can command vehicles and read their state from scripts, in parallel with the web UI. Script commands take exactly the same path as UI commands: waypoints, search grids, and mission routes are drawn on every operator's map, the command is forwarded to the vehicle, and it is logged with `source=api` and the caller's username.
+
+**1. Create a service token** (admin). In `POST /api/auth/service-tokens` give a `name` and either a `permission_level` (default `waypoint_command`) or an explicit `permissions` list, optionally `expires_days` (default 365, max 3650). The response contains the token once; store it like a password. List with `GET /api/auth/service-tokens` and revoke with `DELETE /api/auth/service-tokens/{name}`. Each token is a normal account named `svc-<name>` with the permissions you chose, so the server enforces the same checks as for people. Always set a unique `JWT_SECRET`, since tokens are signed with it.
+
+**2. Send commands.** `POST /api/vehicles/{vehicle_id}/command` with `Authorization: Bearer <token>` and the command as the JSON body:
+
+```bash
+curl -X POST https://server/api/vehicles/boat-01/command \
+  -H "Authorization: Bearer $TRIDENT_TOKEN" -H "Content-Type: application/json" \
+  -d '{"type": "waypoint", "target": {"latitude": 38.98, "longitude": -76.48}}'
+```
+
+A `200` response means the command was queued to the vehicle: `{"ok": true, "delivered": true, "ack": {"command_id", "vehicle_id", "source": "api", "issued_by", "stamp", "command"}}`. The same ack, with the same `command_id`, is broadcast to UIs and `/ws/api`. It confirms delivery to the vehicle bridge, not completion. Errors: `400` invalid command, `401` bad token, `403` missing permission, `404` unknown vehicle, `409` vehicle not connected.
+
+| `type` | Fields | Permission |
+| --- | --- | --- |
+| `waypoint` | `target: {latitude, longitude, altitude?}` | `send_waypoint` |
+| `mission_plan` | `waypoints: [{latitude, longitude, altitude, acceptance_radius_m?, hold_time_s?}]`, `auto_arm_start?`, `force_guided_on_complete?` | `upload_mission` |
+| `ship_relative_trajectory` | `ship_vehicle_id`, `local_waypoints: [{x, y, z, yaw_deg?}]` (x right, y ahead, z up, meters), `arrival_radius_m?`, `update_hz?`, `face_ship?`, `loop_count?`, `hold_last_waypoint?` | `upload_mission` |
+| `search_grid` | `lat`, `lon`, `grid_size_m?`, `swath_m?`, `altitude_m?` | `search_grid` |
+| `rtb`, `land_on_boat` | none | `send_rtb` |
+| `arm`, `disarm`, `takeoff` | `takeoff`: `altitude_m?` | `arm_disarm` |
+| `set_mode` | `mode` | `set_vehicle_mode` |
+| `cancel_sar`, `clear_sar_pattern` | none | `cancel_sar` |
+| `set_velocity` | `speed_ms`, `heading_deg`, `vertical_ms?` (up) | `send_waypoint` |
+| `set_heading` | `heading_deg` | `send_waypoint` |
+| `rc_override` | `channels: {"1": 1500, ...}` PWM, `0` releases a channel | `rc_override` |
+
+`set_velocity`, `set_heading`, and `rc_override` are streaming setpoints: the autopilot drops them after a few seconds, so resend them from a control loop. They are currently executed by the BlueBoat bridge and the server-side SITL bridge; other bridges ignore them until the same handlers (see `yp_common/direct_control.py`) are added.
+
+**3. Read state.** `GET /api/fleet/state` and `GET /api/vehicles/{id}/state` (permission `read_telemetry`) return position, heading, estimated velocity (north/east/speed/course, derived by the server from successive fixes), mode, armed state, behavior, battery, GPS fix, and, for one vehicle, its active map overlays. For control loops, connect to the `/ws/api` WebSocket (same bearer header): you get a `snapshot`, then a `state` message on every vehicle update and every `command_ack`; send `{"op": "subscribe", "vehicle_ids": [...]}` to filter. Orientation is limited to heading; bridges do not report roll or pitch.
+
+**4. Use the Python client.** [`clients/python`](clients/python/README.md) wraps all of the above (`goto`, `rtb`, `mission`, `ship_relative_mission`, `set_velocity`, `rc_override`, `state`, `stream`) so scripts name the vehicle in each call.
 
 ## Voice commands
 

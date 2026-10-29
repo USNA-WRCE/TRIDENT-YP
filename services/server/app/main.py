@@ -12,6 +12,7 @@ import queue as _stdlib_queue
 import re
 import threading
 import time
+import uuid
 import zlib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -33,6 +34,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+from app.api_commands import COMMAND_PERMISSIONS, CommandValidationError, normalize_api_command
 from app.auth import init_database, get_current_user, require_permission
 from app.auth_routes import router as auth_router
 from app.axis_cameras import cameras as axis_camera_registry, coordinate_tracking, is_coordinated_tracking, is_tracking, router as axis_camera_router, set_broadcast_callback as set_axis_camera_broadcast, track_from_detections, load_persisted_settings as load_axis_camera_settings
@@ -63,6 +65,7 @@ from app.voice_synthesis import (
 
 # Import deconfliction module
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
+from yp_common import direct_control as _direct_control
 from yp_common.geometry import bearing_degrees as _bearing_degrees
 from yp_common.telemetry import (
     BEHAVIOR_IDLE,
@@ -165,6 +168,8 @@ vehicles: dict[str, dict[str, Any]] = {}
 video_streams: dict[str, dict[str, Any]] = {}
 vehicle_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 ui_connections: set[WebSocket] = set()
+# Programmatic-API streams: websocket -> vehicle-id filter (None = all vehicles).
+api_connections: dict[WebSocket, Optional[set[str]]] = {}
 ros_connections: dict[WebSocket, set[str]] = defaultdict(set)
 state_lock = asyncio.Lock()
 
@@ -1511,6 +1516,15 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> bool:
             0, 0, 0, 0, float("nan"), 0, 0, altitude_m,
         )
 
+    elif cmd_type == "set_velocity":
+        _direct_control.send_velocity(master, _mavutil, command)
+
+    elif cmd_type == "set_heading":
+        _direct_control.send_heading(master, _mavutil, command)
+
+    elif cmd_type == "rc_override":
+        _direct_control.send_rc_override(master, command)
+
     elif cmd_type == "rtcm_data":
         flags = command.get("flags", 0)
         data_len = command.get("len", 0)
@@ -2031,6 +2045,129 @@ async def get_vehicle(vehicle_id: str) -> JSONResponse:
     return JSONResponse(public_vehicle(vehicle))
 
 
+def _authenticate_api(authorization: Optional[str], permission: Optional[str] = None) -> tuple[Optional[Any], Optional[JSONResponse]]:
+    """Resolve the bearer-token user for the programmatic API; returns (user, error_response)."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None, JSONResponse({"error": "missing or invalid authorization header"}, status_code=401)
+    user = get_current_user(authorization[7:])
+    if not user or not user.active:
+        return None, JSONResponse({"error": "invalid or expired token"}, status_code=401)
+    if permission and not user.has_permission(permission):
+        return None, JSONResponse({"error": "insufficient permissions", "required_permission": permission}, status_code=403)
+    return user, None
+
+
+def api_vehicle_state(vehicle: dict[str, Any]) -> dict[str, Any]:
+    """Compact, script-friendly vehicle state. Velocity is estimated from successive position fixes."""
+    vehicle_id = str(vehicle.get("vehicle_id") or "")
+    with _sitl_nav_lock:
+        nav = dict(_sitl_nav_states.get(vehicle_id, {}))
+    north, east = float(nav.get("vn_ms", 0.0)), float(nav.get("ve_ms", 0.0))
+    speed = math.hypot(north, east)
+    last_seen = vehicle.get("last_seen")
+    return {
+        "vehicle_id": vehicle_id,
+        "vehicle_type": vehicle.get("vehicle_type"),
+        "connected": vehicle_id in vehicle_queues,
+        "stamp": last_seen,
+        "age_s": (time.time() - float(last_seen)) if last_seen else None,
+        "position": vehicle.get("position"),
+        "heading_deg": vehicle.get("heading"),
+        "velocity": {
+            "north_ms": north,
+            "east_ms": east,
+            "speed_ms": speed,
+            "course_deg": math.degrees(math.atan2(east, north)) % 360.0 if speed > 0.2 else None,
+        },
+        "mode": vehicle.get("mode"),
+        "armed": vehicle.get("armed"),
+        "behavior": vehicle.get("behavior"),
+        "autopilot": vehicle.get("autopilot"),
+        "battery": vehicle.get("battery"),
+        "gps_fix": vehicle.get("gps_fix"),
+    }
+
+
+@app.get("/api/fleet/state")
+async def api_fleet_state(authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+    """Authenticated state of every connected vehicle for scripted control loops."""
+    _, error = _authenticate_api(authorization, "read_telemetry")
+    if error:
+        return error
+    async with state_lock:
+        states = [api_vehicle_state(vehicle) for vehicle in vehicles.values()]
+    return JSONResponse({"stamp": time.time(), "vehicles": states})
+
+
+@app.get("/api/vehicles/{vehicle_id}/state")
+async def api_single_vehicle_state(vehicle_id: str, authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+    """Authenticated state of one vehicle, including its active map overlays."""
+    _, error = _authenticate_api(authorization, "read_telemetry")
+    if error:
+        return error
+    async with state_lock:
+        vehicle = vehicles.get(vehicle_id)
+        state = api_vehicle_state(vehicle) if vehicle else None
+    if state is None:
+        return JSONResponse({"error": "vehicle not found"}, status_code=404)
+    state["overlays"] = {
+        "waypoint": shared_waypoints.get(vehicle_id),
+        "mission_plan": shared_mission_plans.get(vehicle_id),
+        "sar_pattern": shared_sar_patterns.get(vehicle_id),
+        "ship_relative_plan": shared_ship_relative_plans.get(vehicle_id),
+    }
+    state["stamp_server"] = time.time()
+    return JSONResponse(state)
+
+
+@app.post("/api/vehicles/{vehicle_id}/command")
+async def api_vehicle_command(
+    vehicle_id: str,
+    command: dict[str, Any] = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Send a command to one vehicle on behalf of an API user.
+
+    The request body is the command itself (e.g. ``{"type": "waypoint", "target": {...}}``). The command takes
+    exactly the path of a UI command, so map overlays update for every operator, and is attributed to the caller.
+    """
+    cmd_type = command.get("type")
+    required_permission = COMMAND_PERMISSIONS.get(cmd_type)
+    if required_permission is None:
+        _, error = _authenticate_api(authorization)
+        return error or JSONResponse({"error": f"unsupported command type: {cmd_type!r}"}, status_code=400)
+    user, error = _authenticate_api(authorization, required_permission)
+    if error:
+        return error
+
+    async with state_lock:
+        vehicle = vehicles.get(vehicle_id)
+        position = dict(vehicle.get("position") or {}) if vehicle else {}
+        ship_known = command.get("ship_vehicle_id") in vehicles
+    if vehicle is None:
+        return JSONResponse({"error": "vehicle not found"}, status_code=404)
+    if vehicle_id not in vehicle_queues:
+        return JSONResponse({"error": "vehicle not connected", "delivered": False}, status_code=409)
+    try:
+        clean = normalize_api_command(command, default_altitude=position.get("altitude"))
+    except CommandValidationError as error:
+        return JSONResponse({"error": str(error)}, status_code=400)
+    if clean["type"] == "ship_relative_trajectory" and not ship_known:
+        return JSONResponse({"error": f"ship vehicle not found: {clean['ship_vehicle_id']}"}, status_code=404)
+
+    ack = await route_command(vehicle_id, clean, source="api", issued_by=user.username)
+    if ack is None:
+        return JSONResponse({"error": "command was not routed"}, status_code=500)
+    delivered = bool(ack.get("delivered"))
+    body = {
+        "ok": delivered,
+        "delivered": delivered,
+        "ack": {key: ack[key] for key in ("command_id", "vehicle_id", "source", "issued_by", "stamp", "command") if key in ack},
+    }
+    if not delivered:
+        body["error"] = "vehicle disconnected before the command could be delivered"
+    return JSONResponse(body, status_code=200 if delivered else 409)
+
 def _select_yp_vehicle_locked() -> Optional[dict[str, Any]]:
     """Pick the mother-vessel source while holding ``state_lock``.
 
@@ -2272,11 +2409,44 @@ async def ui_ws(websocket: WebSocket, token: Optional[str] = None) -> None:
                         "command_type": cmd_type
                     })
                     continue
-                await route_command(payload.get("vehicle_id"), payload.get("command", {}), source="ui")
+                await route_command(payload.get("vehicle_id"), payload.get("command", {}), source="ui", issued_by=user.username)
     except WebSocketDisconnect:
         pass
     finally:
         ui_connections.discard(websocket)
+
+
+@app.websocket("/ws/api")
+async def api_ws(websocket: WebSocket) -> None:
+    """Stream vehicle state and command acks to scripts.
+
+    Authenticate with an ``Authorization: Bearer <token>`` header (or the auth cookie). After the initial
+    ``snapshot`` the client may send ``{"op": "subscribe", "vehicle_ids": [...]}`` to filter; null means all.
+    """
+    await websocket.accept()
+    authorization = websocket.headers.get("authorization")
+    if not authorization and websocket.cookies.get("auth_token"):
+        authorization = f"Bearer {websocket.cookies['auth_token']}"
+    _, error = _authenticate_api(authorization, "read_telemetry")
+    if error:
+        await websocket.send_json({"error": "Authentication required or insufficient permissions."})
+        await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    api_connections[websocket] = None
+    try:
+        async with state_lock:
+            await websocket.send_json({"op": "snapshot", "vehicles": [api_vehicle_state(v) for v in vehicles.values()]})
+        while True:
+            message = await websocket.receive_json()
+            if isinstance(message, dict) and message.get("op") == "subscribe":
+                ids = message.get("vehicle_ids")
+                api_connections[websocket] = {str(i) for i in ids} if isinstance(ids, list) and ids else None
+                await websocket.send_json({"op": "subscribed", "vehicle_ids": sorted(api_connections[websocket] or [])})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        api_connections.pop(websocket, None)
 
 
 @app.websocket("/ws/ship_state")
@@ -2312,25 +2482,7 @@ def _check_command_permission(user: "User", cmd_type: Optional[str]) -> bool:
     if not user or not user.active:
         return False
     
-    # Map command types to required permissions
-    command_permissions = {
-        "waypoint": "send_waypoint",
-        "rtb": "send_rtb",
-        "set_mode": "set_vehicle_mode",
-        "cancel_sar": "cancel_sar",
-        "search_grid": "search_grid",
-        "mob": "trigger_mob",
-        "land_on_boat": "send_rtb",
-        "clear_sar_pattern": "cancel_sar",
-        "mission_plan": "upload_mission",
-        "ship_relative_trajectory": "upload_mission",
-        "trajectory": "send_waypoint",
-        "arm": "arm_disarm",
-        "disarm": "arm_disarm",
-        "takeoff": "arm_disarm",
-    }
-    
-    required_permission = command_permissions.get(cmd_type)
+    required_permission = COMMAND_PERMISSIONS.get(cmd_type)
     if not required_permission:
         return False
     
@@ -2814,10 +2966,15 @@ def _compute_sar_waypoints(command: dict[str, Any]) -> list[list[float]]:
         return []
 
 
-async def route_command(vehicle_id: Optional[str], command: dict[str, Any], source: str) -> None:
-    """Route an operator command to a vehicle, handling RTB-follow and SAR pattern broadcast specially."""
+async def route_command(
+    vehicle_id: Optional[str], command: dict[str, Any], source: str, issued_by: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Route an operator command to a vehicle, handling RTB-follow and SAR pattern broadcast specially.
+
+    Returns the command ack (including ``command_id`` and ``delivered``), or None when no vehicle was given.
+    """
     if not vehicle_id:
-        return
+        return None
 
     cmd_type = command.get("type")
     is_temporary_avoidance = source == "deconfliction"
@@ -2858,8 +3015,7 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
     if cmd_type == "clear_sar_pattern":
         if shared_sar_patterns.pop(vehicle_id, None) is not None:
             await broadcast_ui({"op": "sar_pattern_cleared", "vehicle_id": vehicle_id})
-        await _emit_command_ack(vehicle_id, command, source)
-        return
+        return await _emit_command_ack(vehicle_id, command, source, issued_by)
 
     # Any operator command except RTB or Land should terminate active RTB-follow / Landing
     if source not in ("rtb_follow", "land_on_boat") and cmd_type not in ("rtb", "land_on_boat"):
@@ -2870,14 +3026,12 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
         if vehicle_id in vehicles:
             await _update_deconfliction_state(vehicle_id, vehicles[vehicle_id], command)
         await _start_rtb_follow(vehicle_id, source)
-        await _emit_command_ack(vehicle_id, command, source)
-        return
+        return await _emit_command_ack(vehicle_id, command, source, issued_by)
 
     # HANDLER FOR LAND COMMANDS
     if cmd_type == "land_on_boat":
         await _start_land_on_boat(vehicle_id, source)
-        await _emit_command_ack(vehicle_id, command, source)
-        return
+        return await _emit_command_ack(vehicle_id, command, source, issued_by)
 
     # Broadcast SAR flight-path pattern to the UI before dispatching
     if cmd_type in ("search_grid", "mob"):
@@ -2943,13 +3097,14 @@ async def route_command(vehicle_id: Optional[str], command: dict[str, Any], sour
     if vehicle_id in vehicles and not is_temporary_avoidance:
         await _update_deconfliction_state(vehicle_id, vehicles[vehicle_id], command)
 
-    await _dispatch_vehicle_command(
+    return await _dispatch_vehicle_command(
         vehicle_id,
         command,
         source,
         emit_ack=True,
         write_log=True,
         sar_cancelled=sar_cancelled if cmd_type == "cancel_sar" else None,
+        issued_by=issued_by,
     )
 
 
@@ -2961,6 +3116,7 @@ async def _dispatch_vehicle_command(
     emit_ack: bool,
     write_log: bool,
     sar_cancelled: Optional[bool] = None,
+    issued_by: Optional[str] = None,
 ) -> dict[str, Any]:
     """Queue a command for delivery to a vehicle, optionally logging and acking it."""
     if vehicle_id in sitl_bridges:
@@ -2969,11 +3125,14 @@ async def _dispatch_vehicle_command(
             _set_sitl_behavior(vehicle_id, behavior)
     payload = {
         "op": "command",
+        "command_id": uuid.uuid4().hex,
         "vehicle_id": vehicle_id,
         "source": source,
         "stamp": time.time(),
         "command": command,
     }
+    if issued_by:
+        payload["issued_by"] = issued_by
     queue = vehicle_queues.get(vehicle_id)
     if queue:
         await queue.put(payload)
@@ -2987,7 +3146,7 @@ async def _dispatch_vehicle_command(
             vehicle_id,
             infer_vehicle_type(vehicle_id),
             payload["stamp"],
-            {**command, "command_type": command.get("type")},
+            {**command, "command_type": command.get("type"), "source": source, "issued_by": issued_by},
         )
         await broadcast_ros(f"/vehicles/{vehicle_id}/commands", command, "yp_ground_station/Command")
 
@@ -3001,25 +3160,31 @@ async def _dispatch_vehicle_command(
     return payload
 
 
-async def _emit_command_ack(vehicle_id: str, command: dict[str, Any], source: str) -> None:
+async def _emit_command_ack(
+    vehicle_id: str, command: dict[str, Any], source: str, issued_by: Optional[str] = None,
+) -> dict[str, Any]:
     """Log a command and broadcast a command_ack event without queuing delivery."""
     payload = {
         "op": "command_ack",
+        "command_id": uuid.uuid4().hex,
         "vehicle_id": vehicle_id,
         "source": source,
         "stamp": time.time(),
         "command": command,
         "delivered": vehicle_id in vehicle_queues,
     }
+    if issued_by:
+        payload["issued_by"] = issued_by
     write_influx(
         "command",
         vehicle_id,
         infer_vehicle_type(vehicle_id),
         payload["stamp"],
-        {**command, "command_type": command.get("type")},
+        {**command, "command_type": command.get("type"), "source": source, "issued_by": issued_by},
     )
     await broadcast_ui(payload)
     await broadcast_ros(f"/vehicles/{vehicle_id}/commands", command, "yp_ground_station/Command")
+    return payload
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -3583,8 +3748,31 @@ async def broadcast_ui(payload: dict[str, Any]) -> None:
             stale.append(websocket)
     for websocket in stale:
         ui_connections.discard(websocket)
+    if api_connections:
+        await _broadcast_api(payload)
 
 
+async def _broadcast_api(payload: dict[str, Any]) -> None:
+    """Forward state updates, acks and removals from the UI event stream to subscribed API clients."""
+    op = payload.get("op")
+    if op == "vehicle_update":
+        vehicle_id = str((payload.get("vehicle") or {}).get("vehicle_id") or "")
+        message = {"op": "state", "vehicle": api_vehicle_state(payload["vehicle"])}
+    elif op in ("command_ack", "vehicle_removed"):
+        vehicle_id = str(payload.get("vehicle_id") or "")
+        message = {key: value for key, value in payload.items()}
+    else:
+        return
+    stale: list[WebSocket] = []
+    for websocket, wanted in list(api_connections.items()):
+        if wanted is not None and vehicle_id not in wanted:
+            continue
+        try:
+            await websocket.send_json(message)
+        except Exception:
+            stale.append(websocket)
+    for websocket in stale:
+        api_connections.pop(websocket, None)
 async def broadcast_ros(topic: str, msg: dict[str, Any], msg_type: str) -> None:
     """Publish a message to rosbridge clients subscribed to its topic (or \"*\")."""
     stale: list[WebSocket] = []

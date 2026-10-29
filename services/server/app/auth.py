@@ -6,6 +6,7 @@ via SQLite backend.
 import hashlib
 import hmac
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +31,7 @@ _PERMISSION_ADDITIONS = {
     "waypoint_command": ["send_waypoint", "send_rtb", "set_vehicle_mode", "cancel_sar", "arm_disarm"],
     "mission_planning": ["create_mission", "upload_mission", "search_grid"],
     "man_overboard": ["trigger_mob"],
-    "admin": ["manage_sitl", "manage_users", "manage_settings", "manage_video_streams", "control_cameras"],
+    "admin": ["manage_sitl", "manage_users", "manage_settings", "manage_video_streams", "control_cameras", "rc_override"],
 }
 PERMISSION_LEVELS: dict[str, list[str]] = {}
 _granted_permissions: list[str] = []
@@ -92,6 +93,20 @@ class UserPermission(Base):
     user = relationship("User", back_populates="permissions")
 
 
+class ServiceToken(Base):
+    """Long-lived API token bound to a service-account user; revocable by jti."""
+    __tablename__ = "service_tokens"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(40), unique=True, nullable=False, index=True)
+    username = Column(String(50), nullable=False)
+    jti = Column(String(64), unique=True, nullable=False, index=True)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    revoked = Column(Boolean, default=False, nullable=False)
+
+
 def init_database() -> None:
     """Initialize the SQLite database with schema. Creates default admin if needed."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +140,9 @@ def init_database() -> None:
             if "send_waypoint" in granted and "arm_disarm" not in granted:
                 session.add(UserPermission(user_id=user.id, permission="arm_disarm"))
                 print(f"[AUTH] Backfilled 'arm_disarm' permission for existing user '{user.username}'")
+            if "manage_users" in granted and "rc_override" not in granted:
+                session.add(UserPermission(user_id=user.id, permission="rc_override"))
+                print(f"[AUTH] Backfilled 'rc_override' permission for existing user '{user.username}'")
             if "manage_video_streams" in granted and "control_cameras" not in granted:
                 session.add(UserPermission(user_id=user.id, permission="control_cameras"))
                 print(f"[AUTH] Backfilled 'control_cameras' permission for existing user '{user.username}'")
@@ -190,9 +208,15 @@ def get_current_user(token: Optional[str]) -> Optional[User]:
     username = payload.get("sub")
     if not username:
         return None
-    
+
+    service_token_name = None
     session = get_db_session()
     try:
+        if payload.get("typ") == "service":
+            record = session.query(ServiceToken).filter_by(jti=str(payload.get("jti") or "")).first()
+            if not record or record.revoked or record.username != username:
+                return None
+            service_token_name = record.name
         user = (
             session.query(User)
             .options(selectinload(User.permissions))
@@ -203,7 +227,95 @@ def get_current_user(token: Optional[str]) -> Optional[User]:
             # WebSocket handlers retain this instance after the session closes.
             # Materialize the relationship so permission checks cannot lazy-load.
             list(user.permissions)
+            user.service_token_name = service_token_name
         return user
+    finally:
+        session.close()
+
+
+SERVICE_TOKEN_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+SERVICE_USER_PREFIX = "svc-"
+MAX_SERVICE_TOKEN_DAYS = 3650
+
+
+def create_service_token(
+    name: str, created_by: Optional[str], permissions: Set[str], expires_days: int,
+) -> tuple[bool, str, Optional[str], Optional[datetime]]:
+    """Create a service-account user and a revocable long-lived token. Returns (ok, message, token, expires_at)."""
+    if not SERVICE_TOKEN_NAME_PATTERN.match(name):
+        return False, "name must be 1-40 characters of letters, digits, '_' or '-'", None, None
+    invalid = permissions - VALID_PERMISSIONS
+    if invalid:
+        return False, f"Invalid permissions: {', '.join(sorted(invalid))}", None, None
+    if not 1 <= expires_days <= MAX_SERVICE_TOKEN_DAYS:
+        return False, f"expires_days must be between 1 and {MAX_SERVICE_TOKEN_DAYS}", None, None
+
+    username = f"{SERVICE_USER_PREFIX}{name}"
+    session = get_db_session()
+    try:
+        stale = session.query(ServiceToken).filter_by(name=name, revoked=True).first()
+        if stale:
+            session.delete(stale)
+            session.flush()
+        if session.query(ServiceToken).filter_by(name=name).first() or session.query(User).filter_by(username=username).first():
+            return False, f"Service account '{name}' already exists", None, None
+        user = User(username=username, password_hash=hash_password(secrets.token_urlsafe(48)), active=True)
+        session.add(user)
+        session.flush()
+        for permission in sorted(permissions):
+            session.add(UserPermission(user_id=user.id, permission=permission))
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=expires_days)
+        jti = secrets.token_urlsafe(24)
+        session.add(ServiceToken(name=name, username=username, jti=jti, created_by=created_by, expires_at=expires_at))
+        session.commit()
+        token = jwt.encode(
+            {"sub": username, "typ": "service", "iat": now, "exp": expires_at, "jti": jti},
+            JWT_SECRET, algorithm=JWT_ALGORITHM,
+        )
+        return True, f"Service account '{username}' created", token, expires_at
+    except Exception as error:
+        session.rollback()
+        return False, f"Error creating service token: {error}", None, None
+    finally:
+        session.close()
+
+
+def list_service_tokens() -> list[dict]:
+    """List service tokens (never the token values)."""
+    session = get_db_session()
+    try:
+        return [
+            {
+                "name": record.name,
+                "username": record.username,
+                "created_by": record.created_by,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "expires_at": record.expires_at.isoformat() if record.expires_at else None,
+                "revoked": record.revoked,
+            }
+            for record in session.query(ServiceToken).order_by(ServiceToken.created_at).all()
+        ]
+    finally:
+        session.close()
+
+
+def revoke_service_token(name: str) -> tuple[bool, str]:
+    """Revoke a service token and remove its service-account user."""
+    session = get_db_session()
+    try:
+        record = session.query(ServiceToken).filter_by(name=name, revoked=False).first()
+        if not record:
+            return False, f"Service token '{name}' not found"
+        record.revoked = True
+        user = session.query(User).filter_by(username=record.username).first()
+        if user:
+            session.delete(user)
+        session.commit()
+        return True, f"Service token '{name}' revoked"
+    except Exception as error:
+        session.rollback()
+        return False, f"Error revoking service token: {error}"
     finally:
         session.close()
 

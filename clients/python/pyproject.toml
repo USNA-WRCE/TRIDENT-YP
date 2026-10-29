@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trident-client"
+version = "0.1.0"
+description = "Python client for commanding TRIDENT unmanned vehicles through the ground-station server"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.28"]
+
+[project.optional-dependencies]
+stream = ["websockets>=11"]
+
+[tool.setuptools]
+packages = ["trident_client"]

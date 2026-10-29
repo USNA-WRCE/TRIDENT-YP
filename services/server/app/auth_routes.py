@@ -8,7 +8,8 @@ from fastapi import APIRouter, Body, Header, Request
 from fastapi.responses import JSONResponse
 
 from app.auth import (
-    User, create_access_token, create_user, delete_user, get_current_user,
+    MAX_SERVICE_TOKEN_DAYS, PERMISSION_LEVELS, User, create_service_token, list_service_tokens,
+    revoke_service_token, create_access_token, create_user, delete_user, get_current_user,
     get_db_session, list_users, record_login, require_permission,
     set_user_permissions, update_user_password, update_user_permissions,
     verify_password,
@@ -188,4 +189,65 @@ async def update_password_endpoint(
     if not success:
         return JSONResponse({"error": message}, status_code=400)
 
+    return JSONResponse({"ok": True, "message": message})
+
+
+@router.post("/api/auth/service-tokens")
+async def create_service_token_endpoint(
+    payload: dict[str, Any] = Body(default={}),
+    authorization: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Create a service account and long-lived API token (admin only). The token is returned once."""
+    authorization_error = require_permission(authorization, "manage_users")
+    if authorization_error:
+        return authorization_error
+    admin = get_current_user(authorization[7:] if authorization else None)
+
+    name = str(payload.get("name") or "").strip()
+    permissions = payload.get("permissions")
+    if isinstance(permissions, list):
+        if not all(isinstance(permission, str) for permission in permissions):
+            return JSONResponse({"error": "permissions must be a list of strings"}, status_code=400)
+        granted = set(permissions)
+    else:
+        level = str(payload.get("permission_level") or "waypoint_command").strip()
+        if level not in PERMISSION_LEVELS:
+            return JSONResponse({"error": f"Invalid permission level: {level}"}, status_code=400)
+        granted = set(PERMISSION_LEVELS[level])
+    try:
+        expires_days = int(payload.get("expires_days") or 365)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": f"expires_days must be an integer up to {MAX_SERVICE_TOKEN_DAYS}"}, status_code=400)
+
+    success, message, token, expires_at = create_service_token(name, admin.username if admin else None, granted, expires_days)
+    if not success:
+        return JSONResponse({"error": message}, status_code=400)
+    return JSONResponse({
+        "ok": True,
+        "message": message,
+        "token": token,
+        "username": f"svc-{name}",
+        "permissions": sorted(granted),
+        "expires_at": expires_at.isoformat() if expires_at else None,
+    })
+
+
+@router.get("/api/auth/service-tokens")
+async def list_service_tokens_endpoint(authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+    """List service tokens without their secret values (admin only)."""
+    authorization_error = require_permission(authorization, "manage_users")
+    if authorization_error:
+        return authorization_error
+    return JSONResponse({"tokens": list_service_tokens()})
+
+
+@router.delete("/api/auth/service-tokens/{name}")
+async def revoke_service_token_endpoint(name: str, authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+    """Revoke a service token and delete its service account (admin only)."""
+    authorization_error = require_permission(authorization, "manage_users")
+    if authorization_error:
+        return authorization_error
+    success, message = revoke_service_token(name)
+    if not success:
+        return JSONResponse({"error": message}, status_code=404)
     return JSONResponse({"ok": True, "message": message})

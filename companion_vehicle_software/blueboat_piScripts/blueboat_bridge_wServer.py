@@ -14,6 +14,7 @@ from pymavlink import mavutil
 import websockets
 
 import sar_missions
+from yp_common import direct_control
 from yp_common.geometry import (
     bearing_degrees as _bearing_degrees,
     destination_point as _destination_point,
@@ -924,6 +925,12 @@ async def telemetry_loop(current_config: dict) -> None:
                                 threading.Thread(target=_run_mission_plan, args=(master, command_data["waypoints"], bool(command_data.get("auto_arm_start", True)), bool(command_data.get("force_guided_on_complete", False))), daemon=True).start()
                             elif cmd_type == "set_mode" and command_data.get("mode"):
                                 sar_missions.set_mode(master, str(command_data["mode"]), wait_for_ack=False)
+                            elif cmd_type == "set_velocity":
+                                direct_control.send_velocity(master, mavutil, command_data)
+                            elif cmd_type == "set_heading":
+                                direct_control.send_heading(master, mavutil, command_data)
+                            elif cmd_type == "rc_override":
+                                direct_control.send_rc_override(master, command_data)
                     except json.JSONDecodeError: pass
                 except asyncio.TimeoutError:
                     pass
