@@ -226,14 +226,16 @@ HTML_TEMPLATE = """
         <button type="submit">Save & Restart Telemetry Stream</button>
     </form>
 
-    <h2>Flight Logs</h2>
-    <div class="diag-card">
+    
+    <!-- h2>Flight Logs</h2 -->
+    <!-- div class="diag-card">
         <div class="log-row">
             <select id="log_select"><option value="">Loading...</option></select>
             <button type="button" onclick="downloadSelectedLog()">Download</button>
         </div>
         <div id="log_empty" class="log-empty" style="display: none; margin-top: 10px;">No flight logs found on this device yet. Logs auto-download here when the vehicle disarms.</div>
-    </div>
+    </div -->
+
 
     <script>
         function toggleCustomUrl() {{
@@ -278,7 +280,7 @@ HTML_TEMPLATE = """
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
         }}
 
-        async function fetchLogs() {{
+        /* async function fetchLogs() {{
             try {{
                 const res = await fetch('/api/logs');
                 const logs = await res.json();
@@ -302,15 +304,17 @@ HTML_TEMPLATE = """
                 if (logs.some(log => log.name === previous)) select.value = previous;
             }} catch (e) {{ console.error("Failed fetching logs", e); }}
         }}
+        */
 
-        function downloadSelectedLog() {{
+        /* function downloadSelectedLog() {{
             const select = document.getElementById('log_select');
             if (!select.value) return;
             window.location.href = '/logs/' + encodeURIComponent(select.value);
         }}
+        */
 
-        setInterval(fetchLogs, 5000);
-        fetchLogs();
+        // setInterval(fetchLogs, 5000);
+        // fetchLogs();
     </script>
 </body>
 </html>
@@ -768,58 +772,58 @@ def _run_mission_plan(master, waypoints: list, auto_arm_start: bool, force_guide
             behavior_tracker.finish(BEHAVIOR_ABSOLUTE_MISSION)
 
 
-def _download_latest_dataflash_log(master, vehicle_id: str) -> None:
-    """Fetch the flight controller's most recently closed dataflash log over MAVLink.
+# def _download_latest_dataflash_log(master, vehicle_id: str) -> None:
+#     """Fetch the flight controller's most recently closed dataflash log over MAVLink.
 
-    Runs in a background thread, holding _sar_mission_lock so the telemetry
-    loop pauses its own reads of `master` for the (slow, chunked) duration of
-    the download.
-    """
-    with _sar_mission_lock:
-        try:
-            master.mav.log_request_list_send(master.target_system, master.target_component, 0, 0xFFFF)
-            log_id = None
-            log_size = None
-            deadline = time.time() + LOG_REQUEST_TIMEOUT_S
-            while time.time() < deadline:
-                entry = master.recv_match(type="LOG_ENTRY", blocking=True, timeout=1.0)
-                if entry is None:
-                    continue
-                if entry.num_logs == 0 or entry.last_log_num == 0:
-                    break
-                if entry.id == entry.last_log_num:
-                    log_id, log_size = entry.id, entry.size
-                    break
+#     Runs in a background thread, holding _sar_mission_lock so the telemetry
+#     loop pauses its own reads of `master` for the (slow, chunked) duration of
+#     the download.
+#     """
+#     with _sar_mission_lock:
+#         try:
+#             master.mav.log_request_list_send(master.target_system, master.target_component, 0, 0xFFFF)
+#             log_id = None
+#             log_size = None
+#             deadline = time.time() + LOG_REQUEST_TIMEOUT_S
+#             while time.time() < deadline:
+#                 entry = master.recv_match(type="LOG_ENTRY", blocking=True, timeout=1.0)
+#                 if entry is None:
+#                     continue
+#                 if entry.num_logs == 0 or entry.last_log_num == 0:
+#                     break
+#                 if entry.id == entry.last_log_num:
+#                     log_id, log_size = entry.id, entry.size
+#                     break
 
-            if not log_id or not log_size:
-                print(f"[LOG] No dataflash log available on {vehicle_id} to auto-download.")
-                return
+#             if not log_id or not log_size:
+#                 print(f"[LOG] No dataflash log available on {vehicle_id} to auto-download.")
+#                 return
 
-            data = bytearray(log_size)
-            offset = 0
-            retries = 0
-            while offset < log_size:
-                count = min(LOG_CHUNK_BYTES, log_size - offset)
-                master.mav.log_request_data_send(master.target_system, master.target_component, log_id, offset, count)
-                chunk = master.recv_match(type="LOG_DATA", blocking=True, timeout=2.0)
-                if chunk is None or chunk.id != log_id or chunk.ofs != offset:
-                    retries += 1
-                    if retries > LOG_CHUNK_MAX_RETRIES:
-                        print(f"[LOG] Auto-download of log {log_id} for {vehicle_id} timed out at offset {offset}/{log_size}")
-                        return
-                    continue
-                retries = 0
-                chunk_len = min(chunk.count, log_size - offset)
-                data[offset:offset + chunk_len] = bytes(chunk.data[:chunk_len])
-                offset += chunk_len
+#             data = bytearray(log_size)
+#             offset = 0
+#             retries = 0
+#             while offset < log_size:
+#                 count = min(LOG_CHUNK_BYTES, log_size - offset)
+#                 master.mav.log_request_data_send(master.target_system, master.target_component, log_id, offset, count)
+#                 chunk = master.recv_match(type="LOG_DATA", blocking=True, timeout=2.0)
+#                 if chunk is None or chunk.id != log_id or chunk.ofs != offset:
+#                     retries += 1
+#                     if retries > LOG_CHUNK_MAX_RETRIES:
+#                         print(f"[LOG] Auto-download of log {log_id} for {vehicle_id} timed out at offset {offset}/{log_size}")
+#                         return
+#                     continue
+#                 retries = 0
+#                 chunk_len = min(chunk.count, log_size - offset)
+#                 data[offset:offset + chunk_len] = bytes(chunk.data[:chunk_len])
+#                 offset += chunk_len
 
-            master.mav.log_request_end_send(master.target_system, master.target_component)
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            filename = f"{vehicle_id}_log{log_id}_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.bin"
-            (LOG_DIR / filename).write_bytes(bytes(data))
-            print(f"[LOG] Auto-downloaded flight log on disarm: {filename} ({log_size} bytes)")
-        except Exception as exc:
-            print(f"[LOG] Auto-download failed for {vehicle_id}: {exc}")
+#             master.mav.log_request_end_send(master.target_system, master.target_component)
+#             LOG_DIR.mkdir(parents=True, exist_ok=True)
+#             filename = f"{vehicle_id}_log{log_id}_{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}.bin"
+#             (LOG_DIR / filename).write_bytes(bytes(data))
+#             print(f"[LOG] Auto-downloaded flight log on disarm: {filename} ({log_size} bytes)")
+#         except Exception as exc:
+#             print(f"[LOG] Auto-download failed for {vehicle_id}: {exc}")
 
 
 # --- MAIN TELEMETRY LOOP ---
@@ -970,9 +974,9 @@ async def telemetry_loop(current_config: dict) -> None:
                 if msg_type == "HEARTBEAT":
                     system_status["last_hb_time"] = now
                     armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                    if _armed_state and not armed:
-                        print(f"[LOG] {vehicle_id} disarmed; auto-downloading flight log...")
-                        threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id), daemon=True).start()
+                    # if _armed_state and not armed:
+                    #     print(f"[LOG] {vehicle_id} disarmed; auto-downloading flight log...")
+                    #     threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id), daemon=True).start()
                     _armed_state = armed
                     try:
                         system_status["flight_mode"] = master.flightmode

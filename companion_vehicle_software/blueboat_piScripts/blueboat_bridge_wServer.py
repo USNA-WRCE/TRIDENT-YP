@@ -223,14 +223,15 @@ HTML_TEMPLATE = """
         <button type="submit">Save & Restart Telemetry Stream</button>
     </form>
 
-    <h2>Flight Logs</h2>
-    <div class="diag-card">
+    <!-- h2>Flight Logs</h2 -->
+    <!-- div class="diag-card">
         <div class="log-row">
             <select id="log_select"><option value="">Loading...</option></select>
             <button type="button" onclick="downloadSelectedLog()">Download</button>
         </div>
         <div id="log_empty" class="log-empty" style="display: none; margin-top: 10px;">No flight logs found on this device yet. Logs auto-download here when the vehicle disarms.</div>
-    </div>
+    </div 
+    -->
 
     <script>
         function toggleCustomUrl() {{
@@ -275,7 +276,7 @@ HTML_TEMPLATE = """
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
         }}
 
-        async function fetchLogs() {{
+        /* async function fetchLogs() {{
             try {{
                 const res = await fetch('/api/logs');
                 const logs = await res.json();
@@ -299,15 +300,17 @@ HTML_TEMPLATE = """
                 if (logs.some(log => log.name === previous)) select.value = previous;
             }} catch (e) {{ console.error("Failed fetching logs", e); }}
         }}
+        */
 
-        function downloadSelectedLog() {{
+        /* function downloadSelectedLog() {{
             const select = document.getElementById('log_select');
             if (!select.value) return;
             window.location.href = '/logs/' + encodeURIComponent(select.value);
         }}
+        */
 
-        setInterval(fetchLogs, 5000);
-        fetchLogs();
+        // setInterval(fetchLogs, 5000);
+        // fetchLogs();
     </script>
 </body>
 </html>
@@ -957,9 +960,9 @@ async def telemetry_loop(current_config: dict) -> None:
                 if msg_type == "HEARTBEAT":
                     system_status["last_hb_time"] = now
                     armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-                    if _armed_state and not armed:
-                        print(f"[LOG] {vehicle_id} disarmed; auto-downloading flight log...")
-                        threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id), daemon=True).start()
+                    # if _armed_state and not armed:
+                    #     print(f"[LOG] {vehicle_id} disarmed; auto-downloading flight log...")
+                    #     threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id), daemon=True).start()
                     _armed_state = armed
                     try:
                         system_status["flight_mode"] = master.flightmode

@@ -166,14 +166,14 @@ HTML_TEMPLATE = """
         <button type="submit">Save & Restart Telemetry Stream</button>
     </form>
 
-    <h2>Flight Logs</h2>
-    <div class="diag-card">
+    <!-- h2>Flight Logs</h2 -->
+    <!-- div class="diag-card">
         <div class="log-row">
             <select id="log_select"><option value="">Loading...</option></select>
             <button type="button" onclick="downloadSelectedLog()">Download</button>
         </div>
         <div id="log_empty" class="log-empty" style="display: none; margin-top: 10px;">No flight logs found on this device yet. A log is saved here when this program is stopped (Ctrl+C or service stop).</div>
-    </div>
+    </div -->
 
     <script>
         async function fetchStatus() {{
@@ -211,7 +211,7 @@ HTML_TEMPLATE = """
             return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
         }}
 
-        async function fetchLogs() {{
+        /* async function fetchLogs() {{
             try {{
                 const res = await fetch('/api/logs');
                 const logs = await res.json();
@@ -235,15 +235,17 @@ HTML_TEMPLATE = """
                 if (logs.some(log => log.name === previous)) select.value = previous;
             }} catch (e) {{ console.error("Failed fetching logs", e); }}
         }}
+        */
 
-        function downloadSelectedLog() {{
+        /* function downloadSelectedLog() {{
             const select = document.getElementById('log_select');
             if (!select.value) return;
             window.location.href = '/logs/' + encodeURIComponent(select.value);
         }}
+        */
 
-        setInterval(fetchLogs, 5000);
-        fetchLogs();
+        // setInterval(fetchLogs, 5000);
+        // fetchLogs();
     </script>
 </body>
 </html>
@@ -412,18 +414,19 @@ async def _disarm_and_download_log(vehicle_id: str) -> None:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
             0, 21196, 0, 0, 0, 0, 0,
         )
-        print("[SHUTDOWN] Disarm sent; waiting for the Cube to close its log...")
-        await asyncio.sleep(2.0)
-        stop = threading.Event()
-        worker = threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id, stop), daemon=True)
-        worker.start()
-        deadline = time.time() + LOG_DOWNLOAD_TOTAL_TIMEOUT_S
-        while worker.is_alive():
-            if time.time() > deadline:
-                stop.set()
-                print("[SHUTDOWN] Flight log download timed out.")
-                break
-            await asyncio.sleep(0.2)
+        #print("[SHUTDOWN] Disarm sent; waiting for the Cube to close its log...")
+        print("[SHUTDOWN] Disarm sent.")
+        # await asyncio.sleep(2.0)
+        # stop = threading.Event()
+        # worker = threading.Thread(target=_download_latest_dataflash_log, args=(master, vehicle_id, stop), daemon=True)
+        # worker.start()
+        # deadline = time.time() + LOG_DOWNLOAD_TOTAL_TIMEOUT_S
+        # while worker.is_alive():
+        #    if time.time() > deadline:
+        #        stop.set()
+        #        print("[SHUTDOWN] Flight log download timed out.")
+        #        break
+        #    await asyncio.sleep(0.2)
     except Exception as exc:
         print(f"[SHUTDOWN] Disarm/log download failed: {exc}")
 
