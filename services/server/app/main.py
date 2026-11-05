@@ -67,6 +67,7 @@ from app.voice_synthesis import (
 from app.deconfliction import DeconflictionEngine, MISSION_PRIORITY, DEFAULT_DECONFLICT_RADIUS_M
 from yp_common import direct_control as _direct_control
 from yp_common.geometry import bearing_degrees as _bearing_degrees
+from yp_common.landing import LandStepController
 from yp_common.telemetry import (
     BEHAVIOR_IDLE,
     EVENT_LAND_ON_BOAT_TOUCHDOWN,
@@ -108,6 +109,13 @@ LAND_ON_BOAT_PAD_OFFSET_M = float(os.getenv("LAND_ON_BOAT_PAD_OFFSET_M", "-0.4")
 LAND_ON_BOAT_ALIGNMENT_RADIUS_M = float(os.getenv("LAND_ON_BOAT_ALIGNMENT_RADIUS_M", "1.0"))
 LAND_ON_BOAT_AUTO_DISARM = os.getenv("LAND_ON_BOAT_AUTO_DISARM", "true").lower() not in ("0", "false", "no")
 LAND_ON_BOAT_TOUCHDOWN_DWELL_S = float(os.getenv("LAND_ON_BOAT_TOUCHDOWN_DWELL_S", "1.5"))
+LAND_ON_BOAT_MIN_DESCENT_RATE_MS = float(os.getenv("LAND_ON_BOAT_MIN_DESCENT_RATE_MS", "0.1"))
+LAND_ON_BOAT_MAX_DATA_AGE_S = float(os.getenv("LAND_ON_BOAT_MAX_DATA_AGE_S", "2.0"))
+LAND_ON_BOAT_YP_VEL_WINDOW_S = float(os.getenv("LAND_ON_BOAT_YP_VEL_WINDOW_S", "2.0"))
+LAND_ON_BOAT_YP_VEL_ALPHA = float(os.getenv("LAND_ON_BOAT_YP_VEL_ALPHA", "0.2"))
+LAND_ON_BOAT_YP_MIN_SPEED_MS = float(os.getenv("LAND_ON_BOAT_YP_MIN_SPEED_MS", "0.3"))
+LAND_ON_BOAT_BACKUP_MAX_ALT_M = float(os.getenv("LAND_ON_BOAT_BACKUP_MAX_ALT_M", "2.0"))
+LAND_ON_BOAT_STALL_TIMEOUT_S = float(os.getenv("LAND_ON_BOAT_STALL_TIMEOUT_S", "3.0"))
 RTB_STERN_DISTANCE_M = float(os.getenv("RTB_STERN_DISTANCE_M", "20.0"))
 RTB_UPDATE_HZ = float(os.getenv("RTB_UPDATE_HZ", "2.0"))
 RTB_ALTITUDE_M = float(os.getenv("RTB_ALTITUDE_M", "30.0"))
@@ -193,8 +201,8 @@ _land_on_boat_tasks: dict[str, asyncio.Task[None]] = {} # vehicle_id -> placehol
 _sitl_follow_guided_requests: dict[str, float] = {} # vehicle_id -> timestamp of last follow-guided request (to avoid spamming the vehicle with repeated requests)
 _sitl_guided_forced: dict[str, bool] = {} # vehicle_id -> True once GUIDED has been forced for the current streaming streak
 _sitl_landed_state: dict[str, int] = {} # vehicle_id -> last EXTENDED_SYS_STATE.landed_state seen (real ground-contact detection)
-_sitl_land_touchdown_since: dict[str, float] = {} # vehicle_id -> monotonic time landed_state first read ON_GROUND for the current attempt
-_sitl_land_touchdown_sent: dict[str, bool] = {} # vehicle_id -> True once auto-disarm has fired for the current attempt
+_sitl_land_controllers: dict[str, LandStepController] = {} # vehicle_id -> velocity-only landing controller (touchdown state)
+_sitl_vehicle_pos: dict[str, tuple[float, float, float, float]] = {} # vehicle_id -> (lat, lon, home-relative alt, wall time) from GLOBAL_POSITION_INT
 _sitl_nav_lock = threading.Lock()
 _sitl_nav_states: dict[str, dict[str, float]] = {}
 _sitl_behavior: dict[str, str] = {} # vehicle_id -> behavior reported for server-hosted SITL bridges (hardware bridges report their own)
@@ -891,6 +899,7 @@ async def _run_mavlink_bridge(
 
                 # Rate-limit position messages to avoid overwhelming the UI
                 if msg_type == "GLOBAL_POSITION_INT":
+                    _sitl_vehicle_pos[vehicle_id] = (msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1000.0, now)
                     if now - last_pos_time < min_pos_interval:
                         continue
                     last_pos_time = now
@@ -1368,63 +1377,11 @@ def _handle_sitl_command(master: Any, cmd_payload: dict[str, Any]) -> bool:
         lon = target.get("longitude")
         if lat is not None and lon is not None:
             vehicle_id = str(cmd_payload.get("vehicle_id") or "")
-            now = time.monotonic()
-            # Same force-once/respect-override behavior as rtb_follow above,
-            # plus reset touchdown tracking for the new attempt.
-            if now - _sitl_follow_guided_requests.get(vehicle_id, 0.0) > 1.0:
-                _sitl_guided_forced[vehicle_id] = False
-                _sitl_land_touchdown_since.pop(vehicle_id, None)
-                _sitl_land_touchdown_sent[vehicle_id] = False
-            _sitl_follow_guided_requests[vehicle_id] = now
-
-            # Real ground contact, reported by ArduCopter's own IMU/throttle-based
-            # landing detector -- not a preset altitude the boat deck may not match.
-            if _sitl_landed_state.get(vehicle_id) == _mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-                if vehicle_id not in _sitl_land_touchdown_since:
-                    _sitl_land_touchdown_since[vehicle_id] = now
-                if bool(command.get("auto_disarm", True)) and not _sitl_land_touchdown_sent.get(vehicle_id, False):
-                    dwell_s = float(command.get("touchdown_dwell_s", 1.5))
-                    if now - _sitl_land_touchdown_since[vehicle_id] >= dwell_s:
-                        master.mav.command_long_send(
-                            master.target_system, master.target_component,
-                            _mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                            0, 0, 21196, 0, 0, 0, 0, 0,
-                        )
-                        _sitl_land_touchdown_sent[vehicle_id] = True
-                        print(f"[LAND] Onboard landing detector confirms touchdown on {vehicle_id}; disarmed.")
-                        return True
-                return False
-            _sitl_land_touchdown_since.pop(vehicle_id, None)
-
-            if not _sitl_guided_forced.get(vehicle_id, False):
-                mode_mapping = master.mode_mapping()
-                if mode_mapping and "GUIDED" in mode_mapping:
-                    master.mav.set_mode_send(
-                        master.target_system,
-                        _mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                        mode_mapping["GUIDED"],
-                    )
-                    _sitl_guided_forced[vehicle_id] = True
-            elif getattr(master, "flightmode", "GUIDED") != "GUIDED":
-                print(f"[LAND] Safety pilot has taken control of {vehicle_id}; halting land-on-boat guidance")
-                return False
-            master.mav.set_position_target_global_int_send(
-                0,
-                master.target_system,
-                master.target_component,
-                _mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-                0b100111000000,
-                int(float(lat) * 1e7),
-                int(float(lon) * 1e7),
-                float(target.get("altitude") or 0.0),
-                float(command.get("velocity_north_ms") or 0.0),
-                float(command.get("velocity_east_ms") or 0.0),
-                float(command.get("sink_rate_ms") or 0.0),
-                0.0,
-                0.0,
-                0.0,
-                math.radians(float(command.get("heading") or 0.0)),
-                0.0,
+            controller = _sitl_land_controllers.setdefault(vehicle_id, LandStepController())
+            pos = _sitl_vehicle_pos.get(vehicle_id)
+            position = pos[:3] if pos is not None and time.time() - pos[3] < 1.0 else None
+            return controller.step(
+                master, command, _sitl_landed_state.get(vehicle_id, 0), position,
             )
 
     elif cmd_type == "mission_plan":
@@ -3554,8 +3511,13 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
     STATE_DESCENT = 1
 
     current_state = STATE_APPROACH
-    target_alt_m: Optional[float] = None
+    legacy_alt_m: Optional[float] = None
     last_status_log_s = 0.0
+    # Low-pass filtered YP course-over-ground velocity (north, east).
+    yp_vn_f = 0.0
+    yp_ve_f = 0.0
+    last_yp_stamp = 0.0
+    last_pad: Optional[tuple[float, float, float]] = None  # lat, lon, heading
 
     try:
         while True:
@@ -3574,79 +3536,115 @@ async def _land_on_boat_loop(vehicle_id: str) -> None:
                 yp_pos = yp_vehicle.get("position") or {}
 
                 if yp_pos.get("latitude") is None or target_pos.get("latitude") is None:
-                    target_alt_m = None
+                    legacy_alt_m = None
                 else:
-                    yp_heading = float(yp_vehicle.get("heading") or 0.0) % 360.0
-
+                    now_wall_s = time.time()
                     yp_history = yp_vehicle.get("history") or []
-                    yp_speed_mps = 0.0
-                    if len(yp_history) >= 2:
-                        p1, p2 = yp_history[-2], yp_history[-1]
-                        dt = float(p2.get("stamp") or 0) - float(p1.get("stamp") or 0)
-                        if dt > 0:
-                            yp_speed_mps = _haversine_m(
-                                p1["latitude"], p1["longitude"],
-                                p2["latitude"], p2["longitude"],
-                            ) / dt
+                    yp_stamp = float(yp_history[-1].get("stamp") or 0.0) if yp_history else 0.0
+                    yp_age_s = now_wall_s - yp_stamp if yp_stamp else float("inf")
+                    max_age_s = float(settings.get("land_on_boat_max_data_age_s", LAND_ON_BOAT_MAX_DATA_AGE_S))
+                    yp_stale = yp_age_s > max_age_s
 
-                    pad_lat, pad_lon = _destination_point(
-                        float(yp_pos["latitude"]),
-                        float(yp_pos["longitude"]),
-                        yp_heading + 180.0,
-                        float(settings.get("land_on_boat_pad_offset_m", LAND_ON_BOAT_PAD_OFFSET_M)),
-                    )
+                    if not yp_stale and yp_stamp != last_yp_stamp:
+                        last_yp_stamp = yp_stamp
+                        # Displacement over the last ~2 s of YP fixes, then an EMA.
+                        newest = yp_history[-1]
+                        oldest = newest
+                        for sample in reversed(yp_history):
+                            if yp_stamp - float(sample.get("stamp") or 0.0) > LAND_ON_BOAT_YP_VEL_WINDOW_S:
+                                break
+                            oldest = sample
+                        span_s = yp_stamp - float(oldest.get("stamp") or 0.0)
+                        if span_s >= 0.5:
+                            d_n = math.radians(newest["latitude"] - oldest["latitude"]) * EARTH_RADIUS_M
+                            d_e = (
+                                math.radians(newest["longitude"] - oldest["longitude"])
+                                * EARTH_RADIUS_M
+                                * math.cos(math.radians(newest["latitude"]))
+                            )
+                            raw_vn, raw_ve = d_n / span_s, d_e / span_s
+                            if math.hypot(raw_vn, raw_ve) < LAND_ON_BOAT_YP_MIN_SPEED_MS:
+                                raw_vn = raw_ve = 0.0  # GPS jitter, not motion
+                            yp_vn_f += LAND_ON_BOAT_YP_VEL_ALPHA * (raw_vn - yp_vn_f)
+                            yp_ve_f += LAND_ON_BOAT_YP_VEL_ALPHA * (raw_ve - yp_ve_f)
+
+                    if yp_stale:
+                        # Never extrapolate a stale pad: hold the last good pad point, zero feed-forward.
+                        yp_vn_f = yp_ve_f = 0.0
+                        if time.monotonic() - last_status_log_s >= 1.0:
+                            last_status_log_s = time.monotonic()
+                            print(f"[LAND] YP data {yp_age_s:.1f}s old (> {max_age_s:.1f}s); holding altitude on {vehicle_id}")
+
+                    if not yp_stale or last_pad is None:
+                        yp_heading = float(yp_vehicle.get("heading") or 0.0) % 360.0
+                        pad_lat, pad_lon = _destination_point(
+                            float(yp_pos["latitude"]),
+                            float(yp_pos["longitude"]),
+                            yp_heading + 180.0,
+                            float(settings.get("land_on_boat_pad_offset_m", LAND_ON_BOAT_PAD_OFFSET_M)),
+                        )
+                        last_pad = (pad_lat, pad_lon, yp_heading)
+                    pad_lat, pad_lon, yp_heading = last_pad
+
                     horiz_dist_m = _haversine_m(
                         float(target_pos["latitude"]), float(target_pos["longitude"]),
                         pad_lat, pad_lon,
                     )
+                    yp_speed_mps = math.hypot(yp_vn_f, yp_ve_f)
                     descent_rate_ms = float(settings.get("land_on_boat_descent_rate_ms", LAND_ON_BOAT_DESCENT_RATE_MS))
+                    min_descent_rate_ms = min(
+                        descent_rate_ms,
+                        float(settings.get("land_on_boat_min_descent_rate_ms", LAND_ON_BOAT_MIN_DESCENT_RATE_MS)),
+                    )
                     alignment_radius_m = float(settings.get("land_on_boat_alignment_radius_m", LAND_ON_BOAT_ALIGNMENT_RADIUS_M))
-                    # Altitudes are in the vehicle's own home-relative frame. The
-                    # YP's reported altitude is a different (MSL/unknown) frame and
-                    # the deck height is unknown, so it is never used here.
                     vehicle_alt_m = float(target_pos.get("altitude") or 0.0)
 
-                    if target_alt_m is None:
-                        target_alt_m = vehicle_alt_m
-
+                    # Descent is a constant rate, tapered (never below the minimum
+                    # rate) as horizontal error grows past the alignment radius.
+                    # Hysteresis: start at 1x radius, only fall back to a level
+                    # approach beyond 4x radius.
                     sink_rate_ms = 0.0
+                    if current_state == STATE_APPROACH:
+                        if horiz_dist_m <= alignment_radius_m and not yp_stale:
+                            current_state = STATE_DESCENT
+                            print(f"[LAND] Aligned with pad; starting descent on {vehicle_id}")
+                    elif horiz_dist_m > 4.0 * alignment_radius_m:
+                        current_state = STATE_APPROACH
+                        print(f"[LAND] Lost the pad ({horiz_dist_m:.1f} m); levelling off on {vehicle_id}")
+                    elif not yp_stale:
+                        taper = 1.0 - max(0.0, horiz_dist_m - alignment_radius_m) / (2.0 * alignment_radius_m)
+                        sink_rate_ms = max(min_descent_rate_ms, descent_rate_ms * taper)
+
+                    # Legacy position-Z target, only read by bridges that have not
+                    # moved to velocity-only descent (the ArduCopter bridges ignore it).
+                    if legacy_alt_m is None or sink_rate_ms == 0.0:
+                        legacy_alt_m = vehicle_alt_m
+                    else:
+                        legacy_alt_m = max(legacy_alt_m - sink_rate_ms * period_s, vehicle_alt_m - 1.0)
+
                     now_s = time.monotonic()
                     if now_s - last_status_log_s >= 1.0:
                         last_status_log_s = now_s
-                        print(f"[LAND] {vehicle_id} state={current_state} pad_dist={horiz_dist_m:.2f}m (align<={alignment_radius_m:.1f}m) alt={vehicle_alt_m:.1f}m pad_speed={yp_speed_mps:.1f}m/s")
-                    if current_state == STATE_APPROACH:
-                        target_alt_m = vehicle_alt_m
-                        if horiz_dist_m <= alignment_radius_m:
-                            current_state = STATE_DESCENT
-                            print(f"[LAND] Aligned with pad; starting blind descent on {vehicle_id}")
-                    elif horiz_dist_m > 2.0 * alignment_radius_m:
-                        # Lost the pad: stop sinking and hold until re-aligned.
-                        target_alt_m = vehicle_alt_m
-                    else:
-                        # Descend until the bridge's landing detector reports contact.
-                        # Keep the target within 1 m of the actual altitude so a
-                        # lagging vehicle does not wind up a large downward demand.
-                        target_alt_m = max(
-                            target_alt_m - descent_rate_ms * period_s,
-                            vehicle_alt_m - 1.0,
-                        )
-                        sink_rate_ms = descent_rate_ms
+                        print(f"[LAND] {vehicle_id} state={current_state} pad_dist={horiz_dist_m:.2f}m (align<={alignment_radius_m:.1f}m) alt={vehicle_alt_m:.1f}m sink={sink_rate_ms:.2f}m/s pad_speed={yp_speed_mps:.1f}m/s")
 
                     step_command = {
                         "type": "land_on_boat_step",
                         "target": {
                             "latitude": pad_lat,
                             "longitude": pad_lon,
-                            "altitude": target_alt_m,
+                            "altitude": legacy_alt_m,
                         },
                         "heading": yp_heading,
-                        "velocity_north_ms": yp_speed_mps * math.cos(math.radians(yp_heading)),
-                        "velocity_east_ms": yp_speed_mps * math.sin(math.radians(yp_heading)),
+                        "velocity_north_ms": yp_vn_f,
+                        "velocity_east_ms": yp_ve_f,
                         "sink_rate_ms": sink_rate_ms,
                         # Let the bridge disarm the instant its own onboard
-                        # landing detector confirms ground contact.
+                        # landing detector confirms ground contact (or, as a
+                        # backup, when commanded descent stalls near the ground).
                         "auto_disarm": bool(settings.get("land_on_boat_auto_disarm", LAND_ON_BOAT_AUTO_DISARM)),
                         "touchdown_dwell_s": float(settings.get("land_on_boat_touchdown_dwell_s", LAND_ON_BOAT_TOUCHDOWN_DWELL_S)),
+                        "touchdown_backup_max_alt_m": float(settings.get("land_on_boat_backup_max_alt_m", LAND_ON_BOAT_BACKUP_MAX_ALT_M)),
+                        "touchdown_stall_timeout_s": float(settings.get("land_on_boat_stall_timeout_s", LAND_ON_BOAT_STALL_TIMEOUT_S)),
                     }
 
             if step_command is not None:

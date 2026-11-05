@@ -11,6 +11,7 @@ from pymavlink import mavutil
 import websockets
 
 import sar_missions
+from yp_common.landing import LandStepController
 from yp_common.telemetry import (
     BEHAVIOR_ABSOLUTE_MISSION,
     BEHAVIOR_IDLE,
@@ -119,11 +120,8 @@ _ship_relative_thread: threading.Thread | None = None
 _ship_relative_stop_event: threading.Event | None = None
 _last_rtb_step_time = 0.0
 _rtb_guided_forced = False
-_last_land_step_time = 0.0
-_land_step_guided_forced = False
+_land_controller = LandStepController()
 _landed_state = 0  # MAV_LANDED_STATE_UNDEFINED until EXTENDED_SYS_STATE arrives
-_land_touchdown_since: float | None = None
-_land_touchdown_sent = False
 behavior_tracker = BehaviorTracker()
 _current_mode: str | None = None
 _armed_state: bool | None = None
@@ -482,77 +480,15 @@ def follow_yp_velocity(master, command_data: dict) -> None:
 
 
 def execute_land_step(master, command_data: dict) -> bool:
-    """Stream a moving pad target, including descent or hover velocity.
+    """Stream a velocity-only landing command (pad tracking + constant sink rate).
 
-    Returns True once ArduCopter's own onboard landing detector
-    (EXTENDED_SYS_STATE.landed_state) confirms real ground contact and this
-    call has disarmed the vehicle -- independent of any preset altitude.
+    Returns True once this call has disarmed the vehicle, either on
+    EXTENDED_SYS_STATE.landed_state == ON_GROUND or on the stalled-descent backup.
     """
-    global _last_land_step_time, _land_step_guided_forced, _land_touchdown_since, _land_touchdown_sent
-    target = command_data.get("target", {})
-    lat = target.get("latitude")
-    lon = target.get("longitude")
-    alt = target.get("altitude")
-
-    if None in (lat, lon, alt):
-        return False
-
-    vn = float(command_data.get("velocity_north_ms", 0.0))
-    ve = float(command_data.get("velocity_east_ms", 0.0))
-    vd = float(command_data.get("sink_rate_ms", 0.0))  # Positive = downward velocity
-    yaw_rad = math.radians(float(command_data.get("heading", 0.0)))
-
-    # A gap in steps means the sequence just (re)started, so force GUIDED once
-    # and reset touchdown tracking for the new attempt. While steps are
-    # continuous, never force the mode back -- if the safety pilot switches
-    # modes to take control, respect it and stop guiding.
-    now = time.monotonic()
-    if now - _last_land_step_time > 1.0:
-        _land_step_guided_forced = False
-        _land_touchdown_since = None
-        _land_touchdown_sent = False
-    _last_land_step_time = now
-
-    # Real ground contact, reported by ArduCopter's own IMU/throttle-based
-    # landing detector -- not a preset altitude the boat deck may not match.
-    if _landed_state == mavutil.mavlink.MAV_LANDED_STATE_ON_GROUND:
-        if _land_touchdown_since is None:
-            _land_touchdown_since = now
-        if bool(command_data.get("auto_disarm", True)) and not _land_touchdown_sent:
-            dwell_s = float(command_data.get("touchdown_dwell_s", 1.5))
-            if now - _land_touchdown_since >= dwell_s:
-                master.mav.command_long_send(master.target_system, master.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 21196, 0, 0, 0, 0, 0)
-                _land_touchdown_sent = True
-                print("[LAND] Onboard landing detector confirms touchdown; disarmed.")
-                return True
-        return False
-    _land_touchdown_since = None
-
-    try:
-        if not _land_step_guided_forced:
-            master.set_mode("GUIDED")
-            _land_step_guided_forced = True
-        elif master.flightmode != "GUIDED":
-            print("[LAND] Safety pilot has taken control; halting land-on-boat guidance")
-            return False
-    except Exception:
-        pass
-
-    # Send position + velocity + yaw, while ignoring acceleration and yaw rate.
-    master.mav.set_position_target_global_int_send(
-        0,                                                  # time_boot_ms
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b100111000000,
-        int(float(lat) * 1e7),
-        int(float(lon) * 1e7),
-        float(alt),
-        vn, ve, vd,                                         # Velocity North, East, Down (m/s)
-        0, 0, 0,                                            # Acceleration
-        yaw_rad, 0                                          # Yaw angle
-    )
-    return False
+    state = _snapshot_vehicle_state()
+    fresh = state.get("lat") is not None and time.time() - float(state.get("stamp") or 0.0) < 1.0
+    position = (float(state["lat"]), float(state["lon"]), float(state["alt"])) if fresh else None
+    return _land_controller.step(master, command_data, _landed_state, position)
 
 
 async def telemetry_loop() -> None:
