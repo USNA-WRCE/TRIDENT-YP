@@ -352,7 +352,8 @@ classdef TridentClient < handle
                     req = matlab.net.http.RequestMessage(matlab.net.http.RequestMethod.GET, auth_header);
                 else
                     content_header = matlab.net.http.HeaderField('Content-Type', 'application/json');
-                    json_body = matlab.net.http.MessageBody(jsonencode(body));
+                    json_body = matlab.net.http.MessageBody();
+                    json_body.Payload = uint8(unicode2native(jsonencode(body), 'UTF-8'));
                     req = matlab.net.http.RequestMessage(matlab.net.http.RequestMethod.POST, [auth_header, content_header], json_body);
                 end
                 opts = matlab.net.http.HTTPOptions('ConnectTimeout', obj.timeout, 'ResponseTimeout', obj.timeout);
