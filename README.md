@@ -232,7 +232,7 @@ A `200` response means the command was queued to the vehicle: `{"ok": true, "del
 
 **3. Read state.** `GET /api/fleet/state` and `GET /api/vehicles/{id}/state` (permission `read_telemetry`) return position, heading, estimated velocity (north/east/speed/course, derived by the server from successive fixes), mode, armed state, behavior, battery, GPS fix, and, for one vehicle, its active map overlays. For control loops, connect to the `/ws/api` WebSocket (same bearer header): you get a `snapshot`, then a `state` message on every vehicle update and every `command_ack`; send `{"op": "subscribe", "vehicle_ids": [...]}` to filter. Orientation is limited to heading; bridges do not report roll or pitch.
 
-**4. Use the Python client.** [`clients/python`](clients/python/README.md) wraps all of the above (`goto`, `rtb`, `mission`, `ship_relative_mission`, `set_velocity`, `rc_override`, `state`, `stream`) so scripts name the vehicle in each call.
+**4. Use the Python or MATLAB client.** [`clients/python`](clients/python/README.md) and [`clients/matlab`](clients/matlab/README.md) wrap all of the above (`goto`, `rtb`, `mission`, `ship_relative_mission`, `set_velocity`, `rc_override`, `state`) so scripts name the vehicle in each call.
 
 ## Voice commands
 
