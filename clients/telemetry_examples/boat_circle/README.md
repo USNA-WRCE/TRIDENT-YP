@@ -2,7 +2,17 @@
 
 This standalone example publishes telemetry directly to the TRIDENT server. It does not use the command client or control a real vehicle. The boat appears in the GCS and travels around a circle with a 10-meter radius until you stop the script with **Ctrl+C**. Disconnecting removes it from the live vehicle display.
 
-Install the only dependency:
+## Run from VS Code or Thonny
+
+Open [`boat_circle_ide.py`](boat_circle_ide.py), edit the configuration values near the top (`VEHICLE_NAME`, `VEHICLE_TYPE`, `BASE_LATITUDE`, `BASE_LONGITUDE`, and `SERVER_URL`), then run the file using the IDE's Run button. Stop it with **Ctrl+C** in the IDE's terminal/shell. If `websockets` is missing, install it in the Python environment selected by the IDE. In Thonny, use **Tools > Manage packages** to find and install `websockets`; in VS Code, select the intended Python interpreter, then install it from that interpreter's terminal:
+
+```bash
+python -m pip install websockets
+```
+
+## Run with command-line options
+
+The original `boat_circle.py` example also supports command-line options. Install the dependency:
 
 ```bash
 python -m pip install -r requirements.txt
