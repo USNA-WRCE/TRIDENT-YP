@@ -219,6 +219,14 @@ class TridentClient:
         """Return to the mother vessel and follow it."""
         return self.send_command(vehicle_id, {"type": "rtb"})
 
+    def follow_vehicle(self, vehicle_id: str, target_vehicle_id: str, standoff_m: float = 20.0) -> CommandAck:
+        """Follow another connected vehicle at a specified standoff distance in meters."""
+        return self.send_command(vehicle_id, {
+            "type": "follow_vehicle",
+            "target_vehicle_id": target_vehicle_id,
+            "standoff_m": standoff_m,
+        })
+
     def land_on_boat(self, vehicle_id: str) -> CommandAck:
         return self.send_command(vehicle_id, {"type": "land_on_boat"})
 

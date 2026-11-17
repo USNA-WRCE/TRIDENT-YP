@@ -61,6 +61,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.sent(), {"type": "rc_override", "channels": {"1": 1500}})
         self.client.release_rc("boat-01", [1, 3])
         self.assertEqual(self.sent()["channels"], {"1": 0, "3": 0})
+        self.client.follow_vehicle("boat-01", "uav-01", standoff_m=20)
+        self.assertEqual(self.sent(), {"type": "follow_vehicle", "target_vehicle_id": "uav-01", "standoff_m": 20})
 
     def test_http_errors_map_to_exceptions(self):
         for status, error in ((400, InvalidCommand), (401, AuthenticationError), (403, PermissionDenied),
